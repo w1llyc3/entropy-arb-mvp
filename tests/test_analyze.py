@@ -99,10 +99,18 @@ def test_fillable_gate_forces_rebate_zero_and_labels_p50():
     assert "slip@$100 p90 < net-edge p50" in gates["G3"]["label"]
     assert abs(gates["G4"]["value"] - 0.5) < 1e-9
     assert abs(gates["G4"]["thin_frac"] - (1 / 3)) < 1e-9
+    assert gates["G4"]["pass"] is False  # 1/3 >= 0.30
+    assert "sizing signal" in gates["G4"]["label"]
     text = format_gate_report(gates)
     assert "G1: +3.10 bps PASS" in text
     assert "G3:" in text and "FAIL" in text.split("G3:", 1)[1].splitlines()[0]
-    assert "G4: 0.5000 mean depth_ok_frac thin_frac=0.3333" in text
+    assert ("G4: 0.5000 mean depth_ok_frac FAIL thin_frac=0.3333 (<0.30)"
+            in text)
+    g1 = [ln for ln in text.splitlines() if ln.startswith("G1:")][0]
+    g2 = [ln for ln in text.splitlines() if ln.startswith("G2:")][0]
+    assert g1.startswith("G1: +3.10 bps PASS")
+    assert "worse of SELL/BUY" in g1
+    assert "±50%" in g2
     assert "SELL entropy net p50: +9.10 bps" in text
     assert "BUY entropy net p50: +3.10 bps" in text
     assert "GATE net p50" not in text
@@ -193,6 +201,56 @@ def test_g3_passes_only_when_slip_p90_is_below_net_p50():
     g3 = [ln for ln in report.splitlines() if ln.startswith("G3:")][0]
     assert "PASS" in g3
     assert "p90" not in g3.split("bps", 1)[0]
+
+
+def _summary_with_depth(depth_n, depth_mean, depth_thin_frac):
+    return {
+        "used_fillable": True,
+        "fees": 0.9,
+        "sell": {"n": 2, "pre_p50": 1.9, "net_p50": 1.0, "accrual_p50": 1.0},
+        "buy": {"n": 2, "pre_p50": 1.9, "net_p50": 1.0, "accrual_p50": 1.0},
+        "slip": {
+            "sell": {"n": 2, "p90": 0.1},
+            "buy": {"n": 2, "p90": 0.1},
+        },
+        "depth_n": depth_n,
+        "depth_mean": depth_mean,
+        "depth_thin_frac": depth_thin_frac,
+    }
+
+
+def _g4_line_of(depth_n, depth_mean, depth_thin_frac):
+    gates = evaluate_gates(
+        _summary_with_depth(depth_n, depth_mean, depth_thin_frac),
+        [2.0, 2.0], [2.0, 2.0],
+    )
+    report = format_gate_report(gates)
+    # G1–G3 stay the bps gates; this helper only returns the G4 line.
+    assert any(ln.startswith("G1: ") and " bps " in ln for ln in report.splitlines())
+    assert any(ln.startswith("G3: ") and " bps " in ln for ln in report.splitlines())
+    return [ln for ln in report.splitlines() if ln.startswith("G4:")][0], gates["G4"]
+
+
+def test_g4_passes_only_when_thin_frac_is_below_0_30():
+    line, gate = _g4_line_of(25, 0.88, 0.12)
+    assert gate["pass"] is True
+    assert "PASS thin_frac=0.1200 (<0.30)" in line
+    assert "thin_frac < 0.30 (shallow book / sizing signal only)" in line
+    assert "KILL" not in line
+
+    edge, edge_gate = _g4_line_of(10, 0.70, 0.30)
+    assert edge_gate["pass"] is False
+    assert "FAIL thin_frac=0.3000 (<0.30)" in edge
+
+    above, above_gate = _g4_line_of(3, 0.5, 1 / 3)
+    assert above_gate["pass"] is False
+    assert "FAIL thin_frac=0.3333 (<0.30)" in above
+
+    missing, missing_gate = _g4_line_of(0, float("nan"), float("nan"))
+    assert missing_gate["pass"] is False
+    assert missing_gate["value"] is None
+    assert missing.startswith(
+        "G4: n/a mean depth_ok_frac FAIL thin_frac=n/a (<0.30)")
 
 
 if __name__ == "__main__":

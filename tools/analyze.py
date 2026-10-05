@@ -8,7 +8,7 @@ and prints:
   * fillable-at-$100 contrast columns: pre-fee p50, net p50 (rebate 0),
     and an accrual-rebate figure that is display-only,
   * Gates G1–G4 (worse net median, ±50% band robustness, slip vs net edge,
-    mean depth_ok_frac),
+    thin_frac < 0.30 sizing signal),
   * how often each candidate upper/lower band would have fired,
   * a ready-to-paste `thresholds:` snippet.
 
@@ -43,6 +43,10 @@ from entropy_arb.config import (  # noqa: E402
 )
 
 CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
+
+# G4 is a shallow-book sizing signal. PASS iff thin_frac is strictly below
+# this cut. It does not stop the recorder and it does not place orders.
+THIN_FRAC_MAX = 0.30
 
 FILL_SELL = "fill_sell_edge_100_bps"
 FILL_BUY = "fill_buy_edge_100_bps"
@@ -358,14 +362,25 @@ def _g3(summary: dict) -> dict:
             "sell": sell, "buy": buy}
 
 
+def _g4_label() -> str:
+    return (f"thin_frac < {THIN_FRAC_MAX:.2f} "
+            f"(shallow book / sizing signal only)")
+
+
 def _g4(summary: dict) -> dict:
-    """Shallow-book metric: mean depth_ok_frac and fraction of minutes at 0."""
-    label = "mean depth_ok_frac"
-    if not summary["depth_n"]:
-        return {"value": None, "thin_frac": None, "label": label, "n": 0}
+    """Shallow-book sizing signal. PASS iff ``thin_frac < 0.30``.
+
+    Mean ``depth_ok_frac`` is still reported. A missing depth column fails.
+    """
+    label = _g4_label()
+    thin = summary["depth_thin_frac"]
+    if not summary["depth_n"] or not _finite(thin):
+        return {"value": None, "thin_frac": None, "pass": False,
+                "label": label, "n": summary.get("depth_n") or 0}
     return {
         "value": summary["depth_mean"],
-        "thin_frac": summary["depth_thin_frac"],
+        "thin_frac": thin,
+        "pass": thin < THIN_FRAC_MAX,
         "label": label,
         "n": summary["depth_n"],
     }
@@ -402,6 +417,21 @@ def _shift_detail(name: str, side: dict) -> str:
     return (f"  {name} p90 {p90} → {_fmt(shifts[0])} and {_fmt(shifts[1])}")
 
 
+def _g4_line(g4: dict) -> str:
+    """``G4: … PASS thin_frac=0.1200 (<0.30)`` or FAIL at ``thin_frac >= 0.30``."""
+    cut = f"(<{THIN_FRAC_MAX:.2f})"
+    verdict = _verdict(bool(g4["pass"]))
+    if g4["value"] is None or not _finite(g4.get("thin_frac")):
+        head = f"G4: n/a mean depth_ok_frac {verdict} thin_frac=n/a {cut}"
+    else:
+        head = (
+            f"G4: {g4['value']:.4f} mean depth_ok_frac {verdict} "
+            f"thin_frac={g4['thin_frac']:.4f} {cut}"
+        )
+    label = (g4.get("label") or "").strip()
+    return f"{head} {label}" if label else head
+
+
 def format_gate_report(gates: dict) -> str:
     """Stable stdout block. Gate lines start with ``G1:`` … ``G4:``.
 
@@ -424,13 +454,7 @@ def format_gate_report(gates: dict) -> str:
             f"  {name} slip p90 {_fmt(side['slip'])} < net p50 {_fmt(side['net'])} "
             f"{_verdict(side['pass'])}"
         )
-    if g4["value"] is None:
-        lines.append("G4: n/a mean depth_ok_frac thin_frac=n/a")
-    else:
-        lines.append(
-            f"G4: {g4['value']:.4f} mean depth_ok_frac "
-            f"thin_frac={g4['thin_frac']:.4f}"
-        )
+    lines.append(_g4_line(g4))
     lines.append("Contrast columns (not Gate ids):")
     lines.append(f"SELL entropy net p50: {_fmt(gates['contrast']['sell'])} bps")
     lines.append(f"BUY entropy net p50: {_fmt(gates['contrast']['buy'])} bps")
