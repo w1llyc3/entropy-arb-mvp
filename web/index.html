@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>entropy-arb record-only</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #10151c;
+      --card: #1a222d;
+      --line: #2c3848;
+      --text: #e7eef6;
+      --muted: #93a2b5;
+      --accent: #3ddec8;
+      --warn: #ffd27a;
+      --warn-bg: #3a2e14;
+      --bad: #ff8f8f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main { max-width: 880px; margin: 0 auto; padding: 28px 18px 48px; }
+    h1 { font-size: 1.35rem; margin: 0 0 6px; }
+    h2 { font-size: 1rem; margin: 0 0 12px; }
+    p { margin: 0 0 10px; }
+    .lede { color: var(--muted); margin-bottom: 18px; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+    input, select, button {
+      font: inherit;
+      color: var(--text);
+      background: #0e141c;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    button { cursor: pointer; background: #243140; }
+    button.primary { background: #145e54; border-color: #1d7a6d; color: white; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+    .field { min-width: 140px; }
+    .hint { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    dl {
+      display: grid;
+      grid-template-columns: 11rem 1fr;
+      gap: 6px 12px;
+      margin: 0;
+    }
+    dt { color: var(--muted); }
+    dd { margin: 0; }
+    #warn-box {
+      background: var(--warn-bg);
+      color: var(--warn);
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 12px;
+    }
+    #warn-box ul { margin: 0; padding-left: 1.1rem; }
+    .gates {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .gate {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .gate .id { color: var(--accent); font-weight: 650; }
+    .gate .val { font-size: 1.25rem; margin-top: 4px; }
+    .gate .sub { color: var(--muted); font-size: 0.85rem; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0e141c;
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 320px;
+      overflow: auto;
+      margin: 8px 0 0;
+    }
+    .err { color: var(--bad); }
+    @media (max-width: 640px) {
+      dl { grid-template-columns: 1fr; }
+      .gates { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>entropy-arb record-only</h1>
+  <p class="lede">Localhost panel. Starts and stops data collection only. It does not send orders and it does not read API keys.</p>
+
+  <section>
+    <h2>Recorder</h2>
+    <form id="form" class="row">
+      <div class="field">
+        <label for="symbol">Symbol</label>
+        <input id="symbol" name="symbol" value="SNDK" maxlength="16" autocomplete="off" required>
+      </div>
+      <div class="field">
+        <label for="hedge">Hedge</label>
+        <select id="hedge" name="hedge">
+          <option value="lighter" selected>lighter</option>
+          <option value="lighter-rh">lighter-rh</option>
+          <option value="tradexyz">tradexyz</option>
+        </select>
+      </div>
+      <button class="primary" id="start" type="submit">Start record-only</button>
+      <button id="stop" type="button" disabled>Stop</button>
+    </form>
+    <p class="hint">Runs <span class="mono" id="cmd-preview">python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter</span></p>
+  </section>
+
+  <section>
+    <h2>Status</h2>
+    <div id="warn-box" hidden><ul id="warnings"></ul></div>
+    <dl>
+      <dt>State</dt><dd id="running">—</dd>
+      <dt>PID</dt><dd id="pid">—</dd>
+      <dt>Uptime</dt><dd id="uptime">—</dd>
+      <dt>Market</dt><dd id="market">—</dd>
+      <dt>Minutes collected</dt><dd id="minutes">—</dd>
+      <dt>Samples coverage</dt><dd id="coverage">—</dd>
+      <dt>Latest minute</dt><dd id="latest-time">—</dd>
+      <dt>Latest TOB</dt><dd id="latest-tob">—</dd>
+      <dt>Fillable @ $100</dt><dd id="latest-fill">—</dd>
+      <dt>CSV</dt><dd id="csv-path">logs/minutes.csv</dd>
+    </dl>
+    <p class="hint" id="csv-hint">Minute bars are written to logs/minutes.csv (one row per completed minute). A blank fillable@$100 cell means that side was too thin for every sample in the minute.</p>
+    <pre id="log-tail" hidden></pre>
+  </section>
+
+  <section>
+    <h2>Analyze</h2>
+    <p class="hint">One click runs <span class="mono">python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48</span> on logs/minutes.csv.</p>
+    <button id="analyze" type="button">Analyze last 24h</button>
+    <p id="analyze-msg" class="hint"></p>
+    <div class="gates" id="gates">
+      <article class="gate">
+        <div class="id">G1</div>
+        <div class="sub">SELL entropy GATE net p50 (rebate 0)</div>
+        <div class="val" id="g1">—</div>
+      </article>
+      <article class="gate">
+        <div class="id">G2</div>
+        <div class="sub">BUY entropy GATE net p50 (rebate 0)</div>
+        <div class="val" id="g2">—</div>
+      </article>
+      <article class="gate">
+        <div class="id">G3 · slip p90</div>
+        <div class="sub">slip@$100 p90 (TOB edge − average fill)</div>
+        <div class="val" id="g3">—</div>
+      </article>
+      <article class="gate">
+        <div class="id">G4 · depth_ok_frac</div>
+        <div class="sub">mean depth_ok_frac, both sides fillable at ≥ $100</div>
+        <div class="val" id="g4">—</div>
+      </article>
+    </div>
+    <p class="hint" id="slip-line">slip p90: — · depth_ok_frac: —</p>
+    <pre id="analyze-out" hidden></pre>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+
+function dash(value) {
+  return value == null || value === "" ? "—" : String(value);
+}
+
+function fmtUptime(sec) {
+  if (sec == null) return "—";
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h) return h + "h " + m + "m " + s + "s";
+  if (m) return m + "m " + s + "s";
+  return s + "s";
+}
+
+function pct(frac) {
+  if (frac == null || Number.isNaN(frac)) return "—";
+  return (frac * 100).toFixed(1) + "%";
+}
+
+function preview() {
+  const symbol = ($("symbol").value || "SNDK").trim().toUpperCase();
+  const hedge = $("hedge").value;
+  $("cmd-preview").textContent =
+    "python3 main.py --record-only --no-dashboard --symbol " + symbol + " --hedge " + hedge;
+}
+
+function renderStatus(s) {
+  $("running").textContent = s.running ? "running" : "stopped";
+  $("pid").textContent = dash(s.pid);
+  $("uptime").textContent = fmtUptime(s.uptime_sec);
+  $("market").textContent = (s.symbol && s.hedge) ? (s.symbol + " / " + s.hedge) : "—";
+  $("minutes").textContent = dash(s.minutes_collected);
+  const cov = s.samples_coverage || {};
+  const latestN = cov.latest_samples == null ? "—" : (cov.latest_samples + "/60");
+  $("coverage").textContent =
+    "latest " + latestN + " (" + pct(cov.latest_frac) + ")" +
+    " · recent " + pct(cov.recent_frac) +
+    " · all minutes " + pct(cov.mean_frac);
+  const latest = s.latest;
+  if (!latest) {
+    $("latest-time").textContent = "—";
+    $("latest-tob").textContent = "—";
+    $("latest-fill").textContent = "—";
+  } else {
+    $("latest-time").textContent = dash(latest.time_utc);
+    const tob = latest.tob || {};
+    $("latest-tob").textContent =
+      "entropy " + dash(tob.entropy_bid) + " / " + dash(tob.entropy_ask) +
+      " · hedge " + dash(tob.hedge_bid) + " / " + dash(tob.hedge_ask) +
+      " · premium close " + dash(tob.premium_close_bps) + " bps" +
+      " · sell edge " + dash(tob.sell_edge_mean_bps) +
+      " · buy edge " + dash(tob.buy_edge_mean_bps);
+    const fill = latest.fillable_100 || {};
+    $("latest-fill").textContent =
+      "sell " + dash(fill.sell_bps) + " bps · buy " + dash(fill.buy_bps) + " bps";
+  }
+  $("csv-path").textContent = s.csv_path || "logs/minutes.csv";
+  if (s.csv_hint) $("csv-hint").textContent = s.csv_hint +
+    " A blank fillable@$100 cell means that side was too thin for every sample in the minute.";
+
+  const warnings = s.warnings || [];
+  const list = $("warnings");
+  list.replaceChildren();
+  for (const w of warnings) {
+    const li = document.createElement("li");
+    li.textContent = w;
+    list.appendChild(li);
+  }
+  $("warn-box").hidden = warnings.length === 0;
+
+  const tail = s.log_tail || [];
+  $("log-tail").hidden = tail.length === 0;
+  $("log-tail").textContent = tail.join("\n");
+
+  $("start").disabled = !!s.running;
+  $("stop").disabled = !s.running && s.pid == null;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/status");
+    renderStatus(await res.json());
+  } catch (err) {
+    $("running").textContent = "status unavailable";
+  }
+}
+
+$("symbol").addEventListener("input", preview);
+$("hedge").addEventListener("change", preview);
+
+$("form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("start").disabled = true;
+  const res = await fetch("/api/start", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      symbol: $("symbol").value,
+      hedge: $("hedge").value,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    alert(body.detail || "start failed");
+  }
+  await refresh();
+});
+
+$("stop").addEventListener("click", async () => {
+  $("stop").disabled = true;
+  await fetch("/api/stop", {method: "POST"});
+  await refresh();
+});
+
+function gateText(node, value, suffix) {
+  node.textContent = value == null || value === "" ? "—" : (value + (suffix || ""));
+}
+
+$("analyze").addEventListener("click", async () => {
+  $("analyze").disabled = true;
+  $("analyze-msg").textContent = "running analyzer…";
+  $("analyze-msg").className = "hint";
+  try {
+    const res = await fetch("/api/analyze", {method: "POST"});
+    const body = await res.json();
+    const gates = body.gates || {};
+    const g1 = gates.G1 || {};
+    const g2 = gates.G2 || {};
+    const g3 = gates.G3 || {};
+    const g4 = gates.G4 || {};
+    gateText($("g1"), g1.text, g1.text ? " bps" : "");
+    gateText($("g2"), g2.text, g2.text ? " bps" : "");
+    const slipSell = g3.sell_text || "n/a";
+    const slipBuy = g3.buy_text || "n/a";
+    $("g3").textContent = "SELL " + slipSell + " · BUY " + slipBuy + " bps";
+    gateText($("g4"), g4.text, "");
+    const slip = body.slip_p90 || {};
+    $("slip-line").textContent =
+      "slip p90: SELL " + dash(slip.sell_text) + " bps · BUY " + dash(slip.buy_text) +
+      " bps · depth_ok_frac: " + dash(body.depth_ok_frac_text);
+    const chunks = [];
+    if (body.stderr) chunks.push(body.stderr.trim());
+    if (body.stdout) chunks.push(body.stdout.trim());
+    $("analyze-out").hidden = chunks.length === 0;
+    $("analyze-out").textContent = chunks.join("\n\n");
+    if (!body.ok) {
+      $("analyze-msg").textContent = body.stderr
+        ? "analyzer exited without a full report — see the output below"
+        : "analyzer failed";
+      $("analyze-msg").className = "hint err";
+    } else {
+      $("analyze-msg").textContent = body.basis || "analyzer finished";
+      $("analyze-msg").className = "hint";
+    }
+  } catch (err) {
+    $("analyze-msg").textContent = "analyze request failed";
+    $("analyze-msg").className = "hint err";
+  } finally {
+    $("analyze").disabled = false;
+  }
+});
+
+preview();
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
