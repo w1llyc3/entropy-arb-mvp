@@ -102,3 +102,44 @@ G3 is slip@$100 **p90**. G4 is the mean of `depth_ok_frac`.
 Midline is still the p50 of minute-close premium. Upper/lower suggestions
 are the p90 of fee-adjusted room (rebate 0) on the fillable@$100 series
 when that series exists.
+
+## Localhost panel
+
+A browser on this machine can start and stop record-only collection and run
+the analyzer. The panel binds **127.0.0.1** only. It has no trading control,
+no API-key form, and no `.env` editor. Start always launches:
+
+```bash
+python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter
+```
+
+Symbol and hedge can be changed in the page. The default hedge is `lighter`.
+The recorder's pid file is `.web/recorder.pid`.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-web.txt
+python3 -m web
+```
+
+Open <http://127.0.0.1:8765>. Optional: `python3 -m web --port 8765`.
+
+The Analyze button runs exactly:
+
+```bash
+python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48
+```
+
+and labels the result:
+
+| id | number |
+|---|---|
+| G1 | SELL entropy GATE net p50 (pre-fee median − `--fees-bps`, rebate 0) |
+| G2 | BUY entropy GATE net p50 (same rule) |
+| G3 | slip@$100 p90 |
+| G4 | mean `depth_ok_frac` |
+
+Minute bars stay at `logs/minutes.csv` (one row per completed minute). The
+status view reads that file for minutes collected, samples coverage, and the
+latest top-of-book and fillable@$100 cells. It warns when the pid file's
+process is gone or when recent minutes are thin or stale.

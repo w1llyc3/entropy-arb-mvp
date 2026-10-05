@@ -5,6 +5,7 @@
 # runtime output / 运行时输出
 logs/
 *.log
+.web/
 
 # python
 __pycache__/
