@@ -76,17 +76,31 @@ returns one), the recorder stores the last sample in the minute.
 ## Gate vs accrual (analyze)
 
 `tools/analyze.py` defaults `--fees-bps` to **0.9** (Entropy 0.9 + Lighter 0
-for SNDK). If the CSV has `fill_*_edge_100_bps`, firing stats and the
-threshold suggestion use those minute means. If the columns are absent it
-falls back to `sell_edge_max_bps` / `buy_edge_max_bps` and warns.
+for SNDK). Rebate is forced to **0** on every gate. If the CSV has
+`fill_*_edge_100_bps`, firing stats, gates, and the threshold suggestion use
+those minute means. If the columns are absent it falls back to
+`sell_edge_max_bps` / `buy_edge_max_bps` and warns.
 
-For fillable@$100 it prints median (**p50**) in three columns:
+For fillable@$100 it prints median (**p50**) in three columns. The middle
+column is a **contrast**, not a Gate id:
 
 1. **Pre-fee edge** — recorded marginal edge.
-2. **GATE net-fee edge** = pre-fee − `--fees-bps`, **rebate forced to 0**.
-   This is the only gate metric.
-3. **Accrual-rebate edge (display only)** = gate + a haircut rebate.
+2. **Net-fee edge** = pre-fee − `--fees-bps`, **rebate forced to 0**.
+   Printed again under the gates as **SELL entropy net p50** and **BUY
+   entropy net p50**.
+3. **Accrual-rebate edge (display only)** = net-fee edge + a haircut rebate.
    Not an input to thresholds and not cash.
+
+### Locked gates
+
+SELL and BUY net p50 are never G1 or G2. Each gate is one number.
+
+| id | rule | number to read |
+|---|---|---|
+| **G1** | Conservative fillable@$100 net-fee median **> 0**. The value is the **worse** of SELL net p50 and BUY net p50 (fees = `--fees-bps`, rebate 0). A missing side fails. | signed bps. **PASS** iff `> 0`. Answers “is net edge positive?” |
+| **G2** | Robustness. Upper/lower bases are the **p90** of fee-adjusted room (rebate 0), **before** the 1 bps floor on the pasted suggestion. Shift each base to **×0.5** and **×1.5**. A minute fires when its room is at least that hurdle; the firing’s net edge is the room. **PASS** iff every firing is **≥ 0**. | worst firing net edge, signed bps. **PASS** iff `≥ 0`. `n/a` and **PASS** when nothing fired. |
+| **G3** | On each side, slip@$100 **p90 <** that side’s net-edge p50. **PASS** only when both sides pass (strict `<`). | worse slack `net p50 − slip p90`, signed bps. **PASS** iff slack `> 0`. The line is the comparison, not slip alone. |
+| **G4** | Shallow book: **mean `depth_ok_frac`** (both directions fillable at ≥ $100). Also `thin_frac`, the share of those minutes with `depth_ok_frac` = 0 (too thin on every sample). | mean fraction in `[0, 1]`, plus `thin_frac`. No pass/fail cut. |
 
 Rebate math (display only), from
 [Entropy referrals](https://docs.entropy.io/about-entropy/referrals):
@@ -97,11 +111,10 @@ Rebate math (display only), from
   `self_t3` = 160% and `self_t4` = 200% of the same share (early-bird table).
 - Shipped config: `0.9 × 0.50 × (1 − 0.90) × 1.00 = 0.045` bps recognized.
 
-G3 is slip@$100 **p90**. G4 is the mean of `depth_ok_frac`.
-
 Midline is still the p50 of minute-close premium. Upper/lower suggestions
 are the p90 of fee-adjusted room (rebate 0) on the fillable@$100 series
-when that series exists.
+when that series exists, then floored at 1 bps for the pasted snippet.
+G2 uses that same p90 **before** the floor.
 
 ## Localhost panel
 
@@ -130,14 +143,10 @@ The Analyze button runs exactly:
 python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48
 ```
 
-and labels the result:
-
-| id | number |
-|---|---|
-| G1 | SELL entropy GATE net p50 (pre-fee median − `--fees-bps`, rebate 0) |
-| G2 | BUY entropy GATE net p50 (same rule) |
-| G3 | slip@$100 p90 |
-| G4 | mean `depth_ok_frac` |
+and shows the locked G1–G4 lines from that stdout (pass/fail on G1–G3).
+SELL entropy net p50 and BUY entropy net p50 are contrast columns under
+the gates, not Gate ids. Read the four numbers the same way as the table
+in [Locked gates](#locked-gates).
 
 Minute bars stay at `logs/minutes.csv` (one row per completed minute). The
 status view reads that file for minutes collected, samples coverage, and the

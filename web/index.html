@@ -81,6 +81,8 @@
     .gate .id { color: var(--accent); font-weight: 650; }
     .gate .val { font-size: 1.25rem; margin-top: 4px; }
     .gate .sub { color: var(--muted); font-size: 0.85rem; }
+    .ok { color: #7dffa1; }
+    .bad { color: var(--bad); }
     pre {
       white-space: pre-wrap;
       word-break: break-word;
@@ -151,26 +153,26 @@
     <div class="gates" id="gates">
       <article class="gate">
         <div class="id">G1</div>
-        <div class="sub">SELL entropy GATE net p50 (rebate 0)</div>
+        <div class="sub" id="g1-sub">fillable@$100 conservative net-fee median &gt; 0 (worse of SELL/BUY, rebate 0)</div>
         <div class="val" id="g1">—</div>
       </article>
       <article class="gate">
         <div class="id">G2</div>
-        <div class="sub">BUY entropy GATE net p50 (rebate 0)</div>
+        <div class="sub" id="g2-sub">±50% shift of p90 upper/lower (before 1 bps floor); worst firing net edge &gt;= 0</div>
         <div class="val" id="g2">—</div>
       </article>
       <article class="gate">
-        <div class="id">G3 · slip p90</div>
-        <div class="sub">slip@$100 p90 (TOB edge − average fill)</div>
+        <div class="id">G3</div>
+        <div class="sub" id="g3-sub">slip@$100 p90 &lt; net-edge p50 (worse slack, not slip alone)</div>
         <div class="val" id="g3">—</div>
       </article>
       <article class="gate">
         <div class="id">G4 · depth_ok_frac</div>
-        <div class="sub">mean depth_ok_frac, both sides fillable at ≥ $100</div>
+        <div class="sub" id="g4-sub">mean depth_ok_frac, both sides fillable at ≥ $100; thin_frac = minutes entirely too thin</div>
         <div class="val" id="g4">—</div>
       </article>
     </div>
-    <p class="hint" id="slip-line">slip p90: — · depth_ok_frac: —</p>
+    <p class="hint" id="contrast-line">Contrast (not Gate ids): SELL entropy net p50 — · BUY entropy net p50 —</p>
     <pre id="analyze-out" hidden></pre>
   </section>
 </main>
@@ -292,8 +294,16 @@ $("stop").addEventListener("click", async () => {
   await refresh();
 });
 
-function gateText(node, value, suffix) {
-  node.textContent = value == null || value === "" ? "—" : (value + (suffix || ""));
+function showVerdict(node, gate, suffix) {
+  if (!gate || (gate.text == null && gate.pass == null)) {
+    node.textContent = "—";
+    node.className = "val";
+    return;
+  }
+  const mark = gate.pass === true ? "PASS" : (gate.pass === false ? "FAIL" : "");
+  const num = gate.text == null ? "n/a" : (gate.text + (suffix || ""));
+  node.textContent = mark ? (mark + " · " + num) : num;
+  node.className = "val " + (gate.pass === true ? "ok" : (gate.pass === false ? "bad" : ""));
 }
 
 $("analyze").addEventListener("click", async () => {
@@ -308,16 +318,28 @@ $("analyze").addEventListener("click", async () => {
     const g2 = gates.G2 || {};
     const g3 = gates.G3 || {};
     const g4 = gates.G4 || {};
-    gateText($("g1"), g1.text, g1.text ? " bps" : "");
-    gateText($("g2"), g2.text, g2.text ? " bps" : "");
+    if (g1.label) $("g1-sub").textContent = g1.label;
+    if (g2.label) $("g2-sub").textContent = g2.label;
+    if (g3.label) $("g3-sub").textContent = g3.label;
+    showVerdict($("g1"), g1, g1.text ? " bps" : "");
+    showVerdict($("g2"), g2, g2.text ? " bps" : "");
+    showVerdict($("g3"), g3, g3.text ? " bps" : "");
     const slipSell = g3.sell_text || "n/a";
     const slipBuy = g3.buy_text || "n/a";
-    $("g3").textContent = "SELL " + slipSell + " · BUY " + slipBuy + " bps";
-    gateText($("g4"), g4.text, "");
-    const slip = body.slip_p90 || {};
-    $("slip-line").textContent =
-      "slip p90: SELL " + dash(slip.sell_text) + " bps · BUY " + dash(slip.buy_text) +
-      " bps · depth_ok_frac: " + dash(body.depth_ok_frac_text);
+    const netSell = g3.sell_net_text || "n/a";
+    const netBuy = g3.buy_net_text || "n/a";
+    $("g3-sub").textContent =
+      (g3.label || "slip@$100 p90 < net-edge p50") +
+      " · SELL slip " + slipSell + " vs net " + netSell +
+      " · BUY slip " + slipBuy + " vs net " + netBuy;
+    const thin = g4.thin_text == null ? "n/a" : g4.thin_text;
+    $("g4").textContent = (g4.text == null ? "—" : g4.text) + " · thin_frac " + thin;
+    $("g4").className = "val";
+    const contrast = body.contrast || {};
+    $("contrast-line").textContent =
+      "Contrast (not Gate ids): SELL entropy net p50 " +
+      dash(contrast.sell_net_p50_text) + " bps · BUY entropy net p50 " +
+      dash(contrast.buy_net_p50_text) + " bps";
     const chunks = [];
     if (body.stderr) chunks.push(body.stderr.trim());
     if (body.stdout) chunks.push(body.stdout.trim());
