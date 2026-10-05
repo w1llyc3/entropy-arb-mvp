@@ -5,9 +5,10 @@ Reads the CSV written by the built-in recorder (logs/minutes.csv by default)
 and prints:
 
   * the premium distribution (midline candidates),
-  * fillable-at-$100 edge: pre-fee p50, the Gate (net of fees, rebate 0),
+  * fillable-at-$100 contrast columns: pre-fee p50, net p50 (rebate 0),
     and an accrual-rebate figure that is display-only,
-  * slip@100 p90 and mean depth_ok_frac (G3 / G4),
+  * Gates G1–G4 (worse net median, ±50% band robustness, slip vs net edge,
+    mean depth_ok_frac),
   * how often each candidate upper/lower band would have fired,
   * a ready-to-paste `thresholds:` snippet.
 
@@ -15,8 +16,8 @@ When the CSV has ``fill_*_edge_100_bps`` columns, firing stats use those
 minute means. Older files fall back to top-of-book ``sell/buy_edge_max``
 with a warning.
 
-分析机器人自动采集的分钟级盘口数据。Gate 用 $100 可成交边际溢价减去手续费
-（返佣强制为 0）。应计返佣只展示，不参与 Gate。
+分析机器人自动采集的分钟级盘口数据。G1 取买卖两侧 $100 可成交净边际
+（手续费按 --fees-bps，返佣强制为 0）的较差中位数。应计返佣只展示，不参与 Gate。
 
 Usage:
     python3 tools/analyze.py
@@ -187,9 +188,14 @@ def firing_room(rows: list, side: str, midline: float, fees: float,
 
 def summarize_fillable(rows: list, fees: float, rebate_bps: float,
                        used_fillable: bool) -> dict:
-    """p50 pre-fee / gate / accrual, plus G3 slip p90 and G4 depth."""
+    """Per-side p50 pre-fee / net / accrual, plus slip p90 and depth.
+
+    ``net_p50`` is pre-fee median minus ``fees`` with rebate forced to 0.
+    It is a contrast column. Gate G1 is the worse of the two sides, computed
+    later by :func:`evaluate_gates`.
+    """
     out = {"used_fillable": used_fillable, "fees": fees, "rebate_bps": rebate_bps}
-    for side, key in (("sell", "sell"), ("buy", "buy")):
+    for side in ("sell", "buy"):
         vals = [v for v in (_edge_for(r, side, used_fillable) for r in rows)
                 if v is not None]
         vals.sort()
@@ -197,7 +203,7 @@ def summarize_fillable(rows: list, fees: float, rebate_bps: float,
         out[side] = {
             "n": len(vals),
             "pre_p50": pre,
-            "gate_p50": pre - fees,
+            "net_p50": pre - fees,
             "accrual_p50": pre - fees + rebate_bps,
         }
     slips = {}
@@ -208,31 +214,50 @@ def summarize_fillable(rows: list, fees: float, rebate_bps: float,
     depths = [r["depth_ok"] for r in rows if r["depth_ok"] is not None]
     out["depth_n"] = len(depths)
     out["depth_mean"] = (sum(depths) / len(depths)) if depths else float("nan")
+    # A minute is entirely too thin when no sample had both sides fillable
+    # at >= $100 (depth_ok_frac == 0).
+    thin = sum(1 for d in depths if d == 0.0)
+    out["depth_thin_n"] = thin
+    out["depth_thin_frac"] = (thin / len(depths)) if depths else float("nan")
     return out
 
 
 def _fmt(val: float) -> str:
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return "n/a"
+    if isinstance(val, float) and math.isinf(val):
+        return "-inf" if val < 0 else "+inf"
     return f"{val:+.2f}"
 
 
+def _finite(val) -> bool:
+    return isinstance(val, (int, float)) and math.isfinite(val)
+
+
+def _verdict(flag: bool) -> str:
+    return "PASS" if flag else "FAIL"
+
+
+def _basis_label(used_fillable: bool) -> str:
+    return ("fillable@$100 minute-mean" if used_fillable
+            else "FALLBACK top-of-book edge max")
+
+
 def print_fillable_summary(summary: dict, assumptions: dict) -> None:
-    basis = ("fillable@$100 minute-mean" if summary["used_fillable"]
-             else "FALLBACK top-of-book edge max")
+    basis = _basis_label(summary["used_fillable"])
     fees = summary["fees"]
     rebate = summary["rebate_bps"]
     print(f"fillable edge @ $100 notional — median (p50), basis: {basis}")
     print(f"  {'direction':<16} | {'pre-fee p50':>12} | "
-          f"{'GATE net p50':>12} | {'accrual p50':>12}")
+          f"{'net p50':>12} | {'accrual p50':>12}")
     print(f"  {'':<16} | {'':>12} | {'rebate=0':>12} | {'display only':>12}")
     for side, label in (("sell", "SELL entropy"), ("buy", "BUY entropy")):
         s = summary[side]
         print(f"  {label:<16} | {_fmt(s['pre_p50']):>12} | "
-              f"{_fmt(s['gate_p50']):>12} | {_fmt(s['accrual_p50']):>12}"
+              f"{_fmt(s['net_p50']):>12} | {_fmt(s['accrual_p50']):>12}"
               f"   (n={s['n']})")
-    print(f"  GATE = pre-fee p50 − {fees:.1f} bps taker fees. "
-          f"Rebate is forced to 0. This is the only gate number.")
+    print(f"  net p50 = pre-fee p50 − {fees:.1f} bps taker fees, rebate 0. "
+          f"Contrast column only — not a Gate id. G1 is the worse of the two.")
     rate_pct = assumptions["referral_rate"] * 100.0
     kept = (1.0 - assumptions["growth_haircut"]) * 100.0
     print(f"  Accrual (NOT a gate, never realized cash), from "
@@ -243,19 +268,173 @@ def print_fillable_summary(summary: dict, assumptions: dict) -> None:
           f"{assumptions['growth_haircut']:.2f} "
           f"× {assumptions['referral_mode']} {rate_pct:.0f}% "
           f"= {rebate:.4f} bps recognized.")
-    print(f"    accrual p50 = GATE p50 + {rebate:.4f}. "
+    print(f"    accrual p50 = net p50 + {rebate:.4f}. "
           f"Do not trade off this column.")
-    ss, sb = summary["slip"]["sell"], summary["slip"]["buy"]
-    print(f"  G3 slip@$100 p90 (TOB edge − average-fill edge, bps): "
-          f"SELL {_fmt(ss['p90'])} (n={ss['n']})   "
-          f"BUY {_fmt(sb['p90'])} (n={sb['n']})")
-    if summary["depth_n"]:
-        print(f"  G4 mean depth_ok_frac "
-              f"(both directions fillable at ≥$100): "
-              f"{summary['depth_mean']:.4f} over {summary['depth_n']} minutes")
-    else:
-        print("  G4 mean depth_ok_frac: n/a (column absent or blank)")
     print()
+
+
+def _g1(summary: dict) -> dict:
+    """Worse of the two fillable@$100 net medians. Pass iff > 0."""
+    sell = summary["sell"]["net_p50"]
+    buy = summary["buy"]["net_p50"]
+    label = ("fillable@$100 conservative net-fee median > 0 "
+             "(worse of SELL/BUY, rebate 0)")
+    if not _finite(sell) or not _finite(buy):
+        return {"value": None, "pass": False, "label": label,
+                "sell": sell, "buy": buy}
+    value = min(sell, buy)
+    return {"value": value, "pass": value > 0, "label": label,
+            "sell": sell, "buy": buy}
+
+
+def _shifted_firings(room: list, base: float):
+    """×0.5 and ×1.5 hurdles, and the net edge (room) of each firing."""
+    if not _finite(base) and not (isinstance(base, float) and math.isinf(base)):
+        return None
+    shifts = (base * 0.5, base * 1.5)
+    fired = [edge for hurdle in shifts for edge in room if edge >= hurdle]
+    return shifts, fired
+
+
+def _g2(sell_room: list, buy_room: list) -> dict:
+    """±50% shift of the p90 upper/lower bands.
+
+    Bases are the p90 of fee-adjusted room (rebate already 0), before the
+    1 bps floor used on the pasted suggestion. A minute fires when its room
+    is at least the shifted hurdle. That firing's net edge is the room.
+    Pass iff every firing is >= 0. No firings is a pass (nothing negative).
+    The number is the worst firing net edge.
+    """
+    label = ("±50% shift of p90 upper/lower (before 1 bps floor); "
+             "worst firing net edge >= 0")
+    sides = {}
+    fired: list = []
+    undefined = False
+    for name, room in (("upper", sell_room), ("lower", buy_room)):
+        base = pctl(sorted(room), 90)
+        shifted = _shifted_firings(room, base)
+        if shifted is None:
+            undefined = True
+            sides[name] = {"p90": base, "shifts": None}
+            continue
+        shifts, edges = shifted
+        sides[name] = {"p90": base, "shifts": shifts}
+        fired.extend(edges)
+    if undefined:
+        return {"value": None, "pass": False, "label": label,
+                "fired": False, "sides": sides}
+    finite = [e for e in fired if _finite(e)]
+    if len(finite) != len(fired):
+        # A non-finite room fired (hurdle was infinite). That edge is not >= 0.
+        return {"value": None, "pass": False, "label": label,
+                "fired": True, "sides": sides}
+    if not finite:
+        return {"value": None, "pass": True, "label": label,
+                "fired": False, "sides": sides}
+    worst = min(finite)
+    return {"value": worst, "pass": worst >= 0, "label": label,
+            "fired": True, "sides": sides}
+
+
+def _side_slip_check(net, slip) -> dict:
+    if not _finite(net) or not _finite(slip):
+        return {"pass": False, "slack": None, "net": net, "slip": slip}
+    slack = net - slip
+    return {"pass": slip < net, "slack": slack, "net": net, "slip": slip}
+
+
+def _g3(summary: dict) -> dict:
+    """Each side: slip@$100 p90 < that side's net p50. Number is worse slack."""
+    label = "slip@$100 p90 < net-edge p50 (worse slack)"
+    sell = _side_slip_check(summary["sell"]["net_p50"],
+                            summary["slip"]["sell"]["p90"])
+    buy = _side_slip_check(summary["buy"]["net_p50"],
+                           summary["slip"]["buy"]["p90"])
+    if sell["slack"] is None or buy["slack"] is None:
+        return {"value": None, "pass": False, "label": label,
+                "sell": sell, "buy": buy}
+    worst = min(sell["slack"], buy["slack"])
+    return {"value": worst, "pass": worst > 0, "label": label,
+            "sell": sell, "buy": buy}
+
+
+def _g4(summary: dict) -> dict:
+    """Shallow-book metric: mean depth_ok_frac and fraction of minutes at 0."""
+    label = "mean depth_ok_frac"
+    if not summary["depth_n"]:
+        return {"value": None, "thin_frac": None, "label": label, "n": 0}
+    return {
+        "value": summary["depth_mean"],
+        "thin_frac": summary["depth_thin_frac"],
+        "label": label,
+        "n": summary["depth_n"],
+    }
+
+
+def evaluate_gates(summary: dict, sell_room: list, buy_room: list) -> dict:
+    """Locked G1–G4 plus the SELL/BUY net p50 contrast columns."""
+    return {
+        "fees": summary["fees"],
+        "basis": _basis_label(summary["used_fillable"]),
+        "contrast": {
+            "sell": summary["sell"]["net_p50"],
+            "buy": summary["buy"]["net_p50"],
+        },
+        "G1": _g1(summary),
+        "G2": _g2(sell_room, buy_room),
+        "G3": _g3(summary),
+        "G4": _g4(summary),
+    }
+
+
+def _gate_bps_line(gid: str, gate: dict) -> str:
+    token = _fmt(gate["value"]) if gate["value"] is not None else "n/a"
+    if token == "n/a":
+        return f"{gid}: n/a {_verdict(gate['pass'])} {gate['label']}"
+    return f"{gid}: {token} bps {_verdict(gate['pass'])} {gate['label']}"
+
+
+def _shift_detail(name: str, side: dict) -> str:
+    p90 = _fmt(side["p90"])
+    shifts = side["shifts"]
+    if not shifts:
+        return f"  {name} p90 {p90} → n/a"
+    return (f"  {name} p90 {p90} → {_fmt(shifts[0])} and {_fmt(shifts[1])}")
+
+
+def format_gate_report(gates: dict) -> str:
+    """Stable stdout block. Gate lines start with ``G1:`` … ``G4:``.
+
+    SELL/BUY net p50 are printed underneath as contrast, never as G1/G2.
+    """
+    g2 = gates["G2"]
+    g3 = gates["G3"]
+    g4 = gates["G4"]
+    lines = [
+        (f"Gates (rebate forced to 0, fees {gates['fees']:.1f} bps, "
+         f"basis: {gates['basis']}):"),
+        _gate_bps_line("G1", gates["G1"]),
+        _gate_bps_line("G2", g2),
+        _shift_detail("upper", g2["sides"]["upper"]),
+        _shift_detail("lower", g2["sides"]["lower"]),
+        _gate_bps_line("G3", g3),
+    ]
+    for name, side in (("SELL", g3["sell"]), ("BUY", g3["buy"])):
+        lines.append(
+            f"  {name} slip p90 {_fmt(side['slip'])} < net p50 {_fmt(side['net'])} "
+            f"{_verdict(side['pass'])}"
+        )
+    if g4["value"] is None:
+        lines.append("G4: n/a mean depth_ok_frac thin_frac=n/a")
+    else:
+        lines.append(
+            f"G4: {g4['value']:.4f} mean depth_ok_frac "
+            f"thin_frac={g4['thin_frac']:.4f}"
+        )
+    lines.append("Contrast columns (not Gate ids):")
+    lines.append(f"SELL entropy net p50: {_fmt(gates['contrast']['sell'])} bps")
+    lines.append(f"BUY entropy net p50: {_fmt(gates['contrast']['buy'])} bps")
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -273,8 +452,8 @@ def main() -> None:
                    help="SUM of both venues' taker fees in bps (each crossing "
                         "pays both legs). Recorded edges are pre-fee. Default "
                         "0.9 = Entropy 0.9 + Lighter 0 for SNDK --hedge lighter. "
-                        "The Gate subtracts this with rebate forced to 0. "
-                        "Pass a higher sum for a tradexyz hedge.")
+                        "G1 subtracts this from the fillable@$100 median with "
+                        "rebate forced to 0. Pass a higher sum for a tradexyz hedge.")
     args = p.parse_args()
 
     try:
@@ -319,10 +498,12 @@ def main() -> None:
     # room beyond the midline that was actually executable each minute, net
     # of taker fees (config thresholds are net-of-fee: the engine adds fees
     # on top, and recorded edges are pre-fee). Rebate stays 0 here — the
-    # accrual figure above is not an input.
+    # accrual figure above is not an input. G2 shifts the p90 of this room.
     fees = args.fees_bps
     sell_room = firing_room(rows, "sell", midline, fees, used_fillable)
     buy_room = firing_room(rows, "buy", midline, fees, used_fillable)
+    print(format_gate_report(evaluate_gates(summary, sell_room, buy_room)))
+    print()
     basis = ("fillable@$100" if used_fillable
              else "top-of-book max (fillable columns missing)")
 

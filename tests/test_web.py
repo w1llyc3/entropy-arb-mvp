@@ -220,21 +220,65 @@ def test_analyze_labels_g1_through_g4(tmp_path):
     assert result["ok"] is True
     assert result["csv_path"] == "logs/minutes.csv"
     gates = result["gates"]
-    assert gates["G1"]["label"].startswith("SELL entropy GATE")
-    assert gates["G2"]["label"].startswith("BUY entropy GATE")
-    assert gates["G1"]["text"] == "+9.10"
-    assert gates["G2"]["text"] == "+3.10"
-    assert gates["G3"]["label"] == "slip@$100 p90"
+    assert "worse of SELL/BUY" in gates["G1"]["label"]
+    assert gates["G1"]["text"] == "+3.10"
+    assert gates["G1"]["pass"] is True
+    assert "±50%" in gates["G2"]["label"]
+    assert "BUY entropy" not in gates["G2"]["label"]
+    assert gates["G2"]["pass"] is True
+    assert "slip@$100 p90 < net-edge p50" in gates["G3"]["label"]
+    assert gates["G3"]["pass"] is False
+    assert gates["G3"]["text"] == "-1.70"
     assert gates["G3"]["sell_text"] == "+1.90"
     assert gates["G3"]["buy_text"] == "+4.80"
+    assert gates["G3"]["sell_pass"] is True
+    assert gates["G3"]["buy_pass"] is False
+    assert gates["G4"]["label"] == "mean depth_ok_frac"
     assert gates["G4"]["text"] == "0.5000"
+    assert gates["G4"]["thin_text"] == "0.3333"
+    assert result["contrast"]["sell_net_p50_text"] == "+9.10"
+    assert result["contrast"]["buy_net_p50_text"] == "+3.10"
     assert result["slip_p90"]["sell_text"] == "+1.90"
     assert result["slip_p90"]["buy_text"] == "+4.80"
     assert result["depth_ok_frac_text"] == "0.5000"
-    assert "G3" in result["stdout"] and "G4" in result["stdout"]
-    # the firing table also mentions SELL entropy; it must not replace G1
+    assert "G1:" in result["stdout"] and "G4:" in result["stdout"]
+    # the firing table and contrast columns also mention SELL entropy;
+    # they must not replace G1 (the worse median, +3.10, not SELL +9.10)
     again = parse_analyze(result["stdout"])
-    assert again["gates"]["G1"]["text"] == "+9.10"
+    assert again["gates"]["G1"]["text"] == "+3.10"
+    assert again["contrast"]["sell_net_p50_text"] == "+9.10"
+
+
+def test_parse_reads_gate_lines_not_the_contrast_table():
+    stdout = """
+  SELL entropy     |       +10.00 |       +9.10 |      +9.15   (n=2)
+  BUY entropy      |        +4.00 |       +3.10 |      +3.15   (n=3)
+G1: +1.00 bps FAIL fillable@$100 conservative net-fee median > 0 (worse of SELL/BUY, rebate 0)
+G2: n/a PASS ±50% shift of p90 upper/lower (before 1 bps floor); worst firing net edge >= 0
+G3: +0.50 bps PASS slip@$100 p90 < net-edge p50 (worse slack)
+  SELL slip p90 +0.10 < net p50 +1.00 PASS
+  BUY slip p90 +0.20 < net p50 +1.00 PASS
+G4: 0.2500 mean depth_ok_frac thin_frac=0.5000
+Contrast columns (not Gate ids):
+SELL entropy net p50: +9.10 bps
+BUY entropy net p50: +3.10 bps
+"""
+    parsed = parse_analyze(stdout)
+    assert parsed["gates"]["G1"]["text"] == "+1.00"
+    assert parsed["gates"]["G1"]["pass"] is False
+    assert "worse of SELL/BUY" in parsed["gates"]["G1"]["label"]
+    assert parsed["gates"]["G2"]["text"] is None
+    assert parsed["gates"]["G2"]["pass"] is True
+    assert "±50%" in parsed["gates"]["G2"]["label"]
+    assert parsed["gates"]["G3"]["text"] == "+0.50"
+    assert parsed["gates"]["G3"]["pass"] is True
+    assert parsed["gates"]["G3"]["sell_text"] == "+0.10"
+    assert parsed["gates"]["G3"]["buy_pass"] is True
+    assert parsed["gates"]["G4"]["text"] == "0.2500"
+    assert parsed["gates"]["G4"]["thin_text"] == "0.5000"
+    assert parsed["contrast"]["sell_net_p50_text"] == "+9.10"
+    assert parsed["contrast"]["buy_net_p50_text"] == "+3.10"
+    assert parsed["gates"]["G1"]["text"] != parsed["contrast"]["sell_net_p50_text"]
 
 
 def test_panel_pages_and_routes(tmp_path):
@@ -251,8 +295,13 @@ def test_panel_pages_and_routes(tmp_path):
         html = page.text
         assert "Start record-only" in html
         assert "logs/minutes.csv" in html
-        for label in ("G1", "G2", "G3", "G4", "slip p90", "depth_ok_frac"):
+        for label in ("G1", "G2", "G3", "G4", "depth_ok_frac",
+                      "worse of SELL/BUY", "±50%", "slip@$100 p90",
+                      "net-edge p50", "SELL entropy net p50",
+                      "BUY entropy net p50"):
             assert label in html
+        assert "BUY entropy GATE" not in html
+        assert "GATE net p50" not in html
         assert "Start live" not in html
         assert 'type="password"' not in html
         assert ".env" not in html
@@ -361,12 +410,19 @@ def test_http_analyze_shows_labeled_gates(tmp_path):
         body = client.post("/api/analyze").json()
     assert body["ok"] is True
     assert body["command"] == ANALYZE_COMMAND
-    assert body["gates"]["G1"]["text"] == "+9.10"
-    assert body["gates"]["G2"]["text"] == "+2.10"
+    assert body["gates"]["G1"]["text"] == "+2.10"
+    assert body["gates"]["G1"]["pass"] is True
+    assert "worse of SELL/BUY" in body["gates"]["G1"]["label"]
+    assert "±50%" in body["gates"]["G2"]["label"]
+    assert body["gates"]["G2"]["pass"] is True
+    assert body["gates"]["G3"]["pass"] is False
+    assert "slip@$100 p90 < net-edge p50" in body["gates"]["G3"]["label"]
     assert body["gates"]["G4"]["text"] == "0.7500"
+    assert body["gates"]["G4"]["thin_text"] == "0.0000"
+    assert body["contrast"]["sell_net_p50_text"] == "+9.10"
+    assert body["contrast"]["buy_net_p50_text"] == "+2.10"
     assert body["slip_p90"]["sell_text"] == "+1.90"
     assert body["depth_ok_frac_text"] == "0.7500"
-    assert "slip" in body["gates"]["G3"]["label"]
 
 
 def test_main_binds_loopback_only(monkeypatch):

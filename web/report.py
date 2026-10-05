@@ -1,12 +1,14 @@
 """Status from logs/minutes.csv and a parse of tools/analyze.py output.
 
-Numbers shown as G1–G4 come from the analyzer's own text so the panel and
-the CLI cannot drift apart:
+Numbers shown as G1–G4 come from the analyzer's own ``G1:`` … ``G4:`` lines
+so the panel and the CLI cannot drift apart:
 
-  G1  SELL entropy GATE net p50 (pre-fee median − fees, rebate forced to 0)
-  G2  BUY entropy GATE net p50  (same rule)
-  G3  slip@$100 p90
-  G4  mean depth_ok_frac
+  G1  worse of SELL/BUY fillable@$100 net p50 (rebate 0) > 0
+  G2  ±50% shift of p90 upper/lower; worst firing net edge >= 0
+  G3  slip@$100 p90 < that side's net-edge p50 (worse slack)
+  G4  mean depth_ok_frac, plus thin_frac
+
+SELL entropy net p50 and BUY entropy net p50 are contrast columns, not gates.
 """
 from __future__ import annotations
 
@@ -252,21 +254,49 @@ def _num(token: str) -> Optional[float]:
     return value
 
 
-def _text_num(token: str) -> Optional[str]:
-    token = token.strip().split()[0] if token else ""
-    if not token or token == "n/a":
-        return None
-    if _num(token) is None:
-        return None
-    return token
+_GATE_BPS = re.compile(
+    r"^(G[123]):\s+(\S+)\s+bps\s+(PASS|FAIL)\b(?:\s+(.*))?$")
+_GATE_NA = re.compile(r"^(G[123]):\s+n/a\s+(PASS|FAIL)\b(?:\s+(.*))?$")
+_GATE_G4 = re.compile(
+    r"^G4:\s+(\S+)\s+mean depth_ok_frac\s+thin_frac=(\S+)\s*$")
+_G3_SIDE = re.compile(
+    r"^(SELL|BUY) slip p90\s+(\S+)\s+<\s+net p50\s+(\S+)\s+(PASS|FAIL)\b")
+_CONTRAST = re.compile(r"^(SELL|BUY) entropy net p50:\s+(\S+)")
+
+
+def _gate_shell(gid: str, label: str, unit: str) -> dict:
+    return {
+        "id": gid,
+        "label": label,
+        "value": None,
+        "text": None,
+        "unit": unit,
+        "pass": None,
+    }
 
 
 def parse_analyze(stdout: str) -> dict:
-    """Pull G1–G4 out of ``tools/analyze.py`` stdout."""
-    g1 = g2 = None
-    g1_text = g2_text = None
-    slip = {"sell": None, "buy": None, "sell_text": None, "buy_text": None,
-            "sell_n": None, "buy_n": None}
+    """Pull G1–G4 out of the analyzer's ``G1:`` … ``G4:`` lines.
+
+    The fillable table also contains SELL/BUY net p50. Those rows are
+    contrast columns and must not be read as gates.
+    """
+    gates = {
+        "G1": _gate_shell("G1", "", "bps"),
+        "G2": _gate_shell("G2", "", "bps"),
+        "G3": _gate_shell("G3", "", "bps"),
+        "G4": _gate_shell("G4", "mean depth_ok_frac", "fraction"),
+    }
+    gates["G3"].update({
+        "sell": None, "buy": None, "sell_text": None, "buy_text": None,
+        "sell_net_text": None, "buy_net_text": None,
+        "sell_pass": None, "buy_pass": None,
+    })
+    gates["G4"]["thin_frac"] = None
+    gates["G4"]["thin_text"] = None
+    slip = {"sell": None, "buy": None, "sell_text": None, "buy_text": None}
+    contrast = {"sell_net_p50": None, "buy_net_p50": None,
+                "sell_net_p50_text": None, "buy_net_p50_text": None}
     depth = None
     depth_text = None
     basis = None
@@ -274,75 +304,59 @@ def parse_analyze(stdout: str) -> dict:
         stripped = line.strip()
         if stripped.startswith("fillable edge @"):
             basis = stripped
-        if "|" in line:
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) >= 3:
-                if parts[0].startswith("SELL entropy"):
-                    g1_text = _text_num(parts[2])
-                    g1 = _num(parts[2])
-                elif parts[0].startswith("BUY entropy"):
-                    g2_text = _text_num(parts[2])
-                    g2 = _num(parts[2])
-        if stripped.startswith("G3"):
-            match = re.search(
-                r"SELL\s+(\S+)\s+\(n=(\d+)\).*BUY\s+(\S+)\s+\(n=(\d+)\)",
-                stripped)
-            if match:
-                slip = {
-                    "sell_text": None if match.group(1) == "n/a" else match.group(1),
-                    "sell": _num(match.group(1)),
-                    "sell_n": int(match.group(2)),
-                    "buy_text": None if match.group(3) == "n/a" else match.group(3),
-                    "buy": _num(match.group(3)),
-                    "buy_n": int(match.group(4)),
-                }
-        if stripped.startswith("G4"):
-            match = re.search(
-                r"depth_ok_frac.*?:\s*(n/a|[+-]?\d+(?:\.\d+)?)", stripped)
-            if match and match.group(1) != "n/a":
-                depth_text = match.group(1)
-                depth = _num(match.group(1))
+        matched = _GATE_BPS.match(stripped) or _GATE_NA.match(stripped)
+        if matched:
+            gid = matched.group(1)
+            token = matched.group(2)
+            verdict = matched.group(3) if _GATE_BPS.match(stripped) else matched.group(2)
+            # _GATE_NA groups: 1=id, 2=PASS/FAIL, 3=label
+            # _GATE_BPS groups: 1=id, 2=number, 3=PASS/FAIL, 4=label
+            if _GATE_BPS.match(stripped):
+                text = None if token == "n/a" else token
+                label = (matched.group(4) or "").strip()
+                value = _num(token)
+            else:
+                text = None
+                label = (matched.group(3) or "").strip()
+                value = None
+            gates[gid]["text"] = text
+            gates[gid]["value"] = value
+            gates[gid]["pass"] = verdict == "PASS"
+            if label:
+                gates[gid]["label"] = label
+            continue
+        g4 = _GATE_G4.match(stripped)
+        if g4:
+            depth_text = None if g4.group(1) == "n/a" else g4.group(1)
+            depth = _num(g4.group(1)) if depth_text else None
+            thin_text = None if g4.group(2) == "n/a" else g4.group(2)
+            gates["G4"]["text"] = depth_text
+            gates["G4"]["value"] = depth
+            gates["G4"]["thin_text"] = thin_text
+            gates["G4"]["thin_frac"] = _num(g4.group(2)) if thin_text else None
+            continue
+        side = _G3_SIDE.match(stripped)
+        if side:
+            key = side.group(1).lower()
+            slip_text = None if side.group(2) == "n/a" else side.group(2)
+            net_text = None if side.group(3) == "n/a" else side.group(3)
+            gates["G3"][key] = _num(side.group(2))
+            gates["G3"][f"{key}_text"] = slip_text
+            gates["G3"][f"{key}_net_text"] = net_text
+            gates["G3"][f"{key}_pass"] = side.group(4) == "PASS"
+            slip[key] = gates["G3"][key]
+            slip[f"{key}_text"] = slip_text
+            continue
+        contrast_m = _CONTRAST.match(stripped)
+        if contrast_m:
+            key = contrast_m.group(1).lower()
+            token = contrast_m.group(2)
+            contrast[f"{key}_net_p50_text"] = None if token == "n/a" else token
+            contrast[f"{key}_net_p50"] = _num(token)
     return {
-        "gates": {
-            "G1": {
-                "id": "G1",
-                "label": "SELL entropy GATE net p50 (rebate 0)",
-                "value": g1,
-                "text": g1_text,
-                "unit": "bps",
-            },
-            "G2": {
-                "id": "G2",
-                "label": "BUY entropy GATE net p50 (rebate 0)",
-                "value": g2,
-                "text": g2_text,
-                "unit": "bps",
-            },
-            "G3": {
-                "id": "G3",
-                "label": "slip@$100 p90",
-                "sell": slip["sell"],
-                "buy": slip["buy"],
-                "sell_text": slip["sell_text"],
-                "buy_text": slip["buy_text"],
-                "sell_n": slip["sell_n"],
-                "buy_n": slip["buy_n"],
-                "unit": "bps",
-            },
-            "G4": {
-                "id": "G4",
-                "label": "mean depth_ok_frac",
-                "value": depth,
-                "text": depth_text,
-                "unit": "fraction",
-            },
-        },
-        "slip_p90": {
-            "sell": slip["sell"],
-            "buy": slip["buy"],
-            "sell_text": slip["sell_text"],
-            "buy_text": slip["buy_text"],
-        },
+        "gates": gates,
+        "contrast": contrast,
+        "slip_p90": slip,
         "depth_ok_frac": depth,
         "depth_ok_frac_text": depth_text,
         "basis": basis,
@@ -373,6 +387,7 @@ def run_analyze(root: Path) -> dict:
             "slip_p90": None,
             "depth_ok_frac": None,
             "depth_ok_frac_text": None,
+            "contrast": None,
             "basis": None,
         }
     parsed = parse_analyze(proc.stdout or "")
