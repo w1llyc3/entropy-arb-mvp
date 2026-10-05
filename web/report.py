@@ -6,7 +6,8 @@ so the panel and the CLI cannot drift apart:
   G1  worse of SELL/BUY fillable@$100 net p50 (rebate 0) > 0
   G2  ±50% shift of p90 upper/lower; worst firing net edge >= 0
   G3  slip@$100 p90 < that side's net-edge p50 (worse slack)
-  G4  mean depth_ok_frac, plus thin_frac
+  G4  thin_frac < 0.30 is PASS (shallow book / sizing signal only);
+      mean depth_ok_frac is printed beside it
 
 SELL entropy net p50 and BUY entropy net p50 are contrast columns, not gates.
 """
@@ -258,7 +259,8 @@ _GATE_BPS = re.compile(
     r"^(G[123]):\s+(\S+)\s+bps\s+(PASS|FAIL)\b(?:\s+(.*))?$")
 _GATE_NA = re.compile(r"^(G[123]):\s+n/a\s+(PASS|FAIL)\b(?:\s+(.*))?$")
 _GATE_G4 = re.compile(
-    r"^G4:\s+(\S+)\s+mean depth_ok_frac\s+thin_frac=(\S+)\s*$")
+    r"^G4:\s+(\S+)\s+mean depth_ok_frac\s+(PASS|FAIL)\s+"
+    r"thin_frac=(\S+)\s+\(<([0-9]*\.?[0-9]+)\)(?:\s+(.*))?$")
 _G3_SIDE = re.compile(
     r"^(SELL|BUY) slip p90\s+(\S+)\s+<\s+net p50\s+(\S+)\s+(PASS|FAIL)\b")
 _CONTRAST = re.compile(r"^(SELL|BUY) entropy net p50:\s+(\S+)")
@@ -285,7 +287,11 @@ def parse_analyze(stdout: str) -> dict:
         "G1": _gate_shell("G1", "", "bps"),
         "G2": _gate_shell("G2", "", "bps"),
         "G3": _gate_shell("G3", "", "bps"),
-        "G4": _gate_shell("G4", "mean depth_ok_frac", "fraction"),
+        "G4": _gate_shell(
+            "G4",
+            "thin_frac < 0.30 (shallow book / sizing signal only)",
+            "fraction",
+        ),
     }
     gates["G3"].update({
         "sell": None, "buy": None, "sell_text": None, "buy_text": None,
@@ -329,11 +335,15 @@ def parse_analyze(stdout: str) -> dict:
         if g4:
             depth_text = None if g4.group(1) == "n/a" else g4.group(1)
             depth = _num(g4.group(1)) if depth_text else None
-            thin_text = None if g4.group(2) == "n/a" else g4.group(2)
+            thin_text = None if g4.group(3) == "n/a" else g4.group(3)
             gates["G4"]["text"] = depth_text
             gates["G4"]["value"] = depth
             gates["G4"]["thin_text"] = thin_text
-            gates["G4"]["thin_frac"] = _num(g4.group(2)) if thin_text else None
+            gates["G4"]["thin_frac"] = _num(g4.group(3)) if thin_text else None
+            gates["G4"]["pass"] = g4.group(2) == "PASS"
+            label = (g4.group(5) or "").strip()
+            if label:
+                gates["G4"]["label"] = label
             continue
         side = _G3_SIDE.match(stripped)
         if side:

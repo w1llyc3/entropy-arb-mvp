@@ -168,7 +168,7 @@
       </article>
       <article class="gate">
         <div class="id">G4 · depth_ok_frac</div>
-        <div class="sub" id="g4-sub">mean depth_ok_frac, both sides fillable at ≥ $100; thin_frac = minutes entirely too thin</div>
+        <div class="sub" id="g4-sub">thin_frac &lt; 0.30 (shallow book / sizing signal only)</div>
         <div class="val" id="g4">—</div>
       </article>
     </div>
@@ -294,6 +294,19 @@ $("stop").addEventListener("click", async () => {
   await refresh();
 });
 
+function showG4(node, gate) {
+  if (!gate || (gate.text == null && gate.thin_text == null && gate.pass == null)) {
+    node.textContent = "—";
+    node.className = "val";
+    return;
+  }
+  const mark = gate.pass === true ? "PASS" : (gate.pass === false ? "FAIL" : "");
+  const depth = gate.text == null ? "n/a" : gate.text;
+  const thin = gate.thin_text == null ? "n/a" : gate.thin_text;
+  node.textContent = (mark ? mark + " · " : "") + depth + " · thin_frac " + thin + " (<0.30)";
+  node.className = "val " + (gate.pass === true ? "ok" : (gate.pass === false ? "bad" : ""));
+}
+
 function showVerdict(node, gate, suffix) {
   if (!gate || (gate.text == null && gate.pass == null)) {
     node.textContent = "—";
@@ -332,9 +345,8 @@ $("analyze").addEventListener("click", async () => {
       (g3.label || "slip@$100 p90 < net-edge p50") +
       " · SELL slip " + slipSell + " vs net " + netSell +
       " · BUY slip " + slipBuy + " vs net " + netBuy;
-    const thin = g4.thin_text == null ? "n/a" : g4.thin_text;
-    $("g4").textContent = (g4.text == null ? "—" : g4.text) + " · thin_frac " + thin;
-    $("g4").className = "val";
+    if (g4.label) $("g4-sub").textContent = g4.label;
+    showG4($("g4"), g4);
     const contrast = body.contrast || {};
     $("contrast-line").textContent =
       "Contrast (not Gate ids): SELL entropy net p50 " +

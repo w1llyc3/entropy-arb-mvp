@@ -100,7 +100,7 @@ SELL and BUY net p50 are never G1 or G2. Each gate is one number.
 | **G1** | Conservative fillable@$100 net-fee median **> 0**. The value is the **worse** of SELL net p50 and BUY net p50 (fees = `--fees-bps`, rebate 0). A missing side fails. | signed bps. **PASS** iff `> 0`. Answers “is net edge positive?” |
 | **G2** | Robustness. Upper/lower bases are the **p90** of fee-adjusted room (rebate 0), **before** the 1 bps floor on the pasted suggestion. Shift each base to **×0.5** and **×1.5**. A minute fires when its room is at least that hurdle; the firing’s net edge is the room. **PASS** iff every firing is **≥ 0**. | worst firing net edge, signed bps. **PASS** iff `≥ 0`. `n/a` and **PASS** when nothing fired. |
 | **G3** | On each side, slip@$100 **p90 <** that side’s net-edge p50. **PASS** only when both sides pass (strict `<`). | worse slack `net p50 − slip p90`, signed bps. **PASS** iff slack `> 0`. The line is the comparison, not slip alone. |
-| **G4** | Shallow book: **mean `depth_ok_frac`** (both directions fillable at ≥ $100). Also `thin_frac`, the share of those minutes with `depth_ok_frac` = 0 (too thin on every sample). | mean fraction in `[0, 1]`, plus `thin_frac`. No pass/fail cut. |
+| **G4** | Shallow book / sizing signal. `thin_frac` is the share of minutes with `depth_ok_frac` = 0 (too thin on every sample). **PASS** iff `thin_frac < 0.30`; otherwise **FAIL**, including a missing depth column. Mean `depth_ok_frac` (both directions fillable at ≥ $100) is still printed. The signal does not stop collection and does not change orders. | `thin_frac` in `[0, 1]`. **PASS** iff `< 0.30`. Mean `depth_ok_frac` sits beside it. |
 
 Rebate math (display only), from
 [Entropy referrals](https://docs.entropy.io/about-entropy/referrals):
@@ -143,7 +143,7 @@ The Analyze button runs exactly:
 python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48
 ```
 
-and shows the locked G1–G4 lines from that stdout (pass/fail on G1–G3).
+and shows the locked G1–G4 lines from that stdout (pass/fail on G1–G4).
 SELL entropy net p50 and BUY entropy net p50 are contrast columns under
 the gates, not Gate ids. Read the four numbers the same way as the table
 in [Locked gates](#locked-gates).
