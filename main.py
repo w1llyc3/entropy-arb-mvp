@@ -26,6 +26,7 @@ import logging
 import os
 import signal
 import sys
+import traceback
 
 from entropy_arb.config import HEDGE_VENUES, ConfigError, load_config
 from entropy_arb.engine import Engine
@@ -52,12 +53,31 @@ def setup_logging(level: str, log_file: str = None,
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
+def install_stop_handlers(loop, stop) -> None:
+    """Stop on SIGINT/SIGTERM.
+
+    Unix loops implement ``add_signal_handler``. The Windows
+    ProactorEventLoop raises NotImplementedError, so fall back to
+    ``signal.signal`` and skip a signal the platform will not register.
+    """
+    def _from_signal(_signum, _frame):
+        stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop)
+        except NotImplementedError:
+            try:
+                signal.signal(sig, _from_signal)
+            except (OSError, ValueError):
+                continue
+
+
 async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
                 log_buffer, lang: str) -> None:
     eng = Engine(cfg, record_only=record_only)
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, eng.request_stop)
+    install_stop_handlers(loop, eng.request_stop)
     if not use_dashboard:
         await eng.run()
         return
@@ -136,9 +156,12 @@ def main() -> None:
                           log_buffer=log_buffer,
                           lang="zh" if args.cn else "en"))
     except RuntimeError as e:
-        # startup failures (missing credentials, market not found, venue
-        # unreachable) — a clean message, not a traceback
-        print(f"startup error: {e}", file=sys.stderr)
+        # Startup failures (missing credentials, market not found, venue
+        # unreachable, Windows signal-handler gaps). NotImplementedError is
+        # a RuntimeError whose str() is empty, so include the type and the
+        # traceback — the web panel log is the only place this shows up.
+        print(f"startup error: {type(e).__name__}: {e!r}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
 

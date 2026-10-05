@@ -55,7 +55,7 @@ def recorder_csv_rel(root: Path) -> str:
     if not cfg.is_file():
         return DEFAULT_CSV
     try:
-        raw = yaml.safe_load(cfg.read_text()) or {}
+        raw = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return DEFAULT_CSV
     rec = raw.get("recorder") if isinstance(raw, dict) else None
@@ -107,7 +107,7 @@ def read_minutes(path: Path) -> dict:
         return empty
     rows = []
     try:
-        with open(path, newline="") as fh:
+        with open(path, newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             if not reader.fieldnames:
                 empty["csv_exists"] = True

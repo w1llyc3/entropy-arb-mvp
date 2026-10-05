@@ -304,9 +304,11 @@ def _env_i(name: str) -> Optional[int]:
 
 def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 symbol: str, hedge_venue: str) -> Config:
-    load_dotenv(env_file)
+    # Explicit UTF-8: Chinese Windows opens text as GBK, and config.yaml
+    # (and .env) are UTF-8, including Chinese comments.
+    load_dotenv(env_file, encoding="utf-8")
     try:
-        with open(config_file) as fh:
+        with open(config_file, encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
     except FileNotFoundError:
         raise ConfigError(

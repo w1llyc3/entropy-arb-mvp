@@ -96,7 +96,7 @@ def load_rebate_assumptions(config_path: str) -> dict:
     if config_path and os.path.exists(config_path):
         try:
             import yaml
-            with open(config_path) as fh:
+            with open(config_path, encoding="utf-8") as fh:
                 raw = yaml.safe_load(fh) or {}
             ent = raw.get("entropy") or {}
             if isinstance(ent, dict) and "taker_fee_bps" in ent:
@@ -138,7 +138,7 @@ def load_rows(path: str, hours: float, min_samples: int) -> tuple:
     """
     cutoff = time.time() - hours * 3600 if hours > 0 else 0.0
     rows = []
-    with open(path, newline="") as fh:
+    with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         fields = set(reader.fieldnames or [])
         used_fillable = FILL_SELL in fields and FILL_BUY in fields

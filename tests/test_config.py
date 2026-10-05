@@ -64,6 +64,31 @@ def test_example_config_loads():
     assert abs(recognized_rebate_bps(0.9, 0.90, "referred_t4") - 0.045) < 1e-12
 
 
+def test_utf8_nonascii_comment_loads():
+    import builtins
+    text = MINIMAL + "# 中文注释：中枢占位\n"
+    f = tempfile.NamedTemporaryFile("wb", suffix=".yaml", delete=False)
+    f.write(text.encode("utf-8"))
+    f.close()
+    seen = []
+    real_open = builtins.open
+
+    def tracking_open(file, *args, **kwargs):
+        if os.path.abspath(str(file)) == os.path.abspath(f.name):
+            seen.append(kwargs.get("encoding"))
+        return real_open(file, *args, **kwargs)
+
+    builtins.open = tracking_open
+    try:
+        cfg = load_config(f.name, NO_ENV, symbol="SNDK", hedge_venue="lighter")
+    finally:
+        builtins.open = real_open
+        os.unlink(f.name)
+    assert seen == ["utf-8"]
+    assert cfg.symbol == "SNDK"
+    assert cfg.midline_bps == 5.0 and cfg.upper_bps == 4.0 and cfg.lower_bps == 3.0
+
+
 def test_minimal_defaults():
     cfg = load(MINIMAL, hedge="lighter")
     assert cfg.midline_bps == 5.0 and cfg.upper_bps == 4.0 and cfg.lower_bps == 3.0
