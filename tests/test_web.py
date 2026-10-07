@@ -425,7 +425,9 @@ def test_http_analyze_shows_labeled_gates(tmp_path):
         body = client.post("/api/analyze").json()
     assert body["ok"] is True
     assert body["command"] == ANALYZE_COMMAND
-    assert body["gates"]["G1"]["text"] == "+2.10"
+    # Default prem is +1.0, so --midline auto recenters on +1.0.
+    # Buy fill p50 3 becomes 4, net 3.10, which is the worse side.
+    assert body["gates"]["G1"]["text"] == "+3.10"
     assert body["gates"]["G1"]["pass"] is True
     assert "worse of SELL/BUY" in body["gates"]["G1"]["label"]
     assert "±50%" in body["gates"]["G2"]["label"]
@@ -436,8 +438,8 @@ def test_http_analyze_shows_labeled_gates(tmp_path):
     assert body["gates"]["G4"]["thin_text"] == "0.0000"
     assert body["gates"]["G4"]["pass"] is True
     assert "PASS thin_frac=0.0000 (<0.30)" in body["stdout"]
-    assert body["contrast"]["sell_net_p50_text"] == "+9.10"
-    assert body["contrast"]["buy_net_p50_text"] == "+2.10"
+    assert body["contrast"]["sell_net_p50_text"] == "+8.10"
+    assert body["contrast"]["buy_net_p50_text"] == "+3.10"
     assert body["slip_p90"]["sell_text"] == "+1.90"
     assert body["depth_ok_frac_text"] == "0.7500"
 

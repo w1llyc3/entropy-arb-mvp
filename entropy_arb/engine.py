@@ -26,6 +26,7 @@ import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
+from .funding import FundingPoller
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -194,6 +195,11 @@ class Engine:
                                            self.hedge.book, cfg.staleness_sec)
             tasks.append(asyncio.create_task(self.recorder.run(self.stop),
                                              name="recorder"))
+            # Public REST only. Fills entropy_funding / hedge_funding when the
+            # documented endpoint returns a number. Does not sign or send orders.
+            tasks.append(asyncio.create_task(
+                FundingPoller(self.entropy, self.hedge).run(self.stop),
+                name="funding"))
         if not self.record_only:
             tasks.append(asyncio.create_task(self._strategy_loop(),
                                              name="strategy"))

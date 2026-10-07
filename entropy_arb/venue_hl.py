@@ -25,6 +25,7 @@ import aiohttp
 from .book import OrderBook
 from .config import VenueConf
 from .feeds import HLBookFeed
+from .funding import parse_hl_funding
 
 log = logging.getLogger("hl")
 
@@ -152,6 +153,22 @@ class HLVenue:
 
     def ready_to_trade(self) -> bool:
         return self.account is not None
+
+    async def fetch_funding_rate(self) -> tuple[Optional[float], Optional[str]]:
+        """Current HIP-3 funding via public ``metaAndAssetCtxs``. No orders.
+
+        ``POST {api}/info`` ``{"type":"metaAndAssetCtxs","dex": dex}``.
+        The asset context ``funding`` field is returned unscaled. On failure
+        the reason string is set and the value is None — nothing is invented.
+        """
+        dex = self.conf.hl_dex
+        payload = {"type": "metaAndAssetCtxs", "dex": dex}
+        try:
+            body = await self._info(payload)
+        except Exception as exc:
+            return None, (f"POST {self.api_url}/info {payload} failed: "
+                          f"{type(exc).__name__}: {exc}")
+        return parse_hl_funding(body, dex, self.conf.symbol)
 
     async def warm_http(self) -> None:
         """Order-path keepalive ping (driven by the engine's keepalive loop)."""

@@ -16,12 +16,47 @@ When the CSV has ``fill_*_edge_100_bps`` columns, firing stats use those
 minute means. Older files fall back to top-of-book ``sell/buy_edge_max``
 with a warning.
 
+``--midline auto`` (the default) recenters those edges on the measured
+premium-close p50, rounded to 0.1 bps, before G1-G3. Sell edges subtract
+the midline; buy edges add it. At midline 0 the gate numbers match the
+historical zero-center definitions. G2 was already scored on fee-adjusted
+room beyond that center. G4 is a depth fraction and does not use the
+midline. ``--midline 0`` keeps the zero-center reading.
+
+``--by-session`` splits minutes into UTC sessions. With ``--sessions``
+omitted the windows follow US cash equity hours in America/New_York
+(09:30-16:00 local) so they track US daylight time:
+
+    us_regular          09:30-16:00 America/New_York
+                        13:30-20:00 UTC during EDT, 14:30-21:00 UTC during EST
+    us_post_overnight   from the cash close until 03:00 UTC
+    asia                03:00 UTC until the cash open
+
+Those EDT clocks are the requested default
+(us_regular 13:30-20:00, us_post_overnight 20:00-03:00, asia 03:00-13:30).
+Pass ``--sessions name=HH:MM-HH:MM,...`` to pin fixed UTC windows instead.
+The rule is the US Energy Policy Act calendar (second Sunday in March
+07:00 UTC through first Sunday in November 06:00 UTC) and does not need
+the tzdata package.
+
+Each session prints minutes, coverage, premium p50/p5/p95, the session
+midline (that session's own p50, rounded to 0.1), G1-G4 against it, and
+the AR(1) half-life of (premium - session midline) on contiguous minutes
+only. An hourly coverage table (UTC and Beijing, UTC+8) warns when overall
+coverage is below 80% or any hour inside the sample span has 0 minutes.
+
+When ``entropy_funding`` and ``hedge_funding`` are both present, the report
+prints their difference. The two APIs are not rescaled.
+
 分析机器人自动采集的分钟级盘口数据。G1 取买卖两侧 $100 可成交净边际
 （手续费按 --fees-bps，返佣强制为 0）的较差中位数。应计返佣只展示，不参与 Gate。
+``--midline auto`` 用溢价 p50 作为中枢，G1-G3 相对该中枢重算。
 
 Usage:
     python3 tools/analyze.py
     python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48
+    python3 tools/analyze.py --by-session --midline auto
+    python3 tools/analyze.py --sessions us_regular=13:30-20:00,us_post_overnight=20:00-03:00,asia=03:00-13:30
 """
 from __future__ import annotations
 
@@ -31,6 +66,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -47,6 +83,16 @@ CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
 # G4 is a shallow-book sizing signal. PASS iff thin_frac is strictly below
 # this cut. It does not stop the recorder and it does not place orders.
 THIN_FRAC_MAX = 0.30
+
+# AR(1) half-life needs a handful of contiguous minute pairs. Fewer than this
+# is reported as n/a rather than a noisy phi.
+MIN_HALF_LIFE_PAIRS = 8
+
+# Overall minute coverage under this fraction prints a warning. An hour
+# inside the sample span with zero rows warns on its own.
+COVERAGE_WARN = 0.80
+
+SESSION_ORDER = ("us_regular", "us_post_overnight", "asia")
 
 FILL_SELL = "fill_sell_edge_100_bps"
 FILL_BUY = "fill_buy_edge_100_bps"
@@ -161,6 +207,8 @@ def load_rows(path: str, hours: float, min_samples: int) -> tuple:
                     "slip_sell": _opt_float(r.get(SLIP_SELL)) if has_slip else None,
                     "slip_buy": _opt_float(r.get(SLIP_BUY)) if has_slip else None,
                     "depth_ok": _opt_float(r.get(DEPTH)) if has_depth else None,
+                    "e_funding": _opt_float(r.get("entropy_funding")),
+                    "h_funding": _opt_float(r.get("hedge_funding")),
                 }
                 rows.append(row)
             except (KeyError, ValueError, TypeError):
@@ -226,6 +274,16 @@ def summarize_fillable(rows: list, fees: float, rebate_bps: float,
     return out
 
 
+def _fmt_mid(mid: float) -> str:
+    """Compact signed bps. ``+0.0`` for zero, no trailing zeros otherwise."""
+    text = f"{mid:+.4f}".rstrip("0").rstrip(".")
+    if text in ("+0", "-0", "+", "-"):
+        return "+0.0"
+    if "." not in text:
+        text += ".0"
+    return text
+
+
 def _fmt(val: float) -> str:
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return "n/a"
@@ -251,7 +309,11 @@ def print_fillable_summary(summary: dict, assumptions: dict) -> None:
     basis = _basis_label(summary["used_fillable"])
     fees = summary["fees"]
     rebate = summary["rebate_bps"]
-    print(f"fillable edge @ $100 notional — median (p50), basis: {basis}")
+    rel = ""
+    midline = summary.get("midline")
+    if isinstance(midline, (int, float)) and math.isfinite(midline):
+        rel = f", relative to midline {_fmt_mid(midline)} bps"
+    print(f"fillable edge @ $100 notional — median (p50){rel}, basis: {basis}")
     print(f"  {'direction':<16} | {'pre-fee p50':>12} | "
           f"{'net p50':>12} | {'accrual p50':>12}")
     print(f"  {'':<16} | {'':>12} | {'rebate=0':>12} | {'display only':>12}")
@@ -260,7 +322,7 @@ def print_fillable_summary(summary: dict, assumptions: dict) -> None:
         print(f"  {label:<16} | {_fmt(s['pre_p50']):>12} | "
               f"{_fmt(s['net_p50']):>12} | {_fmt(s['accrual_p50']):>12}"
               f"   (n={s['n']})")
-    print(f"  net p50 = pre-fee p50 − {fees:.1f} bps taker fees, rebate 0. "
+    print(f"  net p50 = pre-fee p50 - {fees:.1f} bps taker fees, rebate 0. "
           f"Contrast column only — not a Gate id. G1 is the worse of the two.")
     rate_pct = assumptions["referral_rate"] * 100.0
     kept = (1.0 - assumptions["growth_haircut"]) * 100.0
@@ -436,13 +498,19 @@ def format_gate_report(gates: dict) -> str:
     """Stable stdout block. Gate lines start with ``G1:`` … ``G4:``.
 
     SELL/BUY net p50 are printed underneath as contrast, never as G1/G2.
+    A ``midline`` key, when present, is named in the header. Gate lines
+    themselves stay ``G1:`` … ``G4:`` with PASS/FAIL.
     """
     g2 = gates["G2"]
     g3 = gates["G3"]
     g4 = gates["G4"]
+    mid = gates.get("midline")
+    mid_txt = ""
+    if isinstance(mid, (int, float)) and math.isfinite(mid):
+        mid_txt = f"midline {_fmt_mid(mid)} bps, "
     lines = [
         (f"Gates (rebate forced to 0, fees {gates['fees']:.1f} bps, "
-         f"basis: {gates['basis']}):"),
+         f"{mid_txt}basis: {gates['basis']}):"),
         _gate_bps_line("G1", gates["G1"]),
         _gate_bps_line("G2", g2),
         _shift_detail("upper", g2["sides"]["upper"]),
@@ -461,7 +529,443 @@ def format_gate_report(gates: dict) -> str:
     return "\n".join(lines)
 
 
+def configure_stdio() -> None:
+    """Force UTF-8 stdout and stderr.
+
+    Chinese Windows consoles are often GBK. The net-p50 line used to print
+    U+2212 MINUS SIGN, which GBK cannot encode, and analyze crashed. That
+    character is now an ASCII hyphen. Reconfigure is the backup so a later
+    non-GBK character is replaced instead of raising UnicodeEncodeError.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            continue
+
+
+def resolve_midline(spec: str, premiums_sorted: list) -> tuple[float, str]:
+    """``auto`` is the premium-close p50 rounded to 0.1 bps. Else a fixed bps.
+
+    Rounding matches the pasted ``thresholds.midline_bps`` snippet. Zero is
+    normalized so ``-0.0`` does not sneak into the YAML.
+    """
+    text = str(spec).strip()
+    if text.lower() == "auto":
+        if not premiums_sorted:
+            raise ValueError("cannot use --midline auto with no premium samples")
+        mid = round(pctl(premiums_sorted, 50), 1)
+        if mid == 0:
+            mid = 0.0
+        return mid, "auto"
+    try:
+        mid = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"--midline must be 'auto' or a number of bps, got {spec!r}") from exc
+    if math.isnan(mid) or math.isinf(mid):
+        raise ValueError("--midline must be a finite number of bps")
+    if mid == 0:
+        mid = 0.0
+    return mid, "fixed"
+
+
+def rows_relative_to_midline(rows: list, midline: float) -> list:
+    """Sell edges minus midline, buy edges plus midline.
+
+    At midline 0 the rows are returned unchanged, so G1-G3 match the
+    historical zero-center definitions. Slip and depth are costs and
+    coverage, not premium levels, and are not shifted.
+    """
+    if midline == 0.0:
+        return rows
+    out = []
+    for r in rows:
+        n = dict(r)
+        if n.get("sell_fill") is not None:
+            n["sell_fill"] = n["sell_fill"] - midline
+        if n.get("buy_fill") is not None:
+            n["buy_fill"] = n["buy_fill"] + midline
+        if n.get("sell_max") is not None:
+            n["sell_max"] = n["sell_max"] - midline
+        if n.get("buy_max") is not None:
+            n["buy_max"] = n["buy_max"] + midline
+        out.append(n)
+    return out
+
+
+def gates_versus_midline(rows: list, fees: float, rebate: float,
+                         used_fillable: bool, midline: float) -> tuple:
+    """G1-G4 on edges measured from ``midline``.
+
+    Returns ``(gates, summary, sell_room, buy_room)``. G4 does not depend
+    on the midline. G2's room is the same fee-adjusted room ``firing_room``
+    has always computed.
+    """
+    shifted = rows_relative_to_midline(rows, midline)
+    summary = summarize_fillable(shifted, fees, rebate, used_fillable)
+    summary["midline"] = midline
+    sell_room = firing_room(shifted, "sell", 0.0, fees, used_fillable)
+    buy_room = firing_room(shifted, "buy", 0.0, fees, used_fillable)
+    gates = evaluate_gates(summary, sell_room, buy_room)
+    gates["midline"] = midline
+    return gates, summary, sell_room, buy_room
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> int:
+    """Day-of-month for the n-th ``weekday`` (Monday=0 .. Sunday=6)."""
+    first = datetime(year, month, 1, tzinfo=timezone.utc)
+    delta = (weekday - first.weekday()) % 7
+    return 1 + delta + (n - 1) * 7
+
+
+def is_us_eastern_dst(dt: datetime) -> bool:
+    """True during US Eastern daylight time for this UTC instant.
+
+    Energy Policy Act of 2005: second Sunday in March 02:00 EST (07:00 UTC)
+    through first Sunday in November 02:00 EDT (06:00 UTC). No tzdata
+    dependency, so the same clocks are used on Windows.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    year = dt.year
+    start = datetime(year, 3, _nth_weekday(year, 3, 6, 2), 7, 0,
+                     tzinfo=timezone.utc)
+    end = datetime(year, 11, _nth_weekday(year, 11, 6, 1), 6, 0,
+                   tzinfo=timezone.utc)
+    return start <= dt < end
+
+
+def _parse_hhmm(text: str) -> int:
+    raw = text.strip()
+    parts = raw.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"clock must be HH:MM, got {raw!r}")
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"clock must be HH:MM, got {raw!r}") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"clock out of range: {raw!r}")
+    return hour * 60 + minute
+
+
+def parse_sessions(spec: str):
+    """Parse ``name=HH:MM-HH:MM,...`` into UTC minute windows, or None.
+
+    None means the DST-aware US cash-session default. A window whose end
+    is less than or equal to its start wraps past midnight (20:00-03:00).
+    """
+    text = (spec or "").strip()
+    if not text:
+        return None
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(
+                f"--sessions entry must be name=HH:MM-HH:MM, got {part!r}")
+        name, clock = part.split("=", 1)
+        name = name.strip()
+        if not name or any(ch.isspace() for ch in name):
+            raise ValueError(f"bad session name in {part!r}")
+        if "-" not in clock:
+            raise ValueError(f"session window needs HH:MM-HH:MM: {part!r}")
+        start_txt, end_txt = clock.split("-", 1)
+        out.append((name, _parse_hhmm(start_txt), _parse_hhmm(end_txt)))
+    if not out:
+        raise ValueError("--sessions was empty")
+    return out
+
+
+def _dst_windows(dt: datetime):
+    """EDT or EST tiling of the UTC day. Endpoints match on [start, end)."""
+    if is_us_eastern_dst(dt):
+        reg_s, reg_e = 13 * 60 + 30, 20 * 60
+    else:
+        reg_s, reg_e = 14 * 60 + 30, 21 * 60
+    return (
+        ("us_regular", reg_s, reg_e),
+        ("us_post_overnight", reg_e, 3 * 60),
+        ("asia", 3 * 60, reg_s),
+    )
+
+
+def assign_session(ts: float, windows=None) -> str:
+    """Name the session that contains ``ts`` (unix seconds, UTC).
+
+    ``windows`` is the list from :func:`parse_sessions`. None uses the
+    DST-aware cash-hour windows. First matching window wins. A minute that
+    matches none is ``other``.
+    """
+    dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    chosen = windows if windows is not None else _dst_windows(dt)
+    mins = dt.hour * 60 + dt.minute
+    for name, start, end in chosen:
+        if start < end:
+            if start <= mins < end:
+                return name
+        elif mins >= start or mins < end:
+            return name
+    return "other"
+
+
+def _minute_slots(start_ts: float, end_ts: float):
+    t = int(math.floor(float(start_ts))) // 60 * 60
+    end = int(math.floor(float(end_ts))) // 60 * 60
+    while t <= end:
+        yield t
+        t += 60
+
+
+def _fmt_hhmm(minutes: int) -> str:
+    minutes = int(minutes) % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _fmt_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def coverage_stats(rows: list) -> dict:
+    """Hour-of-day coverage between the first and last minute, inclusive.
+
+    Expected counts are wall-clock minute slots. A slot counts as observed
+    when any loaded row falls in that minute. Hours outside the span have
+    expected 0 and are not gap warnings.
+    """
+    hours = [{"hour_utc": h, "hour_beijing": (h + 8) % 24,
+              "minutes": 0, "expected": 0} for h in range(24)]
+    if not rows:
+        return {"hours": hours, "observed": 0, "expected": 0,
+                "frac": float("nan"), "start": None, "end": None,
+                "warnings": []}
+    start = min(r["ts"] for r in rows)
+    end = max(r["ts"] for r in rows)
+    observed = {int(math.floor(r["ts"])) // 60 * 60 for r in rows}
+    expected_n = 0
+    hit_n = 0
+    for t in _minute_slots(start, end):
+        expected_n += 1
+        hour = datetime.fromtimestamp(t, tz=timezone.utc).hour
+        hours[hour]["expected"] += 1
+        if t in observed:
+            hours[hour]["minutes"] += 1
+            hit_n += 1
+    frac = (hit_n / expected_n) if expected_n else float("nan")
+    warnings = []
+    if expected_n and frac < COVERAGE_WARN:
+        warnings.append(
+            f"warning: overall coverage {frac:.3f} is below {COVERAGE_WARN:.2f}")
+    for h in hours:
+        if h["expected"] > 0 and h["minutes"] == 0:
+            warnings.append(
+                f"warning: UTC hour {h['hour_utc']:02d} "
+                f"(Beijing {h['hour_beijing']:02d}) has 0 minutes "
+                f"inside the sample span")
+    return {"hours": hours, "observed": hit_n, "expected": expected_n,
+            "frac": frac, "start": start, "end": end, "warnings": warnings}
+
+
+def format_coverage_report(rows: list) -> str:
+    stats = coverage_stats(rows)
+    lines = ["hourly coverage (UTC and Beijing UTC+8, no Beijing DST):"]
+    if not stats["expected"]:
+        lines.append("  n/a (no minutes)")
+        return "\n".join(lines)
+    lines.append(
+        f"  window {_fmt_ts(stats['start'])} .. {_fmt_ts(stats['end'])}  "
+        f"minutes {stats['observed']}/{stats['expected']} "
+        f"({stats['frac']:.3f})")
+    lines.append(f"  {'UTC':>4}  {'Beijing':>7}  {'minutes':>7}  "
+                 f"{'expected':>8}  {'frac':>6}")
+    for h in stats["hours"]:
+        if h["expected"]:
+            frac = f"{h['minutes'] / h['expected']:.3f}"
+        else:
+            frac = "n/a"
+        utc = f"{h['hour_utc']:02d}"
+        beijing = f"{h['hour_beijing']:02d}"
+        lines.append(
+            f"  {utc:>4}  {beijing:>7}  "
+            f"{h['minutes']:7d}  {h['expected']:8d}  {frac:>6}")
+    lines.extend(stats["warnings"])
+    return "\n".join(lines)
+
+
+def estimate_half_life(points: list, min_pairs: int = MIN_HALF_LIFE_PAIRS) -> dict:
+    """AR(1) half-life in minutes of a (timestamp, value) series.
+
+    Only pairs whose timestamps differ by 60 seconds are used, so a gap
+    does not look like a one-minute step. Half-life is ``-ln(2)/ln(phi)``
+    for ``0 < phi < 1``. ``phi >= 1`` is not mean-reverting. ``phi <= 0``
+    has no positive-AR(1) half-life. Too few pairs, or a flat lag, is n/a.
+    """
+    ordered = sorted(points, key=lambda item: item[0])
+    pairs = []
+    for (t0, x0), (t1, x1) in zip(ordered, ordered[1:]):
+        if abs((t1 - t0) - 60.0) < 1e-6:
+            pairs.append((x0, x1))
+    n = len(pairs)
+    out = {"half_life_min": None, "phi": None, "n_pairs": n, "reason": None}
+    if n < min_pairs:
+        out["reason"] = (f"insufficient contiguous minute pairs "
+                         f"({n} < {min_pairs}); gaps are skipped")
+        return out
+    xs = [a for a, _ in pairs]
+    ys = [b for _, b in pairs]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    ssx = sum((x - mean_x) ** 2 for x in xs)
+    if ssx <= 0.0:
+        out["reason"] = "lagged series has zero variance; phi undefined"
+        return out
+    phi = sum((x - mean_x) * (y - mean_y) for x, y in pairs) / ssx
+    out["phi"] = phi
+    if phi >= 1.0:
+        out["reason"] = f"non-mean-reverting (phi={phi:.4f} >= 1)"
+        return out
+    if phi <= 0.0:
+        out["reason"] = f"non-positive AR(1) phi={phi:.4f}; half-life undefined"
+        return out
+    out["half_life_min"] = -math.log(2.0) / math.log(phi)
+    return out
+
+
+def funding_diff_stats(rows: list) -> dict:
+    """``entropy_funding - hedge_funding`` on minutes where both are present.
+
+    Values stay in the API's own units. They are not rescaled to a common
+    funding period.
+    """
+    both = []
+    n_e = n_h = 0
+    for r in rows:
+        ent = r.get("e_funding")
+        hed = r.get("h_funding")
+        if ent is not None:
+            n_e += 1
+        if hed is not None:
+            n_h += 1
+        if ent is not None and hed is not None:
+            both.append(ent - hed)
+    if not both:
+        return {"n": 0, "n_entropy": n_e, "n_hedge": n_h,
+                "mean": None, "p50": None}
+    both.sort()
+    return {"n": len(both), "n_entropy": n_e, "n_hedge": n_h,
+            "mean": sum(both) / len(both), "p50": pctl(both, 50)}
+
+
+def format_funding_diff(stats: dict) -> str:
+    if not stats or stats["n"] == 0:
+        n_e = 0 if not stats else stats["n_entropy"]
+        n_h = 0 if not stats else stats["n_hedge"]
+        return ("funding diff: n/a (need both entropy_funding and "
+                "hedge_funding; "
+                f"entropy present on {n_e} minute(s), hedge on {n_h})")
+    return ("funding diff (entropy_funding - hedge_funding, raw API units, "
+            f"not rescaled): n={stats['n']} mean={stats['mean']:+.8g} "
+            f"p50={stats['p50']:+.8g}")
+
+
+def _prefix_lines(text: str, prefix: str) -> str:
+    return "\n".join(
+        (prefix + line) if line.strip() else line
+        for line in text.splitlines())
+
+
+def session_names(windows) -> list:
+    names = [w[0] for w in windows] if windows else list(SESSION_ORDER)
+    return names
+
+
+def format_session_report(rows: list, windows, fees: float, rebate: float,
+                          used_fillable: bool) -> str:
+    """Per-session coverage, premium, midline, G1-G4, half-life, funding."""
+    lines = ["sessions:"]
+    if windows is None:
+        lines.append(
+            "  DST-aware US cash hours 09:30-16:00 America/New_York. "
+            "During EDT: us_regular 13:30-20:00 UTC, "
+            "us_post_overnight 20:00-03:00 UTC, asia 03:00-13:30 UTC. "
+            "During EST, us_regular is 14:30-21:00 UTC and the other two "
+            "windows move with it so the day still tiles. "
+            "Pass --sessions name=HH:MM-HH:MM to pin fixed UTC clocks.")
+    else:
+        parts = [f"{name} {_fmt_hhmm(start)}-{_fmt_hhmm(end)} UTC"
+                 for name, start, end in windows]
+        lines.append("  fixed UTC windows (no DST shift): " + ", ".join(parts))
+    if not rows:
+        lines.append("  n/a (no minutes)")
+        return "\n".join(lines)
+    start = min(r["ts"] for r in rows)
+    end = max(r["ts"] for r in rows)
+    rows_by: dict = {}
+    observed: dict = {}
+    for r in rows:
+        name = assign_session(r["ts"], windows)
+        rows_by.setdefault(name, []).append(r)
+        minute = int(math.floor(r["ts"])) // 60 * 60
+        observed.setdefault(name, set()).add(minute)
+    slots: dict = {}
+    for t in _minute_slots(start, end):
+        name = assign_session(t, windows)
+        slots[name] = slots.get(name, 0) + 1
+    names = session_names(windows)
+    for name in list(rows_by) + list(slots):
+        if name not in names:
+            names.append(name)
+    for name in names:
+        got = rows_by.get(name, [])
+        n_slots = slots.get(name, 0)
+        n_hit = len(observed.get(name, ()))
+        if n_slots == 0 and not got:
+            lines.append(f"{name}: minutes n=0 coverage n/a "
+                         "(session not in sample span)")
+            continue
+        cov = f"{(n_hit / n_slots):.3f}" if n_slots else "n/a"
+        lines.append(f"{name}: minutes n={len(got)} coverage {cov}")
+        if not got:
+            lines.append("  premium p50/p5/p95: n/a")
+            lines.append("  session midline: n/a")
+            lines.append("  half-life: n/a (no minutes in session)")
+            lines.append("  " + format_funding_diff(funding_diff_stats([])))
+            lines.append("  gates: n/a (no minutes in session)")
+            continue
+        prem = sorted(r["prem"] for r in got)
+        mid, _src = resolve_midline("auto", prem)
+        lines.append(
+            f"  premium p50 {pctl(prem, 50):+.2f}  "
+            f"p5 {pctl(prem, 5):+.2f}  p95 {pctl(prem, 95):+.2f}")
+        lines.append(
+            f"  session midline {_fmt_mid(mid)} bps "
+            "(session premium p50, rounded to 0.1 bps)")
+        hl = estimate_half_life([(r["ts"], r["prem"] - mid) for r in got])
+        if hl["half_life_min"] is None:
+            lines.append(f"  half-life: n/a ({hl['reason']})")
+        else:
+            lines.append(
+                "  half-life of (premium - session midline): "
+                f"{hl['half_life_min']:.2f} min "
+                f"(phi={hl['phi']:.4f}, contiguous pairs={hl['n_pairs']})")
+        lines.append("  " + format_funding_diff(funding_diff_stats(got)))
+        gates, _summary, _sell, _buy = gates_versus_midline(
+            got, fees, rebate, used_fillable, mid)
+        lines.append(_prefix_lines(format_gate_report(gates), f"  [{name}] "))
+    return "\n".join(lines)
+
+
 def main() -> None:
+    configure_stdio()
     p = argparse.ArgumentParser(description="suggest thresholds from recorded "
                                             "minute data")
     p.add_argument("--csv", default="logs/minutes.csv")
@@ -478,6 +982,19 @@ def main() -> None:
                         "0.9 = Entropy 0.9 + Lighter 0 for SNDK --hedge lighter. "
                         "G1 subtracts this from the fillable@$100 median with "
                         "rebate forced to 0. Pass a higher sum for a tradexyz hedge.")
+    p.add_argument("--midline", default="auto",
+                   help="auto (default) = premium-close p50 rounded to 0.1 bps, "
+                        "or a fixed center in bps (pass 0 for the historical "
+                        "zero-center gates). G1-G3 are recomputed on edges "
+                        "relative to this midline. G4 is depth-only.")
+    p.add_argument("--by-session", action="store_true",
+                   help="split G1-G4, coverage, premium, half-life, and "
+                        "funding diff by UTC session")
+    p.add_argument("--sessions", default="",
+                   help="fixed UTC windows name=HH:MM-HH:MM,comma-separated. "
+                        "Default follows US cash hours and US DST "
+                        "(EDT us_regular 13:30-20:00, "
+                        "us_post_overnight 20:00-03:00, asia 03:00-13:30).")
     args = p.parse_args()
 
     try:
@@ -499,12 +1016,28 @@ def main() -> None:
         if not rows:
             sys.exit(1)
 
+    try:
+        windows = parse_sessions(args.sessions)
+    except ValueError as exc:
+        print(f"sessions error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     assumptions = load_rebate_assumptions(args.config)
+    rows.sort(key=lambda r: r["ts"])
     span_h = (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0 + 1 / 60.0
     prem = sorted(r["prem"] for r in rows)
     mean = sum(prem) / len(prem)
     var = sum((x - mean) ** 2 for x in prem) / len(prem)
     median = pctl(prem, 50)
+    try:
+        midline, midline_src = resolve_midline(args.midline, prem)
+    except ValueError as exc:
+        print(f"midline error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if midline_src == "auto":
+        how = "median / p50 of premium close, rounded to 0.1 bps"
+    else:
+        how = "fixed --midline"
 
     print(f"\n=== {args.csv}: {len(rows)} minutes over {span_h:.1f}h ===\n")
     print("premium of Entropy over hedge, minute close (bps) / "
@@ -513,25 +1046,21 @@ def main() -> None:
           f"median (p50) {median:+.2f}")
     print(f"  p5 {pctl(prem, 5):+.2f}   p25 {pctl(prem, 25):+.2f}   "
           f"p75 {pctl(prem, 75):+.2f}   p95 {pctl(prem, 95):+.2f}")
+    print(f"  gate midline {_fmt_mid(midline)} bps ({how})")
     print()
-    summary = summarize_fillable(rows, args.fees_bps, assumptions["rebate_bps"],
-                                 used_fillable)
-    print_fillable_summary(summary, assumptions)
-
-    midline = round(median, 1) or 0.0   # normalize -0.0
-    # room beyond the midline that was actually executable each minute, net
-    # of taker fees (config thresholds are net-of-fee: the engine adds fees
-    # on top, and recorded edges are pre-fee). Rebate stays 0 here — the
-    # accrual figure above is not an input. G2 shifts the p90 of this room.
+    # Edges are recentered on the midline before G1-G3. Rebate stays 0.
+    # The accrual figure is not an input. G2 shifts the p90 of this room.
+    # G4 is thin_frac and does not move with the midline.
     fees = args.fees_bps
-    sell_room = firing_room(rows, "sell", midline, fees, used_fillable)
-    buy_room = firing_room(rows, "buy", midline, fees, used_fillable)
-    print(format_gate_report(evaluate_gates(summary, sell_room, buy_room)))
+    gates, summary, sell_room, buy_room = gates_versus_midline(
+        rows, fees, assumptions["rebate_bps"], used_fillable, midline)
+    print_fillable_summary(summary, assumptions)
+    print(format_gate_report(gates))
     print()
     basis = ("fillable@$100" if used_fillable
              else "top-of-book max (fillable columns missing)")
 
-    print(f"with midline_bps = {midline:+.1f} (median / p50 of premium close) "
+    print(f"with midline_bps = {_fmt_mid(midline)} ({how}) "
           f"and {fees:.1f} bps one-crossing taker fees (rebate 0), minutes "
           f"each band would have fired on {basis} / 各档净阈值触发的分钟数:")
     print(f"  {'band bps':>9} | {'SELL entropy':>17} | {'BUY entropy':>17}")
@@ -571,6 +1100,16 @@ Re-run with --hours to focus on recent regimes; premiums drift, so refresh
 these numbers regularly. / 溢价中枢会漂移，请定期重新分析并更新配置。
 The accrual-rebate column above is not an input to these thresholds.
 """)
+    print(format_coverage_report(rows))
+    print()
+    print("funding (overall):")
+    print("  " + format_funding_diff(funding_diff_stats(rows)))
+    print("  entropy: Hyperliquid metaAndAssetCtxs funding, unscaled")
+    print("  hedge: Lighter GET /api/v1/funding-rates exchange=lighter rate, unscaled")
+    if args.by_session:
+        print()
+        print(format_session_report(
+            rows, windows, fees, assumptions["rebate_bps"], used_fillable))
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ in the minute.
 | `fill_{sell,buy}_edge_{50,100,250}_bps` | marginal executable edge, **pre-fee** |
 | `slip_{sell,buy}_{50,100,250}_bps` | top-of-book edge minus average-fill edge |
 | `depth_ok_frac` | fraction of samples where **both** directions fill ≥ $100 |
-| `entropy_funding`, `hedge_funding` | blank unless a book already exposes numeric `funding` |
+| `entropy_funding`, `hedge_funding` | last successful public REST poll, else blank |
 
 `sell` is SELL entropy / BUY hedge. `buy` is BUY entropy / SELL hedge.
 Same price ratios as the existing top-of-book edges, at the marginal price
@@ -69,9 +69,23 @@ after the walk.
 ### Funding
 
 Upstream book feeds (`entropy_arb/feeds.py`) do not carry funding rates.
-The columns are written and left blank. No rate is synthesized. If a feed
-later sets `OrderBook.funding` to a number (or a zero-arg callable that
-returns one), the recorder stores the last sample in the minute.
+While the recorder is running, `FundingPoller` calls public REST every 60s
+and, on success, stores the number on `OrderBook.funding`. The minute row
+keeps the last sample. No rate is synthesized. A failed poll logs the
+reason. The cell stays blank until the first success. A later failure keeps
+the last real value and logs why the refresh failed.
+
+- Entropy / Hyperliquid HIP-3: `POST https://api.hyperliquid.xyz/info` with
+  `{"type":"metaAndAssetCtxs","dex":"<dex>"}` (Entropy dex is `io`). The
+  matching asset context's `funding` field is stored unscaled.
+- Lighter: `GET {profile}/api/v1/funding-rates` (mainnet host
+  `https://mainnet.zklighter.elliot.ai`). The row with `exchange=lighter`
+  and this market's `market_id` supplies `rate`, stored unscaled. Binance,
+  Bybit, and Hyperliquid rows in that payload are ignored.
+
+`tools/analyze.py` prints `entropy_funding - hedge_funding` per session
+when both cells are present (`--by-session`). The two APIs are not
+rescaled onto one funding period.
 
 ## Gate vs accrual (analyze)
 
@@ -111,7 +125,11 @@ Rebate math (display only), from
   `self_t3` = 160% and `self_t4` = 200% of the same share (early-bird table).
 - Shipped config: `0.9 × 0.50 × (1 − 0.90) × 1.00 = 0.045` bps recognized.
 
-Midline is still the p50 of minute-close premium. Upper/lower suggestions
+`--midline auto` (the default) is the p50 of minute-close premium, rounded
+to 0.1 bps. G1–G3 are then scored on edges relative to that center (sell
+edge minus midline, buy edge plus midline). `--midline 0` is the historical
+zero-center reading. At midline 0, G1–G4 match the table above. G4 does not
+use the midline. Upper/lower suggestions
 are the p90 of fee-adjusted room (rebate 0) on the fillable@$100 series
 when that series exists, then floored at 1 bps for the pasted snippet.
 G2 uses that same p90 **before** the floor.

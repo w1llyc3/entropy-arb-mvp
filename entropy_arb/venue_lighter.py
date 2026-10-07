@@ -30,6 +30,7 @@ except ImportError:
 from .book import OrderBook
 from .config import VenueConf
 from .feeds import LighterBookFeed
+from .funding import parse_lighter_funding
 
 log = logging.getLogger("lighter")
 
@@ -237,6 +238,23 @@ class LighterVenue:
 
     def ready_to_trade(self) -> bool:
         return self.orders_feed is not None and self.orders_feed.ready.is_set()
+
+    async def fetch_funding_rate(self) -> tuple[Optional[float], Optional[str]]:
+        """Current Lighter funding via public ``GET /api/v1/funding-rates``.
+
+        Host is this profile's ``api_url`` (mainnet:
+        ``https://mainnet.zklighter.elliot.ai``). Only the ``exchange=lighter``
+        row for this ``market_id`` is used. The ``rate`` is returned unscaled.
+        On failure the reason string is set and the value is None.
+        """
+        path = "/api/v1/funding-rates"
+        try:
+            body = await self._get(path)
+        except Exception as exc:
+            return None, (f"GET {self.profile.api_url}{path} failed: "
+                          f"{type(exc).__name__}: {exc}")
+        market_id = self.market_id if self.market_id >= 0 else None
+        return parse_lighter_funding(body, self.conf.symbol, market_id)
 
     async def warm_http(self) -> None:
         """Keep the order-path HTTPS connections warm (a cold TLS handshake

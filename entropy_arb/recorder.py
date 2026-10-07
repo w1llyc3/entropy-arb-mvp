@@ -33,8 +33,10 @@ with the existing helpers ``walk_depth`` and ``crossable_base``:
         fill >= $100 notional.
     entropy_funding, hedge_funding
         last sample's funding rate if the book exposes a numeric ``funding``
-        attribute. The upstream feeds do not, so these stay blank. Nothing
-        is invented.
+        attribute. Websocket feeds do not set it. ``FundingPoller`` writes
+        the last successful public REST read (Hyperliquid metaAndAssetCtxs
+        ``funding``, Lighter ``GET /api/v1/funding-rates`` ``rate``). A miss
+        stays blank. Nothing is invented.
 
 Aggregation: each 1 Hz sample computes the fillable metrics; the minute
 cell is the arithmetic mean of samples that could fill that notional.
