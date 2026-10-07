@@ -22,6 +22,9 @@ class OrderBook:
         self.ready = False
         self.last_update_ts = 0.0
         self.alive_ts = 0.0
+        # Last funding rate fetched from a documented REST poll, or None.
+        # clear() does not wipe it: a book resync is not a new funding print.
+        self.funding: Optional[float] = None
 
     def touch(self) -> None:
         self.alive_ts = time.time()
