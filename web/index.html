@@ -129,6 +129,8 @@
     .status.live { color: var(--green); border-color: var(--green-line); background: var(--green-dim); }
     .status.pause { color: var(--amber); border-color: #6a5424; background: var(--amber-dim); }
     .status.stop { color: var(--faint); }
+    .status.halt { color: #ffd6d6; border-color: var(--red); background: var(--red-dim); }
+    .task.halted { border-left-color: var(--red); }
     .mode-flag {
       display: inline-block;
       margin-top: 8px;
@@ -345,13 +347,14 @@
         <div><span>单边上限</span><b id="card-pos">$10</b></div>
       </div>
       <div class="warn-line" id="card-warn" hidden>会偏离 Decision Card</div>
+      <p class="hint" id="fee-line">费率：尚未成交，假设 0.90 bps</p>
       <p class="hint" id="card-empty">还没有任务。创建一个 SNDK 探针。</p>
     </article>
     <div class="actions">
       <button class="primary" id="open-create" type="button">创建套利任务</button>
       <button class="ghost" id="clear-task" type="button" disabled>清除</button>
     </div>
-    <p class="legend">状态：记录中 · 暖机 · LIVE · 暂停 · 已停止</p>
+    <p class="legend">状态：记录中 · 暖机 · LIVE · 暂停 · HALT · 已停止</p>
   </aside>
 
   <section>
@@ -370,6 +373,7 @@
         </div>
       </div>
       <div id="run-warn" class="banner" hidden></div>
+      <p class="hint" id="order-line">尚无确认订单</p>
       <div class="track-wrap">
         <div class="track-label">
           <span>偏离中枢</span>
@@ -521,11 +525,11 @@
       <div class="grid two">
         <div>
           <label for="f-ord">单笔名义 (USD)</label>
-          <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" required>
+          <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" max="10" required>
         </div>
         <div>
           <label for="f-cap">单边持仓上限 (USD)</label>
-          <input id="f-cap" name="max_position_usd" type="number" step="1" value="10" min="10" required>
+          <input id="f-cap" name="max_position_usd" type="number" step="1" value="10" min="10" max="10" required>
         </div>
       </div>
       <div class="modes" role="group" aria-label="模式">
@@ -572,8 +576,14 @@
       <tbody id="c-legs"></tbody>
     </table>
     <div class="warn-line" id="c-tail" hidden></div>
-    <p class="hint" id="c-block" hidden>非美股 RTH，确认已禁用。</p>
-    <p class="hint">确认入队。取消则跳过。当前不会向交易所发单。</p>
+    <div class="warn-line" id="c-force" hidden>
+      <div id="c-force-session"></div>
+      <div id="c-force-map">us_regular -1.7 / us_post_overnight +2.6 / asia -0.4</div>
+      <div id="c-force-task"></div>
+      <div id="c-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
+    </div>
+    <p class="hint" id="c-block" hidden></p>
+    <p class="hint">确认会通过实盘引擎同时发送两腿。非 RTH 必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
@@ -614,6 +624,7 @@ function setStatus(el, label) {
     "暖机": "warm",
     "LIVE": "live",
     "暂停": "pause",
+    "HALT": "halt",
     "已停止": "stop",
   }[label] || "stop");
 }
@@ -685,9 +696,23 @@ function showConfirm(payload) {
   const tail = payload.tail_vs_median;
   $("c-tail").hidden = !tail;
   $("c-tail").textContent = tail || "";
+  const force = !!payload.force_required;
+  const card = payload.force_card || {};
+  $("c-force").hidden = !force;
+  if (force) {
+    $("c-force-session").textContent =
+      "当前时段 " + (card.name || "—") + " · 该时段实测中枢 " +
+      (card.midline_bps == null ? "—" : Number(card.midline_bps).toFixed(1)) + " bps";
+    $("c-force-task").textContent =
+      "任务中枢 " + (card.task_midline_bps == null ? "—" : Number(card.task_midline_bps).toFixed(1)) +
+      " bps · " + (card.deviation_text || "");
+    $("c-force-line").textContent = card.risk_line || "带宽 1 bps，错中枢风险大于费率缺口";
+  }
   const enabled = !!payload.confirm_enabled;
+  $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : "确认";
   $("c-ok").disabled = !enabled;
-  $("c-block").hidden = enabled;
+  $("c-block").hidden = !payload.block_reason;
+  $("c-block").textContent = payload.block_reason || "";
   if (payload.proposal_id !== lastProposalId) {
     lastProposalId = payload.proposal_id;
     $("confirm-modal").hidden = false;
@@ -698,7 +723,9 @@ function render(s) {
   const task = s.task;
   const label = s.status_label || "已停止";
   setStatus($("task-status"), label);
+  $("task-card").classList.toggle("halted", label === "HALT");
   $("stat-status").textContent = label;
+  $("stat-status").className = "v" + (label === "HALT" ? " bad" : "");
   $("stat-status-d").textContent = s.running
     ? ("pid " + dash(s.pid) + (s.paused ? " · 已暂停" : ""))
     : "尚未启动";
@@ -780,6 +807,22 @@ function render(s) {
   $("acct-note").textContent = acct.note
     || ((creds.entropy || creds.lighter) ? "已检测到密钥，数值来自只读查询。" : "密钥只留在服务器。页面不接收私钥。");
 
+  const fee = s.fee_check || {};
+  const feeNode = $("fee-line");
+  if (fee.actual_bps == null) {
+    feeNode.textContent = "费率：尚未成交，假设 0.90 bps";
+    feeNode.className = "hint";
+  } else {
+    feeNode.textContent = "实际费率 " + Number(fee.actual_bps).toFixed(2)
+      + " bps / 假设 0.90 bps"
+      + (fee.mismatch ? " · 不匹配，已停止确认" : " · 一致");
+    feeNode.className = "hint" + (fee.mismatch ? " bad" : "");
+  }
+  const last = s.last_order;
+  $("order-line").textContent = last
+    ? ("最近确认 " + dash(last.confirm_id) + " · "
+      + (last.sent ? "已发送" : "未发送") + " · " + dash(last.status || last.error))
+    : "尚无确认订单";
   $("btn-start").disabled = !!s.running && !s.paused;
   $("btn-pause").disabled = !s.running || !!s.paused;
   $("btn-stop").disabled = !s.running && !s.pid;
@@ -895,10 +938,24 @@ $("c-cancel").addEventListener("click", async () => {
 $("confirm-x").addEventListener("click", () => { $("confirm-modal").hidden = true; });
 $("c-ok").addEventListener("click", async () => {
   if (!lastPayload || $("c-ok").disabled) return;
+  const body = Object.assign({}, lastPayload);
+  if ($("c-ok").textContent === "强制确认") body.force_confirm = true;
   $("c-ok").disabled = true;
   try {
-    const body = await post("/api/confirm", lastPayload);
-    alert(body.gap || "已入队");
+    const result = await post("/api/confirm", body);
+    if (result.needs_force_confirm) {
+      lastPayload.force_ack = true;
+      $("c-ok").textContent = "强制确认";
+      $("c-ok").disabled = false;
+      $("confirm-modal").hidden = false;
+      await refresh();
+      $("confirm-modal").hidden = false;
+      return;
+    }
+    const note = result.sent
+      ? "两腿已提交"
+      : (result.gap || "未发送");
+    alert(note);
     $("confirm-modal").hidden = true;
   } catch (err) {
     alert(err.message);

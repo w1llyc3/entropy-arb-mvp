@@ -37,12 +37,16 @@ class StubVenue:
         self.cap_usd, self.fee_bps = cap, fee
         self.size_decimals, self.min_base, self.min_quote = 4, 1e-4, 10.0
         self.position, self.cash = 0.0, 0.0
+        self.volume_usd = 0.0
         self.orders_per_min = 30
         self.last_traded_ts = 0.0
         self.book = OrderBook()
 
     def ready_to_trade(self):
         return True
+
+    def px_round(self, px, round_up=False):
+        return round(float(px), 8)
 
     def set_book(self, bid, ask, sz=50.0):
         self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
@@ -143,6 +147,52 @@ def test_scan_respects_position_caps():
     eng.hedge.position = 100.0
     eng.hedge.cap_usd = 10000.0
     assert run_scan(eng) is None
+
+
+def test_execute_confirmed_requires_id_and_halts_on_single_leg(tmp_path):
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.trades_csv = str(tmp_path / "trades.csv")
+    eng.entropy.set_book(101.0, 101.2, sz=50)
+    eng.hedge.set_book(100.0, 100.1, sz=50)
+    calls = {"n": 0}
+
+    async def buy_leg(*, is_buy, qty, limit_px, reduce_only=False):
+        calls["n"] += 1
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False, "fee_bps": 0.9}
+
+    async def sell_leg(*, is_buy, qty, limit_px, reduce_only=False):
+        calls["n"] += 1
+        return {"status": "canceled", "filled_base": 0.0, "avg_px": None,
+                "err": None, "unresolved": False}
+
+    eng.hedge.send_taker = buy_leg
+    eng.entropy.send_taker = sell_leg
+
+    async def go():
+        try:
+            await eng.execute_confirmed(
+                direction="sell_entropy", confirm_id="", cap_notional=10)
+        except RuntimeError as exc:
+            assert "confirm id" in str(exc)
+        else:
+            raise AssertionError("blank confirm id was accepted")
+        assert calls["n"] == 0
+        result = await eng.execute_confirmed(
+            direction="sell_entropy", confirm_id="abc", cap_notional=10)
+        assert result["sent"] is True
+        assert result["routed"] is True
+        assert result["halted"] is True
+        assert result["confirm_id"] == "abc"
+        assert abs(result["net_base"]) > 0
+        assert eng.halted is True
+        assert calls["n"] == 2
+        again = await eng.execute_confirmed(
+            direction="sell_entropy", confirm_id="def", cap_notional=10)
+        assert again["sent"] is False
+        assert calls["n"] == 2
+
+    asyncio.run(go())
 
 
 if __name__ == "__main__":

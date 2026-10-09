@@ -1,8 +1,9 @@
-"""Single SNDK probe task: record, arm, pause, reconcile, confirm queue.
+"""Single SNDK probe task: record, arm, pause, reconcile, confirmed orders.
 
 Arming 探针实盘 never builds a live ``main.py`` command. The subprocess, when
-one is started, is record-only. A confirm admits an intent to a local queue
-and does not call a venue.
+one is started, is record-only. A confirm admits an id and only then calls
+``Engine.execute_confirmed`` (see ``web.live_exec``). Outside US RTH the
+first click does not send; a second 「强制确认」 is required.
 """
 from __future__ import annotations
 
@@ -16,13 +17,17 @@ from typing import Callable, Optional
 
 import yaml
 
-from web.accounts import read_accounts, scrub
+from web.accounts import missing_live_env, read_accounts, scrub
+from web.live_exec import execute_admitted
 from web.probe import (
     ACCRUAL_BPS,
     ACCRUAL_LABEL,
     DECISION_WARNING,
     ENTROPY_FEE_BPS,
+    FEE_MISMATCH_TOL_BPS,
+    NET_TOL_BASE,
     RTH_WINDOW,
+    STATUS_HALT,
     SYMBOL,
     books_fresh,
     build_confirm_payload,
@@ -35,6 +40,7 @@ from web.probe import (
     normalize_task,
     probe_config_dict,
     qualifying_direction,
+    session_snapshot,
     status_label,
     tail_vs_median,
 )
@@ -53,16 +59,20 @@ class ProbeError(Exception):
 class ProbeSession:
     def __init__(self, root: Path, ctl: RecorderControl,
                  now: Optional[Callable[[], float]] = None,
-                 account_reader: Optional[Callable] = None) -> None:
+                 account_reader: Optional[Callable] = None,
+                 executor: Optional[Callable] = None) -> None:
         self.root = Path(root)
         self.ctl = ctl
         self.now = now or time.time
         self.account_reader = account_reader or (
             lambda: read_accounts(self.root))
+        self.executor = executor or execute_admitted
         self.dir = self.root / ".web"
         self.task_path = self.dir / "task.json"
         self.queue_path = self.dir / "confirm_queue.json"
         self.config_path = self.dir / "probe.yaml"
+        self.risk_path = self.dir / "risk.json"
+        self.log_path = self.dir / "probe.log"
         self._account_cache = None
         self._accounts_at = 0.0
 
@@ -102,6 +112,66 @@ class ProbeSession:
     def _save_queue(self, data: dict) -> None:
         data["history"] = list(data.get("history") or [])[-_QUEUE_LIMIT:]
         self._write_json(self.queue_path, data)
+
+    def _blank_risk(self) -> dict:
+        return {
+            "halted": False,
+            "halt_reason": None,
+            "net_base": 0.0,
+            "actual_fee_bps": None,
+            "assumed_fee_bps": ENTROPY_FEE_BPS,
+            "fee_mismatch": False,
+            "last_order": None,
+        }
+
+    def risk(self) -> dict:
+        data = self._read_json(self.risk_path) or {}
+        base = self._blank_risk()
+        for key in base:
+            if key in data:
+                base[key] = data[key]
+        return base
+
+    def _save_risk(self, risk: dict) -> None:
+        self._write_json(self.risk_path, risk)
+
+    def _log(self, message: str) -> None:
+        self._ensure()
+        stamp = datetime.fromtimestamp(float(self.now()), timezone.utc)
+        line = scrub(f"{stamp.strftime('%Y-%m-%dT%H:%M:%SZ')} {message}")
+        if not isinstance(line, str):
+            line = str(message)
+        with self.log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def _creds_missing(self) -> list:
+        return missing_live_env(self.root)
+
+    def _account_net(self) -> Optional[float]:
+        acct = self._accounts()
+        ent = (acct.get("entropy") or {}).get("position")
+        lig = (acct.get("lighter") or {}).get("position")
+        if isinstance(ent, bool) or isinstance(lig, bool):
+            return None
+        if isinstance(ent, (int, float)) and isinstance(lig, (int, float)):
+            return float(ent) + float(lig)
+        return None
+
+    def _block_reason(self) -> Optional[str]:
+        risk = self.risk()
+        net = float(risk.get("net_base") or 0.0)
+        if risk.get("halted") or abs(net) > NET_TOL_BASE:
+            return "HALT：净敞口不为 0，拒绝新开仓"
+        if risk.get("fee_mismatch"):
+            return "实际费率与假设 0.9 bps 不一致，已停止确认"
+        if self._creds_missing():
+            return ("实盘密钥不完整，拒绝确认（需要 HL_PRIVATE_KEY、"
+                    "HL_ACCOUNT_ADDRESS、LIGHTER_ACCOUNT_INDEX、"
+                    "LIGHTER_API_KEY_INDEX、LIGHTER_API_PRIVATE_KEY）")
+        acct_net = self._account_net()
+        if acct_net is not None and abs(acct_net) > NET_TOL_BASE:
+            return "HALT：账户净敞口不为 0，拒绝新开仓"
+        return None
 
     def _clock(self) -> datetime:
         return datetime.fromtimestamp(float(self.now()), timezone.utc)
@@ -255,6 +325,11 @@ class ProbeSession:
             if spec.get("rth_only", True) and not self.rth_now():
                 raise ProbeError(
                     "非美股 RTH（America/New_York 09:30–16:00），禁止武装探针实盘",
+                    status_code=409)
+            missing = self._creds_missing()
+            if missing:
+                raise ProbeError(
+                    "实盘密钥不完整，拒绝 LIVE：" + ", ".join(missing),
                     status_code=409)
         try:
             info = self._spawn(spec)
@@ -432,21 +507,34 @@ class ProbeSession:
         rth = self.rth_now()
         payload = build_confirm_payload(
             spec, pending, rth=rth, tail=pending.get("tail_vs_median"))
-        # Live confirm is refused outside US RTH even if the operator turned
-        # the RTH-only arming toggle off. The toggle only gates 启动.
-        payload["confirm_enabled"] = bool(rth) and bool(spec.get("manual_confirm"))
+        snap = session_snapshot(self._clock(), float(spec["midline_bps"]))
+        block = self._block_reason()
+        # Outside RTH the card stays clickable. The first click only
+        # acknowledges the force card; the order waits for 「强制确认」.
+        payload["confirm_enabled"] = block is None and bool(spec.get("manual_confirm"))
+        payload["block_reason"] = block
         payload["rth_only"] = bool(spec.get("rth_only", True))
+        payload["force_required"] = not rth
+        payload["force_ack"] = bool(pending.get("force_ack"))
+        payload["session"] = snap
+        payload["force_card"] = snap if not rth else None
         return payload
 
-    def _archive(self, queue: dict, action: str, proposal: dict) -> None:
+    def _archive(self, queue: dict, action: str, proposal: dict,
+                 **extra) -> None:
         queue["history"] = list(queue.get("history") or [])
-        queue["history"].append({
+        entry = {
             "action": action,
             "ts": self.now(),
             "proposal_id": proposal.get("proposal_id"),
             "routed": False,
             "sent": False,
-        })
+        }
+        for key, value in extra.items():
+            if key in ("routed", "sent", "confirm_id", "force_confirm_outside_rth",
+                       "error", "status"):
+                entry[key] = value
+        queue["history"].append(entry)
         queue["pending"] = None
         self._save_queue(queue)
 
@@ -460,9 +548,12 @@ class ProbeSession:
                 "proposal_id": pending.get("proposal_id")}
 
     def admit_confirm(self, payload: dict) -> dict:
-        """Queue a confirm only when live-armed, explicitly confirmed, and in RTH.
+        """Admit a confirm id, then route one dual-leg order.
 
-        Returns a body that always says the venue was not called.
+        Outside US RTH the first call only records that the force card was
+        seen. The order is sent on a later call with ``force_confirm`` true,
+        and that path logs ``force_confirm_outside_rth=true``. Inside RTH one
+        confirm is enough. Nothing is sent without a confirm id.
         """
         if not isinstance(payload, dict):
             raise ProbeError("confirm body must be an object", status_code=400)
@@ -479,17 +570,20 @@ class ProbeSession:
             raise ProbeError(
                 DECISION_WARNING + "；confirm refused without manual confirm",
                 status_code=409)
+        if payload.get("confirm") is not True:
+            raise ProbeError("confirm refused without an explicit confirm",
+                             status_code=409)
         proc = self.ctl.snapshot()
         if proc.get("paused"):
             raise ProbeError("confirm refused while paused", status_code=409)
+        block = self._block_reason()
+        if block:
+            self._log("confirm refused: " + block)
+            raise ProbeError(block, status_code=409)
         rth = self.rth_now()
         if bool(payload.get("rth")) != rth:
             raise ProbeError("confirm refused: rth flag does not match the server clock",
                              status_code=409)
-        if not rth:
-            raise ProbeError(
-                "confirm refused outside US RTH (America/New_York 09:30–16:00)",
-                status_code=403)
         queue = self.queue()
         pending = queue.get("pending")
         if not pending:
@@ -504,19 +598,156 @@ class ProbeSession:
             if abs(float(payload["midline_bps"]) - float(spec["midline_bps"])) > 1e-6:
                 raise ProbeError("confirm refused: midline_bps does not match",
                                  status_code=409)
+            order_usd = float(spec["order_notional_usd"])
+            pos_usd = float(spec["max_position_usd"])
         except (TypeError, ValueError):
             raise ProbeError("confirm refused: numeric fields are not numbers",
                              status_code=400)
-        self._archive(queue, "confirmed", pending)
-        return {
-            "ok": True,
-            "queued": True,
-            "routed": False,
-            "sent": False,
-            "proposal_id": pending.get("proposal_id"),
-            "gap": ("order routing is not wired; the intent was queued and "
-                    "no venue order was sent"),
+        if order_usd - 10.0 > 1e-9 or pos_usd - 10.0 > 1e-9:
+            raise ProbeError("confirm refused: probe caps are $10", status_code=409)
+        if not rth:
+            force = payload.get("force_confirm") is True
+            if not force:
+                pending["force_ack"] = True
+                self._save_queue(queue)
+                self._log(
+                    "force-ack proposal_id="
+                    + str(pending.get("proposal_id"))
+                    + " no order")
+                card = session_snapshot(self._clock(), float(spec["midline_bps"]))
+                return {
+                    "ok": False,
+                    "queued": False,
+                    "routed": False,
+                    "sent": False,
+                    "needs_force_confirm": True,
+                    "proposal_id": pending.get("proposal_id"),
+                    "force_card": card,
+                    "gap": "非 RTH：需要第二次点击「强制确认」才会发单",
+                }
+            if not pending.get("force_ack"):
+                raise ProbeError(
+                    "强制确认需要先确认风险提示", status_code=409)
+        return self._route_admitted(spec, queue, pending, outside=not rth)
+
+    def _route_admitted(self, spec: dict, queue: dict, pending: dict,
+                        *, outside: bool) -> dict:
+        confirm_id = uuid.uuid4().hex
+        if not confirm_id:
+            raise ProbeError("refusing order without an admitted confirm id",
+                             status_code=500)
+        direction = pending.get("direction")
+        self._log(
+            f"route confirm_id={confirm_id} direction={direction} "
+            f"force_confirm_outside_rth={str(bool(outside)).lower()}")
+        # Drop the pending card before the send so a second click cannot
+        # admit the same proposal again.
+        proposal = dict(pending)
+        queue["pending"] = None
+        self._save_queue(queue)
+        req = {
+            "confirm_id": confirm_id,
+            "direction": direction,
+            "order_notional_usd": float(spec["order_notional_usd"]),
+            "max_position_usd": float(spec["max_position_usd"]),
+            "root": str(self.root),
+            "force_confirm_outside_rth": bool(outside),
         }
+        try:
+            result = self.executor(req)
+        except Exception as exc:
+            result = {
+                "ok": False, "routed": False, "sent": False, "halted": False,
+                "confirm_id": confirm_id,
+                "error": scrub(f"{type(exc).__name__}: {exc}"),
+                "buy_fill": 0.0, "sell_fill": 0.0, "net_base": 0.0,
+                "entropy_fee_bps": None, "status": "error",
+            }
+        if not isinstance(result, dict):
+            result = {"ok": False, "routed": False, "sent": False,
+                      "error": "bad executor result", "confirm_id": confirm_id}
+        if result.get("confirm_id") not in (None, confirm_id):
+            result["error"] = "confirm id mismatch"
+            result["sent"] = False
+        result.setdefault("confirm_id", confirm_id)
+        self._apply_result(result)
+        routed = bool(result.get("routed"))
+        sent = bool(result.get("sent"))
+        self._archive(queue, "confirmed" if sent else "failed", proposal,
+                      routed=routed, sent=sent, confirm_id=confirm_id,
+                      force_confirm_outside_rth=bool(outside),
+                      error=result.get("error"), status=result.get("status"))
+        # _archive rewrote the queue from the pre-clear copy's history.
+        # pending is set to None there. Good.
+        risk = self.risk()
+        self._log(
+            f"result confirm_id={confirm_id} routed={str(routed).lower()} "
+            f"sent={str(sent).lower()} ok={str(bool(result.get('ok'))).lower()} "
+            f"halt={risk.get('halt_reason') or ''} "
+            f"fee_bps={result.get('entropy_fee_bps')} "
+            f"error={result.get('error') or ''}")
+        gap = result.get("error") or (
+            "两腿已提交" if sent else "确认已承认，但没有发出订单")
+        return scrub({
+            "ok": bool(result.get("ok")),
+            "queued": False,
+            "routed": routed,
+            "sent": sent,
+            "needs_force_confirm": False,
+            "proposal_id": proposal.get("proposal_id"),
+            "confirm_id": confirm_id,
+            "force_confirm_outside_rth": bool(outside),
+            "halted": bool(risk.get("halted")),
+            "fee_mismatch": bool(risk.get("fee_mismatch")),
+            "entropy_fee_bps": result.get("entropy_fee_bps"),
+            "assumed_fee_bps": ENTROPY_FEE_BPS,
+            "status": result.get("status"),
+            "gap": gap,
+        })
+
+    def _apply_result(self, result: dict) -> None:
+        risk = self.risk()
+        buy = float(result.get("buy_fill") or 0.0)
+        sell = float(result.get("sell_fill") or 0.0)
+        net = result.get("net_base")
+        if net is None:
+            net = buy - sell
+        try:
+            net = float(net)
+        except (TypeError, ValueError):
+            net = buy - sell
+        if result.get("halted") or abs(net) > NET_TOL_BASE:
+            risk["halted"] = True
+            risk["halt_reason"] = result.get("halt_reason") or "single-leg fill"
+            risk["net_base"] = net
+        elif result.get("sent"):
+            risk["net_base"] = net
+        actual = result.get("entropy_fee_bps")
+        filled = buy > 0 or sell > 0
+        if filled and actual is not None:
+            try:
+                actual_f = float(actual)
+            except (TypeError, ValueError):
+                actual_f = None
+            if actual_f is not None:
+                risk["actual_fee_bps"] = actual_f
+                if abs(actual_f - ENTROPY_FEE_BPS) > FEE_MISMATCH_TOL_BPS:
+                    risk["fee_mismatch"] = True
+        risk["last_order"] = scrub({
+            "confirm_id": result.get("confirm_id"),
+            "ok": bool(result.get("ok")),
+            "routed": bool(result.get("routed")),
+            "sent": bool(result.get("sent")),
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "buy_fill": buy,
+            "sell_fill": sell,
+            "net_base": net,
+            "entropy_fee_bps": risk.get("actual_fee_bps"),
+            "assumed_fee_bps": ENTROPY_FEE_BPS,
+            "ts": self.now(),
+        })
+        self._save_risk(risk)
 
     # ------------------------------------------------------------------ status
 
@@ -538,6 +769,9 @@ class ProbeSession:
         mode = spec.get("mode") if spec else None
         label = status_label(running=proc_running, paused=paused, mode=mode,
                              live_armed=live_armed, fresh=fresh)
+        risk = self.risk()
+        if risk.get("halted") or abs(float(risk.get("net_base") or 0.0)) > NET_TOL_BASE:
+            label = STATUS_HALT
         proposal = None
         if spec and live_armed and not paused:
             proposal = self.pending_payload(base.get("latest"))
@@ -559,15 +793,31 @@ class ProbeSession:
             "recent": [
                 {"action": item.get("action"), "ts": item.get("ts"),
                  "proposal_id": item.get("proposal_id"),
-                 "routed": False, "sent": False}
+                 "confirm_id": item.get("confirm_id"),
+                 "routed": bool(item.get("routed")),
+                 "sent": bool(item.get("sent")),
+                 "force_confirm_outside_rth": bool(
+                     item.get("force_confirm_outside_rth"))}
                 for item in self.queue().get("history") or []
             ][-5:],
         }
+        out["halted"] = label == STATUS_HALT
+        out["fee_check"] = {
+            "assumed_bps": ENTROPY_FEE_BPS,
+            "actual_bps": risk.get("actual_fee_bps"),
+            "mismatch": bool(risk.get("fee_mismatch")),
+        }
+        out["last_order"] = risk.get("last_order")
+        out["net_base"] = risk.get("net_base")
+        task_mid = float(spec["midline_bps"]) if spec else -1.7
+        out["session"] = session_snapshot(self._clock(), task_mid)
         out["gaps"] = [
-            "探针实盘只武装确认队列；子进程始终是 --record-only，不会自动下单。",
-            "确认入队后 routed=false：交易所订单路由未接入。",
+            "启动探针实盘仍只拉起 --record-only 记录进程。下单只发生在已承认的确认单上，并走 Engine.execute_confirmed。",
+            "非美股 RTH 不禁用确认，但必须先看强制确认卡，再点「强制确认」才会发单。",
+            "默认仍建议仅美国 RTH 启动。中枢不会按时段自动切换。",
             "对账只记一条请求，不会做链上持仓同步。",
             "RTH 为美东周一至周五 09:30–16:00，不含交易所假日。",
+            "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓。",
         ]
         return scrub(out)
 

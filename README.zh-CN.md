@@ -68,9 +68,11 @@ python3 -m web
 ```
 
 只监听 <http://127.0.0.1:8765>。打开页面不会自动武装实盘，密钥也不会发到浏览器。
-点击路径、Decision Card 默认值（中枢 -1.7、带宽 ±1.0、单笔与单边上限 $10、
-self_t2 应计约 0.54 bps 标记未到账）和尚未接入的下单路由见 [MVP.md](MVP.md)。
-命令行实盘不变：`python3 main.py --symbol SNDK --hedge lighter`。
+Dexter 的点击路径、Decision Card 默认值（中枢 -1.7、带宽 ±1.0、单笔与单边上限 $10、
+self_t2 应计约 0.54 bps 标记未到账）见 [MVP.md](MVP.md)。**启动**仍然只跑
+`--record-only`。**确认**才下单：美股 RTH 内一次确认走 `Engine.execute_confirmed`；
+RTH 外必须再点一次 **强制确认**。命令行实盘不变：
+`python3 main.py --symbol SNDK --hedge lighter`。
 
 ## 快速开始
 

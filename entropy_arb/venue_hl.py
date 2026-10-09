@@ -284,10 +284,14 @@ class HLVenue:
             return fail(f"malformed response: {str(body)[:200]}")
         if "filled" in st:
             f = st["filled"]
-            return {"status": "filled",
-                    "filled_base": float(f.get("totalSz") or 0.0),
-                    "avg_px": float(f["avgPx"]) if f.get("avgPx") else None,
-                    "err": None, "unresolved": False}
+            filled = float(f.get("totalSz") or 0.0)
+            avg = float(f["avgPx"]) if f.get("avgPx") else None
+            out = {"status": "filled", "filled_base": filled, "avg_px": avg,
+                   "err": None, "unresolved": False}
+            fee = _optional_float(f.get("fee"))
+            if fee is not None:
+                out["fee_quote"] = abs(fee)
+            return out
         if "error" in st:
             msg = str(st["error"])
             if "could not immediately match" in msg.lower():
@@ -298,6 +302,39 @@ class HLVenue:
             return {"status": "resting?", "filled_base": 0.0, "avg_px": None,
                     "err": None, "unresolved": True}
         return fail(f"unknown status: {str(st)[:150]}")
+
+    async def recent_fill_fee_bps(self) -> Optional[float]:
+        """Latest SNDK fill fee in bps via the existing info endpoint.
+
+        ``userFills`` is the same client the venue already uses. Returns
+        None when the payload has no fee — nothing is invented.
+        """
+        addr = self._query_address()
+        if not addr:
+            return None
+        try:
+            body = await self._info({"type": "userFills", "user": addr})
+        except Exception:
+            return None
+        if not isinstance(body, list):
+            return None
+        symbol = (self.conf.symbol or "").upper()
+        for row in body:
+            if not isinstance(row, dict):
+                continue
+            coin = str(row.get("coin") or "").upper()
+            if symbol not in coin:
+                continue
+            px = _optional_float(row.get("px"))
+            sz = _optional_float(row.get("sz"))
+            fee = _optional_float(row.get("fee"))
+            if px is None or sz is None or fee is None:
+                continue
+            notional = px * sz
+            if notional <= 0:
+                continue
+            return abs(fee) / notional * 1e4
+        return None
 
     # -------------------------------------------------------------- accounts
 
@@ -350,3 +387,12 @@ class HLVenue:
 
     async def close(self) -> None:
         pass
+
+
+def _optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

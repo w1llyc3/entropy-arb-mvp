@@ -33,6 +33,37 @@ from .venue_lighter import LighterVenue
 
 log = logging.getLogger("engine")
 
+
+def _fill_fee_bps(info: dict, fill: float, px) -> Optional[float]:
+    """Actual fee in bps when the venue result names one. None if it does not."""
+    if not fill or fill <= 0:
+        return None
+    raw = info.get("fee_bps")
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    quote = info.get("fee_quote")
+    if quote is None or not px:
+        return None
+    try:
+        notional = float(fill) * float(px)
+        if notional <= 0:
+            return None
+        return abs(float(quote)) / notional * 1e4
+    except (TypeError, ValueError):
+        return None
+
+
+def _not_sent(confirm_id: str, error: str) -> dict:
+    return {
+        "ok": False, "routed": False, "sent": False, "halted": False,
+        "confirm_id": confirm_id, "error": error,
+        "buy_fill": 0.0, "sell_fill": 0.0, "net_base": 0.0,
+        "entropy_fee_bps": None, "status": error,
+    }
+
 CSV_HEADER = ["ts", "direction", "buy_venue", "sell_venue", "qty",
               "buy_limit", "sell_limit", "buy_notional", "sell_notional",
               "exp_edge_usd", "gross_edge_usd", "marginal_premium_bps",
@@ -86,6 +117,8 @@ class Engine:
         self._venue_fetch_fails: Dict[str, int] = {}
         # per-execution records for the dashboard (newest last)
         self.recent_trades: deque = deque(maxlen=50)
+        # Last dual-leg attempt. The panel reads this after execute_confirmed.
+        self.last_execution: Optional[dict] = None
 
     # ------------------------------------------------------------- utilities
 
@@ -501,7 +534,110 @@ class Engine:
         self._log_csv(direction, buy, sell, plan, sent_ok, bfill, sfill,
                       binfo["status"], sinfo["status"], fill_edge, inv_bps)
         self.last_trade_ts = time.time()
+        self.last_execution = {
+            "direction": direction,
+            "buy_fill": bfill,
+            "sell_fill": sfill,
+            "buy_status": binfo.get("status"),
+            "sell_status": sinfo.get("status"),
+            "buy_fee_bps": _fill_fee_bps(
+                binfo, bfill, binfo.get("avg_px") or plan.buy_limit),
+            "sell_fee_bps": _fill_fee_bps(
+                sinfo, sfill, sinfo.get("avg_px") or plan.sell_limit),
+            "buy_key": buy.key,
+            "sell_key": sell.key,
+            "error": binfo.get("err") or sinfo.get("err"),
+            "unresolved": bool(unresolved),
+            "status": f"{binfo.get('status')}/{sinfo.get('status')}",
+        }
         return bool(unresolved)
+
+    async def execute_confirmed(self, *, direction: str, confirm_id: str,
+                                cap_notional: float) -> dict:
+        """One dual-leg slice for an admitted panel confirm.
+
+        Uses the same ``_execute`` path as the strategy loop (both legs go
+        through ``send_taker``). Refuses a blank confirm id before any send.
+        A residual net after the pair halts this engine; the caller must not
+        open again while that net is non-zero. This method does not hedge —
+        a hedge would be a second order without its own confirm.
+        """
+        if not str(confirm_id or "").strip():
+            raise RuntimeError("refusing order without an admitted confirm id")
+        confirm_id = str(confirm_id).strip()
+        if self.halted:
+            return {
+                "ok": False, "routed": False, "sent": False, "halted": True,
+                "confirm_id": confirm_id, "error": "halted",
+                "buy_fill": 0.0, "sell_fill": 0.0, "net_base": 0.0,
+                "entropy_fee_bps": None, "status": "halted",
+            }
+        if direction == "sell_entropy":
+            buy, sell = self.hedge, self.entropy
+        elif direction == "buy_entropy":
+            buy, sell = self.entropy, self.hedge
+        else:
+            raise RuntimeError(f"unknown direction {direction}")
+        cfg = self.cfg
+        if not (buy.book.is_fresh(cfg.staleness_sec)
+                and sell.book.is_fresh(cfg.staleness_sec)):
+            return _not_sent(confirm_id, "stale_book")
+        if not (buy.ready_to_trade() and sell.ready_to_trade()):
+            return _not_sent(confirm_id, "not_ready")
+        cap = min(float(cap_notional), float(cfg.max_order_notional),
+                  float(buy.cap_usd), float(sell.cap_usd), 10.0)
+        if cap <= 0:
+            return _not_sent(confirm_id, "cap")
+        ref = buy.book.best_ask() or sell.book.best_bid() or 0.0
+        if ref > 0:
+            cap = min(cap, max(self._headroom(buy, sell, ref), 0.0))
+        if cap + 1e-9 < min(self._min_notional, 10.0) * 0.98:
+            return _not_sent(confirm_id, "position_cap")
+        # A $10 cap floored to the size step can land a hair under the
+        # configured minimum. Keep the slice, but never above the cap.
+        saved_min = self._min_notional
+        self._min_notional = min(saved_min, cap * 0.98)
+        try:
+            plan, reason = self._plan(buy, sell, cap)
+        finally:
+            self._min_notional = saved_min
+        if plan is None:
+            return _not_sent(confirm_id, reason or "no_plan")
+        if (plan.buy_notional > cap * 1.02 + 1e-6
+                or plan.sell_notional > cap * 1.02 + 1e-6):
+            return _not_sent(confirm_id, "notional_above_cap")
+        await self._vlock(buy.key).acquire()
+        await self._vlock(sell.key).acquire()
+        try:
+            unresolved = await self._execute(buy, sell, plan)
+        finally:
+            self._vlock(buy.key).release()
+            self._vlock(sell.key).release()
+        last = dict(self.last_execution or {})
+        bfill = float(last.get("buy_fill") or 0.0)
+        sfill = float(last.get("sell_fill") or 0.0)
+        net = bfill - sfill
+        tol = float(cfg.net_tolerance_base)
+        halted = abs(net) > tol
+        if halted:
+            self.halted = True
+        if sell.key == "entropy":
+            fee = last.get("sell_fee_bps")
+        else:
+            fee = last.get("buy_fee_bps")
+        last.update({
+            "ok": (not halted) and not unresolved and not last.get("error"),
+            "routed": True,
+            "sent": True,
+            "halted": halted,
+            "halt_reason": "single-leg fill" if halted else None,
+            "confirm_id": confirm_id,
+            "net_base": net,
+            "entropy_fee_bps": fee,
+            "unresolved": bool(unresolved),
+        })
+        self.last_execution = last
+        return last
 
     def _record_trade(self, direction: str, plan: ArbPlan, fill_edge,
                       status: str, ok: bool) -> None:

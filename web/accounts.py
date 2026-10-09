@@ -56,6 +56,12 @@ def creds_ready(vals: dict) -> dict:
     return {"entropy": entropy, "lighter": lighter}
 
 
+def missing_live_env(root: Path) -> list:
+    """Names of the five live keys that are missing or blank. Values stay here."""
+    vals = parse_env_file(Path(root) / ".env")
+    return [key for key in _ENV_KEYS if not vals.get(key)]
+
+
 def _blank_leg() -> dict:
     return {"equity": None, "available": None, "position": None, "isolated": None}
 

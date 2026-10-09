@@ -1,16 +1,17 @@
 """SNDK Entropy ↔ Lighter probe: Decision Card, RTH gate, confirm payload.
 
-Pure functions. No network, no secrets, no order routing. The panel calls
-these before it will even queue a live intent.
+Pure functions. No network and no secrets. Order routing lives in
+``web.live_exec`` and only runs after an admitted confirm id.
 """
 from __future__ import annotations
 
 import math
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from entropy_arb.config import display_accrual_bps
+from tools.analyze import assign_session
 
 # Locked Decision Card (Researcher). The create form opens on these values.
 DECISION_MIDLINE_BPS = -1.7
@@ -32,6 +33,16 @@ MIN_ORDER_USD = 10.0
 ACCRUAL_BPS = round(display_accrual_bps(ENTROPY_FEE_BPS, REFERRAL_MODE), 4)
 ACCRUAL_LABEL = "未到账"
 DECISION_WARNING = "会偏离 Decision Card"
+
+# Measured session midlines. Display only — the task midline never follows them.
+SESSION_MIDLINE_BPS = {
+    "us_regular": -1.7,
+    "us_post_overnight": 2.6,
+    "asia": -0.4,
+}
+FORCE_RISK_LINE = "带宽 1 bps，错中枢风险大于费率缺口"
+FEE_MISMATCH_TOL_BPS = 0.05
+NET_TOL_BASE = 0.001
 
 RTH_OPEN = dtime(9, 30)
 RTH_CLOSE = dtime(16, 0)
@@ -63,6 +74,7 @@ STATUS_WARMING = "暖机"
 STATUS_LIVE = "LIVE"
 STATUS_PAUSED = "暂停"
 STATUS_STOPPED = "已停止"
+STATUS_HALT = "HALT"
 
 
 def decision_defaults() -> dict:
@@ -125,6 +137,10 @@ def normalize_task(body: Optional[dict]) -> dict:
     if spec["order_notional_usd"] < MIN_ORDER_USD:
         raise ValueError(
             f"order_notional_usd must be >= {MIN_ORDER_USD:.0f}")
+    if spec["order_notional_usd"] - DECISION_ORDER_USD > 1e-9:
+        raise ValueError("order_notional_usd cap is $10")
+    if spec["max_position_usd"] - DECISION_POSITION_USD > 1e-9:
+        raise ValueError("max_position_usd cap is $10")
     if spec["max_position_usd"] < spec["order_notional_usd"]:
         raise ValueError("max_position_usd must cover one order")
     mode = str(raw.get("mode", spec["mode"]) or "").strip().lower()
@@ -172,6 +188,28 @@ def _new_york() -> ZoneInfo:
                 "On Windows install the IANA database: pip install tzdata"
             ) from exc
     return _NY
+
+
+def session_snapshot(now: datetime, task_midline: float) -> dict:
+    """Current session and its measured midline. Does not change the task.
+
+    Deviation is session midline minus the task midline. A task still at
+    -1.7 during us_post_overnight (+2.6) is about 4 bps off.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    name = assign_session(now.timestamp())
+    measured = float(SESSION_MIDLINE_BPS[name])
+    delta = measured - float(task_midline)
+    approx = int(round(abs(delta)))
+    return {
+        "name": name,
+        "midline_bps": measured,
+        "task_midline_bps": float(task_midline),
+        "deviation_bps": round(delta, 4),
+        "deviation_text": f"偏离约 {approx} bps",
+        "risk_line": FORCE_RISK_LINE,
+    }
 
 
 def in_us_rth(now: datetime) -> bool:
