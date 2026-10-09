@@ -17,24 +17,32 @@ from entropy_arb.book import sync_size_grid
 from entropy_arb.config import load_config
 from entropy_arb.engine import Engine
 from web.accounts import missing_live_env
-from web.probe import MAX_ORDER_USD, MAX_POSITION_USD, MIN_ORDER_USD
+from web.probe import MIN_ORDER_USD
 
 _BOOK_WAIT_SEC = 12.0
 
 
 def execute_admitted(req: dict) -> dict:
     """Synchronous entry used by the panel. Refuses before any network if
-    the confirm id is missing or the notional is outside $10.50–$20."""
+    the confirm id is missing, the notional is under the venue floor, or
+    the caller did not pass the dynamic balance cap."""
     confirm_id = str((req or {}).get("confirm_id") or "").strip()
     if not confirm_id:
         raise RuntimeError("refusing order without an admitted confirm id")
     order = float(req.get("order_notional_usd") or 0.0)
     position = float(req.get("max_position_usd") or 0.0)
-    if order < MIN_ORDER_USD - 1e-9 or order - MAX_ORDER_USD > 1e-9:
-        raise RuntimeError("probe order notional must be $10.50–$20")
-    if position + 1e-9 < order or position - MAX_POSITION_USD > 1e-9:
-        raise RuntimeError(
-            "probe position cap must cover the order and be <= $20")
+    if order < MIN_ORDER_USD - 1e-9:
+        raise RuntimeError(f"probe order notional must be >= ${MIN_ORDER_USD}")
+    if position + 1e-9 < order:
+        raise RuntimeError("probe position cap must cover the order")
+    try:
+        balance_cap = float(req.get("balance_cap_usd"))
+    except (TypeError, ValueError):
+        raise RuntimeError("refusing order without a computed balance cap")
+    if not (balance_cap == balance_cap) or balance_cap <= 0:
+        raise RuntimeError("refusing order without a computed balance cap")
+    if order - balance_cap > 1e-9 or position - balance_cap > 1e-9:
+        raise RuntimeError("order exceeds dynamic balance cap")
     return asyncio.run(_route(req, confirm_id))
 
 
@@ -46,9 +54,11 @@ async def _route(req: dict, confirm_id: str) -> dict:
     env_path = root / ".env"
     cfg = load_config(str(cfg_path), str(env_path),
                       symbol="SNDK", hedge_venue="lighter")
-    cfg.max_order_notional = min(float(cfg.max_order_notional), MAX_ORDER_USD)
-    cfg.entropy.cap_usd = min(float(cfg.entropy.cap_usd), MAX_POSITION_USD)
-    cfg.hedge.cap_usd = min(float(cfg.hedge.cap_usd), MAX_POSITION_USD)
+    order = float(req.get("order_notional_usd") or 0.0)
+    position = float(req.get("max_position_usd") or 0.0)
+    cfg.max_order_notional = order
+    cfg.entropy.cap_usd = position
+    cfg.hedge.cap_usd = position
     eng = Engine(cfg, record_only=False)
     eng.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(
         keepalive_timeout=75.0, ttl_dns_cache=300))

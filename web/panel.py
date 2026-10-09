@@ -66,6 +66,9 @@ class TaskIn(BaseModel):
     mode: str = "record"
     manual_confirm: bool = True
     rth_only: bool = True
+    auto_confirm: bool = False
+    auto_confirm_sec: float = 3.0
+    auto_confirm_max_usd: Optional[float] = None
 
 
 class ConfirmIn(BaseModel):

@@ -22,28 +22,34 @@ from web.live_exec import execute_admitted
 from web.probe import (
     ACCRUAL_BPS,
     ACCRUAL_LABEL,
+    BALANCE_SAFETY,
     DECISION_WARNING,
     ENTROPY_FEE_BPS,
     FEE_MISMATCH_TOL_BPS,
-    MAX_ORDER_USD,
-    MAX_POSITION_USD,
-    MIN_ORDER_USD,
     NET_TOL_BASE,
     RTH_WINDOW,
     STATUS_HALT,
     SYMBOL,
+    auto_confirm_decision,
+    available_short_reason,
+    balance_view,
     books_fresh,
     build_confirm_payload,
     confirm_field_errors,
     decision_defaults,
     decision_warnings,
+    dynamic_balance_cap,
     in_us_rth,
     leg_plan,
     net_edge_bps,
     normalize_task,
+    notional_cap_reason,
     probe_config_dict,
     qualifying_direction,
+    save_notional_reason,
+    session_name,
     session_snapshot,
+    session_switch_decision,
     status_label,
     tail_vs_median,
 )
@@ -221,6 +227,19 @@ class ProbeSession:
         acct_net = self._account_net()
         if acct_net is not None and abs(acct_net) > NET_TOL_BASE:
             return "HALT：账户净敞口不为 0，拒绝新开仓"
+        spec = self.task()
+        if spec and spec.get("session_switch_block"):
+            return str(spec["session_switch_block"])
+        if spec:
+            short = available_short_reason(
+                self._accounts(), spec.get("order_notional_usd"))
+            if short:
+                return short
+            capped = notional_cap_reason(
+                spec.get("order_notional_usd"), spec.get("max_position_usd"),
+                self._accounts(), spec.get("balance_safety", BALANCE_SAFETY))
+            if capped:
+                return capped
         return None
 
     def _clock(self) -> datetime:
@@ -243,6 +262,11 @@ class ProbeSession:
             spec = normalize_task(body)
         except ValueError as exc:
             raise ProbeError(str(exc), status_code=400)
+        cap_err = save_notional_reason(
+            spec["order_notional_usd"], spec["max_position_usd"],
+            self._accounts(), spec.get("balance_safety", BALANCE_SAFETY))
+        if cap_err:
+            raise ProbeError(cap_err, status_code=400)
         spec["live_armed"] = False
         spec["warnings"] = decision_warnings(spec)
         spec["saved_at"] = self.now()
@@ -292,6 +316,13 @@ class ProbeSession:
             "accrual_label": ACCRUAL_LABEL,
             "manual_confirm": bool(spec.get("manual_confirm")),
             "rth_only": bool(spec.get("rth_only", True)),
+            "auto_confirm": bool(spec.get("auto_confirm")),
+            "auto_confirm_sec": spec.get("auto_confirm_sec"),
+            "auto_confirm_max_usd": spec.get("auto_confirm_max_usd"),
+            "balance_safety": spec.get("balance_safety", BALANCE_SAFETY),
+            "session_anchor": spec.get("session_anchor"),
+            "session_switch_block": spec.get("session_switch_block"),
+            "last_auto_action": spec.get("last_auto_action"),
             "mode": spec.get("mode"),
             "mode_label": "探针实盘" if spec.get("mode") == "live" else "只记录",
             "live_armed": bool(spec.get("live_armed")),
@@ -307,6 +338,14 @@ class ProbeSession:
 
     def _mark_armed(self, spec: dict, armed: bool) -> dict:
         spec["live_armed"] = bool(armed and spec.get("mode") == "live")
+        if spec["live_armed"]:
+            # Pin the session at arm time. A later boundary is the only
+            # moment the midline may follow SESSION_MIDLINE_BPS. rth_only
+            # is a start gate and is not touched here.
+            spec["session_anchor"] = session_name(float(self.now()))
+            spec["session_switch_block"] = None
+        else:
+            spec["session_switch_block"] = None
         spec["warnings"] = decision_warnings(spec)
         self._write_json(self.task_path, spec)
         return spec
@@ -504,6 +543,164 @@ class ProbeSession:
         self._accounts_at = now
         return self._account_cache
 
+    def _apply_session_boundary(self, spec: dict) -> dict:
+        """Follow the session midline only on a boundary, and only if flat.
+
+        A tick inside the same session does not rewrite the task. rth_only
+        is left as the operator saved it.
+        """
+        if not spec or not spec.get("live_armed"):
+            return spec
+        now_name = session_name(float(self.now()))
+        decision = session_switch_decision(
+            spec.get("session_anchor"), now_name, self._accounts(),
+            armed=True)
+        action = decision.get("action")
+        if action == "pin":
+            if spec.get("session_anchor") != decision["session"]:
+                spec["session_anchor"] = decision["session"]
+                spec["session_switch_block"] = None
+                self._write_json(self.task_path, spec)
+            return spec
+        if action == "hold":
+            if spec.get("session_switch_block"):
+                spec["session_switch_block"] = None
+                self._write_json(self.task_path, spec)
+            return spec
+        if action == "block":
+            reason = decision["reason"]
+            if spec.get("session_switch_block") != reason:
+                spec["session_switch_block"] = reason
+                self._write_json(self.task_path, spec)
+                self._log("session switch blocked: " + reason)
+            return spec
+        if action != "apply":
+            return spec
+        old_mid = float(spec["midline_bps"])
+        new_mid = float(decision["midline_bps"])
+        frm = decision["from_session"]
+        to = decision["session"]
+        spec["midline_bps"] = new_mid
+        spec["session_anchor"] = to
+        spec["session_switch_block"] = None
+        spec["warnings"] = decision_warnings(spec)
+        self._write_json(self.task_path, spec)
+        self._write_probe_yaml(spec)
+        self._log(
+            f"session switch {frm} -> {to} midline {old_mid} -> {new_mid}")
+        queue = self.queue()
+        if queue.get("pending"):
+            self._save_queue({"pending": None, "history": queue["history"]})
+        return spec
+
+    def _note_auto(self, text: str, fired: bool) -> None:
+        spec = self.task()
+        if not spec:
+            return
+        prev = spec.get("last_auto_action") or {}
+        if prev.get("text") == text and bool(prev.get("fired")) == bool(fired):
+            return
+        spec["last_auto_action"] = {
+            "ts": self.now(),
+            "text": text,
+            "fired": bool(fired),
+        }
+        self._write_json(self.task_path, spec)
+
+    def _auto_status(self, spec: Optional[dict],
+                     pending: Optional[dict]) -> dict:
+        armed = bool(spec and spec.get("auto_confirm") and spec.get("live_armed")
+                     and spec.get("mode") == "live" and spec.get("manual_confirm"))
+        sec = None
+        remaining = None
+        if spec:
+            try:
+                sec = float(spec.get("auto_confirm_sec"))
+            except (TypeError, ValueError):
+                sec = None
+        created = (pending or {}).get("created_at") if pending else None
+        if armed and sec is not None and isinstance(created, (int, float)):
+            remaining = max(0.0, sec - (float(self.now()) - float(created)))
+        last = (spec or {}).get("last_auto_action")
+        max_usd = (spec or {}).get("auto_confirm_max_usd")
+        return {
+            "armed": armed,
+            "sec": sec,
+            "max_usd": max_usd,
+            "remaining_sec": remaining,
+            "last_action": last if isinstance(last, dict) else None,
+        }
+
+    def maybe_auto_confirm(self, latest: Optional[dict],
+                           payload: Optional[dict]) -> Optional[dict]:
+        """Fire the same admit path once the confirm card has aged in.
+
+        Refuses on HALT, a funding short, a stale book, a notional above
+        the auto cap, or a card that no longer qualifies. Does not set
+        force_confirm, so a non-RTH card stays with the operator.
+        """
+        spec = self.task()
+        if not spec or not payload:
+            return None
+        armed = bool(spec.get("auto_confirm") and spec.get("live_armed")
+                     and spec.get("mode") == "live" and spec.get("manual_confirm"))
+        risk = self.risk()
+        halted = bool(risk.get("halted")
+                      or abs(float(risk.get("net_base") or 0.0)) > NET_TOL_BASE
+                      or risk.get("fee_mismatch"))
+        paused = bool(self.ctl.snapshot().get("paused"))
+        fresh = books_fresh(latest, now=float(self.now()))
+        view = self._edge_view(latest)
+        qual = qualifying_direction(spec, view["sell_pre_bps"], view["buy_pre_bps"])
+        qualifying = bool(qual and qual.get("direction") == payload.get("direction"))
+        accounts = self._accounts(force=True)
+        order = spec.get("order_notional_usd")
+        if spec.get("session_switch_block"):
+            funding = str(spec["session_switch_block"])
+        else:
+            funding = available_short_reason(accounts, order)
+        cap_block = notional_cap_reason(
+            order, spec.get("max_position_usd"), accounts,
+            spec.get("balance_safety", BALANCE_SAFETY))
+        # A funding line is already inside cap_block. Keep both so a test
+        # can see the funding stop even when the cap math would also fail.
+        if funding and cap_block == funding:
+            cap_block = None
+        pending = self.queue().get("pending") or {}
+        created = pending.get("created_at")
+        age = None
+        if isinstance(created, (int, float)):
+            age = float(self.now()) - float(created)
+        try:
+            auto_max = float(spec.get("auto_confirm_max_usd"))
+            wait = float(spec.get("auto_confirm_sec"))
+            order_f = float(order)
+        except (TypeError, ValueError):
+            auto_max, wait, order_f = 0.0, 3.0, 0.0
+        kind, reason = auto_confirm_decision(
+            armed=armed, halted=halted, paused=paused, fresh=fresh,
+            qualifying=qualifying, funding_block=funding, cap_block=cap_block,
+            order_usd=order_f, auto_max_usd=auto_max, age_sec=age,
+            wait_sec=wait, rth=self.rth_now())
+        if kind in ("off", "wait"):
+            return None
+        if kind != "fire":
+            self._note_auto("未自动确认：" + str(reason or "refused"), False)
+            return None
+        try:
+            result = self.admit_confirm(dict(payload))
+        except ProbeError as exc:
+            self._note_auto("未自动确认：" + str(exc), False)
+            return None
+        if result.get("sent"):
+            self._note_auto(
+                "已自动确认 " + str(result.get("confirm_id") or ""), True)
+        else:
+            self._note_auto(
+                "未自动确认：" + str(result.get("gap") or result.get("status") or ""),
+                False)
+        return result
+
     def refresh_proposal(self, latest: Optional[dict]) -> Optional[dict]:
         """Open a confirm card when the live probe sees a qualifying net edge.
 
@@ -511,6 +708,8 @@ class ProbeSession:
         with confirm disabled; ``admit_confirm`` refuses it.
         """
         spec = self.task()
+        if spec and spec.get("live_armed"):
+            spec = self._apply_session_boundary(spec)
         queue = self.queue()
         risk = self.risk()
         if risk.get("halted") or abs(float(risk.get("net_base") or 0.0)) > NET_TOL_BASE:
@@ -575,6 +774,7 @@ class ProbeSession:
         payload["force_ack"] = bool(pending.get("force_ack"))
         payload["session"] = snap
         payload["force_card"] = snap if not rth else None
+        payload["auto"] = self._auto_status(spec, pending)
         return payload
 
     def _archive(self, queue: dict, action: str, proposal: dict,
@@ -620,6 +820,8 @@ class ProbeSession:
                 "confirm payload rejected: " + "; ".join(field_errors),
                 status_code=400)
         spec = self._load_task()
+        if spec.get("live_armed"):
+            spec = self._apply_session_boundary(spec)
         if spec.get("mode") != "live" or not spec.get("live_armed"):
             raise ProbeError("confirm refused: probe is not live-armed",
                              status_code=409)
@@ -660,14 +862,12 @@ class ProbeSession:
         except (TypeError, ValueError):
             raise ProbeError("confirm refused: numeric fields are not numbers",
                              status_code=400)
-        if order_usd < MIN_ORDER_USD - 1e-9 or order_usd - MAX_ORDER_USD > 1e-9:
-            raise ProbeError(
-                "confirm refused: order notional must be $10.50–$20",
-                status_code=409)
-        if pos_usd + 1e-9 < order_usd or pos_usd - MAX_POSITION_USD > 1e-9:
-            raise ProbeError(
-                "confirm refused: position cap must cover the order and be <= $20",
-                status_code=409)
+        cap_err = notional_cap_reason(
+            order_usd, pos_usd, self._accounts(force=True),
+            spec.get("balance_safety", BALANCE_SAFETY))
+        if cap_err:
+            self._log("confirm refused: " + cap_err)
+            raise ProbeError("confirm refused: " + cap_err, status_code=409)
         if not rth:
             force = payload.get("force_confirm") is True
             if not force:
@@ -700,6 +900,12 @@ class ProbeSession:
             raise ProbeError("refusing order without an admitted confirm id",
                              status_code=500)
         direction = pending.get("direction")
+        accounts = self._accounts(force=True)
+        balance_cap = dynamic_balance_cap(
+            accounts, spec.get("balance_safety", BALANCE_SAFETY))
+        if balance_cap is None:
+            raise ProbeError("confirm refused: 余额未读到，拒绝下单（不猜测可用）",
+                             status_code=409)
         self._log(
             f"route confirm_id={confirm_id} direction={direction} "
             f"force_confirm_outside_rth={str(bool(outside)).lower()}")
@@ -713,6 +919,7 @@ class ProbeSession:
             "direction": direction,
             "order_notional_usd": float(spec["order_notional_usd"]),
             "max_position_usd": float(spec["max_position_usd"]),
+            "balance_cap_usd": float(balance_cap),
             "root": str(self.root),
             "force_confirm_outside_rth": bool(outside),
         }
@@ -831,6 +1038,8 @@ class ProbeSession:
             self._mark_armed(spec, False)
             live_armed = False
             spec = self.task()
+        if spec and live_armed:
+            spec = self._apply_session_boundary(spec)
         fresh = books_fresh(base.get("latest"), now=float(self.now()))
         mode = spec.get("mode") if spec else None
         label = status_label(running=proc_running, paused=paused, mode=mode,
@@ -841,6 +1050,16 @@ class ProbeSession:
         proposal = None
         if spec and live_armed and not paused:
             proposal = self.pending_payload(base.get("latest"))
+            if proposal and label != STATUS_HALT:
+                fired = self.maybe_auto_confirm(base.get("latest"), proposal)
+                if fired and fired.get("sent"):
+                    proposal = None
+                    spec = self.task()
+                elif spec:
+                    spec = self.task() or spec
+                    if proposal:
+                        proposal["auto"] = self._auto_status(
+                            spec, self.queue().get("pending"))
         elif self.queue().get("pending") and not live_armed:
             self._save_queue({"pending": None, "history": self.queue()["history"]})
         out = dict(base)
@@ -852,7 +1071,10 @@ class ProbeSession:
         out["rth_window"] = RTH_WINDOW
         out["edge"] = self._edge_view(base.get("latest"))
         out["proposal"] = proposal
-        out["accounts"] = self._accounts()
+        accounts = self._accounts()
+        out["accounts"] = accounts
+        safety = (spec or {}).get("balance_safety", BALANCE_SAFETY) if spec else BALANCE_SAFETY
+        out["balance"] = balance_view(accounts, safety)
         out["reconcile"] = self.last_reconcile()
         out["confirm_queue"] = {
             "pending": bool(proposal),
@@ -877,13 +1099,17 @@ class ProbeSession:
         out["net_base"] = risk.get("net_base")
         task_mid = float(spec["midline_bps"]) if spec else -1.7
         out["session"] = session_snapshot(self._clock(), task_mid)
+        out["session_switch_block"] = (spec or {}).get("session_switch_block") if spec else None
+        out["auto_confirm"] = self._auto_status(spec, self.queue().get("pending") if proposal else None)
         out["gaps"] = [
             "启动探针实盘仍只拉起 --record-only 记录进程。下单只发生在已承认的确认单上，并走 Engine.execute_confirmed。",
-            "非美股 RTH 不禁用确认，但必须先看强制确认卡，再点「强制确认」才会发单。",
-            "默认仍建议仅美国 RTH 启动。中枢不会按时段自动切换。",
+            "非美股 RTH 不禁用确认，但必须先看强制确认卡，再点「强制确认」才会发单。自动确认不代替强制确认。",
+            "仅美国 RTH 启动仍由 rth_only 单独控制。实盘武装后，时段边界且两所都空仓时，中枢改成该时段实测值，带宽不变。未空仓则暂停新确认，不在持仓中改中枢。",
+            "自动确认默认关闭。勾选后，确认卡保持打开达到设定秒数且盘口仍新鲜、仍达标、名义不超过自动上限，才走同一条确认。HALT、余额不足、盘口不新鲜、超过上限不会自动发。",
+            "单笔与持仓上限取两边可用的较小值 × 0.9，且不低于约 $10.50。没有读到余额就不会猜一个数字。",
             "对账只记一条请求，不会做链上持仓同步。",
             "RTH 为美东周一至周五 09:30–16:00，不含交易所假日。",
-            "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓。",
+            "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓。Entropy 名义会先按 szDecimals 向上取整，仍低于 $10 则不发 Lighter。",
         ]
         return scrub(out)
 

@@ -17,13 +17,17 @@ from tools.analyze import assign_session
 DECISION_MIDLINE_BPS = -1.7
 DECISION_UPPER_BPS = 1.0
 DECISION_LOWER_BPS = 1.0
-# Probe orders default to $11 and may sit anywhere in $10.50–$20.
+# Probe orders default to $11. The floor is the venue minimum (~$10.50).
+# There is no hard $10 or $20 ceiling: the live cap is
+# min(Entropy available, Lighter available) × BALANCE_SAFETY.
 # $10.00 floors through szDecimals and Hyperliquid rejects the leg.
 DECISION_ORDER_USD = 11.0
 DECISION_POSITION_USD = 11.0
 MIN_ORDER_USD = 10.5
-MAX_ORDER_USD = 20.0
-MAX_POSITION_USD = 20.0
+BALANCE_SAFETY = 0.9
+AUTO_CONFIRM_SEC_DEFAULT = 3.0
+AUTO_CONFIRM_SEC_MIN = 2.0
+AUTO_CONFIRM_SEC_MAX = 5.0
 ENTROPY_FEE_BPS = 0.9
 LIGHTER_FEE_BPS = 0.0
 SYMBOL = "SNDK"
@@ -38,7 +42,8 @@ ACCRUAL_BPS = round(display_accrual_bps(ENTROPY_FEE_BPS, REFERRAL_MODE), 4)
 ACCRUAL_LABEL = "未到账"
 DECISION_WARNING = "会偏离 Decision Card"
 
-# Measured session midlines. Display only — the task midline never follows them.
+# Measured session midlines. A live-armed task adopts the new session's
+# midline only on a session boundary, and only when both venues are flat.
 SESSION_MIDLINE_BPS = {
     "us_regular": -1.7,
     "us_post_overnight": 2.6,
@@ -101,6 +106,10 @@ def decision_defaults() -> dict:
         "persist_sec": PERSIST_SEC,
         "manual_confirm": True,
         "rth_only": True,
+        "auto_confirm": False,
+        "auto_confirm_sec": AUTO_CONFIRM_SEC_DEFAULT,
+        "auto_confirm_max_usd": DECISION_ORDER_USD,
+        "balance_safety": BALANCE_SAFETY,
         "mode": "record",
     }
 
@@ -141,12 +150,26 @@ def normalize_task(body: Optional[dict]) -> dict:
     if spec["order_notional_usd"] < MIN_ORDER_USD - 1e-9:
         raise ValueError(
             f"order_notional_usd must be >= {MIN_ORDER_USD}")
-    if spec["order_notional_usd"] - MAX_ORDER_USD > 1e-9:
-        raise ValueError(f"order_notional_usd cap is ${MAX_ORDER_USD:.0f}")
-    if spec["max_position_usd"] - MAX_POSITION_USD > 1e-9:
-        raise ValueError(f"max_position_usd cap is ${MAX_POSITION_USD:.0f}")
     if spec["max_position_usd"] + 1e-9 < spec["order_notional_usd"]:
         raise ValueError("max_position_usd must cover one order")
+    if "auto_confirm" in raw and not isinstance(raw["auto_confirm"], bool):
+        raise ValueError("auto_confirm must be true or false")
+    spec["auto_confirm"] = (bool(raw["auto_confirm"])
+                            if "auto_confirm" in raw else False)
+    sec_raw = raw.get("auto_confirm_sec", AUTO_CONFIRM_SEC_DEFAULT)
+    spec["auto_confirm_sec"] = _num(sec_raw, "auto_confirm_sec")
+    if (spec["auto_confirm_sec"] < AUTO_CONFIRM_SEC_MIN - 1e-9
+            or spec["auto_confirm_sec"] - AUTO_CONFIRM_SEC_MAX > 1e-9):
+        raise ValueError("auto_confirm_sec must be between 2 and 5")
+    max_raw = raw.get("auto_confirm_max_usd", None)
+    if max_raw is None or max_raw == "":
+        spec["auto_confirm_max_usd"] = spec["order_notional_usd"]
+    else:
+        spec["auto_confirm_max_usd"] = _num(max_raw, "auto_confirm_max_usd")
+        if spec["auto_confirm_max_usd"] < MIN_ORDER_USD - 1e-9:
+            raise ValueError(
+                f"auto_confirm_max_usd must be >= {MIN_ORDER_USD}")
+    spec["balance_safety"] = BALANCE_SAFETY
     mode = str(raw.get("mode", spec["mode"]) or "").strip().lower()
     if mode not in ("record", "live"):
         raise ValueError("mode must be record (只记录) or live (探针实盘)")
@@ -214,6 +237,221 @@ def session_snapshot(now: datetime, task_midline: float) -> dict:
         "deviation_text": f"偏离约 {approx} bps",
         "risk_line": FORCE_RISK_LINE,
     }
+
+
+def session_name(ts: float) -> str:
+    """Session label for a unix timestamp. Does not rewrite a task."""
+    return assign_session(float(ts))
+
+
+def _leg_available(accounts: Optional[dict], key: str) -> Optional[float]:
+    raw = ((accounts or {}).get(key) or {}).get("available")
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def dynamic_balance_cap(accounts: Optional[dict],
+                        safety: float = BALANCE_SAFETY) -> Optional[float]:
+    """min(Entropy available, Lighter available) × safety.
+
+    Returns None when either available is missing. Never invents a balance.
+    """
+    entropy = _leg_available(accounts, "entropy")
+    lighter = _leg_available(accounts, "lighter")
+    if entropy is None or lighter is None:
+        return None
+    try:
+        frac = float(safety)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(frac) or frac <= 0:
+        return None
+    return min(entropy, lighter) * frac
+
+
+def balance_view(accounts: Optional[dict],
+                 safety: float = BALANCE_SAFETY) -> dict:
+    """Numbers the form shows next to the notional inputs."""
+    cap = dynamic_balance_cap(accounts, safety)
+    return {
+        "entropy_available": _leg_available(accounts, "entropy"),
+        "lighter_available": _leg_available(accounts, "lighter"),
+        "safety": float(safety),
+        "dynamic_cap_usd": cap,
+        "min_probe_usd": MIN_ORDER_USD,
+        "tradable": cap is not None and cap + 1e-9 >= MIN_ORDER_USD,
+    }
+
+
+def available_short_reason(accounts: Optional[dict], order_usd: float
+                           ) -> Optional[str]:
+    """Hard stop when either venue cannot fund ``order_usd``.
+
+    A missing available is a stop: the probe does not guess a balance.
+    """
+    try:
+        need = float(order_usd)
+    except (TypeError, ValueError):
+        return "订单名义无效"
+    entropy = _leg_available(accounts, "entropy")
+    lighter = _leg_available(accounts, "lighter")
+    if entropy is None or lighter is None:
+        return "余额未读到，拒绝下单（不猜测可用）"
+    short = []
+    if entropy + 1e-9 < need:
+        short.append(f"Entropy ${entropy:.2f}")
+    if lighter + 1e-9 < need:
+        short.append(f"Lighter ${lighter:.2f}")
+    if not short:
+        return None
+    return "可用不足：" + "、".join(short) + f"，低于订单 ${need:.2f}"
+
+
+def notional_cap_reason(order_usd: float, position_usd: float,
+                        accounts: Optional[dict],
+                        safety: float = BALANCE_SAFETY) -> Optional[str]:
+    """Confirm gate: both notionals must sit in [venue min, dynamic cap]."""
+    try:
+        order = float(order_usd)
+        position = float(position_usd)
+    except (TypeError, ValueError):
+        return "订单名义无效"
+    if order < MIN_ORDER_USD - 1e-9:
+        return f"order notional must be >= {MIN_ORDER_USD}"
+    if position + 1e-9 < order:
+        return "max_position_usd must cover one order"
+    short = available_short_reason(accounts, order)
+    if short:
+        return short
+    cap = dynamic_balance_cap(accounts, safety)
+    if cap is None:
+        return "余额未读到，拒绝下单（不猜测可用）"
+    if cap + 1e-9 < MIN_ORDER_USD:
+        return "动态上限低于交易所最小名义 $10.50"
+    if order - cap > 1e-9 or position - cap > 1e-9:
+        return f"名义超过动态上限 ${cap:.2f}（较小可用 × {float(safety):g}）"
+    return None
+
+
+def save_notional_reason(order_usd: float, position_usd: float,
+                         accounts: Optional[dict],
+                         safety: float = BALANCE_SAFETY) -> Optional[str]:
+    """Form save. Unknown balances do not invent a ceiling.
+
+    When both availables are present, the saved order and position must
+    sit in [venue min, dynamic cap].
+    """
+    cap = dynamic_balance_cap(accounts, safety)
+    if cap is None:
+        return None
+    return notional_cap_reason(order_usd, position_usd, accounts, safety)
+
+
+def venues_flat(accounts: Optional[dict],
+                tol: float = NET_TOL_BASE) -> Optional[bool]:
+    """True only when both venue positions are known and near zero.
+
+    None means a position was not read. A missing read is not flat.
+    """
+    positions = []
+    for key in ("entropy", "lighter"):
+        raw = ((accounts or {}).get(key) or {}).get("position")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        number = float(raw)
+        if not math.isfinite(number):
+            return None
+        positions.append(number)
+    if any(abs(pos) > float(tol) for pos in positions):
+        return False
+    return True
+
+
+def session_switch_decision(anchor: Optional[str], now_session: str,
+                            accounts: Optional[dict], *,
+                            armed: bool) -> dict:
+    """What to do with the task midline at this clock.
+
+    ``hold`` keeps the current midline. ``pin`` records the session at
+    arm time without rewriting the midline. ``block`` is a session
+    boundary while either venue is not flat. ``apply`` copies
+    ``SESSION_MIDLINE_BPS`` and leaves the bands alone.
+    """
+    if not armed or now_session not in SESSION_MIDLINE_BPS:
+        return {"action": "hold"}
+    if not anchor:
+        return {"action": "pin", "session": now_session}
+    if anchor == now_session:
+        return {"action": "hold"}
+    flat = venues_flat(accounts)
+    if flat is not True:
+        if flat is None:
+            reason = (
+                f"时段切换：持仓未读到，不能确认两所空仓，暂停新确认，"
+                f"中枢保持（{anchor} → {now_session}）"
+            )
+        else:
+            reason = (
+                f"时段切换：两所未同时空仓，暂停新确认，中枢不切换"
+                f"（{anchor} → {now_session}）"
+            )
+        return {
+            "action": "block",
+            "reason": reason,
+            "session": now_session,
+            "anchor": anchor,
+        }
+    return {
+        "action": "apply",
+        "session": now_session,
+        "from_session": anchor,
+        "midline_bps": float(SESSION_MIDLINE_BPS[now_session]),
+    }
+
+
+def auto_confirm_decision(*, armed: bool, halted: bool, paused: bool,
+                          fresh: bool, qualifying: bool,
+                          funding_block: Optional[str],
+                          cap_block: Optional[str],
+                          order_usd: float, auto_max_usd: float,
+                          age_sec: Optional[float], wait_sec: float,
+                          rth: bool) -> tuple:
+    """('off'|'wait'|'refuse'|'fire', reason). Hard stops never return fire."""
+    if not armed:
+        return "off", None
+    if halted:
+        return "refuse", "HALT"
+    if paused:
+        return "refuse", "paused"
+    if funding_block:
+        return "refuse", funding_block
+    if cap_block:
+        return "refuse", cap_block
+    try:
+        order = float(order_usd)
+        auto_max = float(auto_max_usd)
+    except (TypeError, ValueError):
+        return "refuse", "订单名义无效"
+    if order < MIN_ORDER_USD - 1e-9:
+        return "refuse", "below venue min"
+    if order - auto_max > 1e-9:
+        return "refuse", "notional above auto max"
+    if not fresh:
+        return "refuse", "books not fresh"
+    if not qualifying:
+        return "refuse", "not qualifying"
+    if not rth:
+        return "refuse", "非 RTH，自动确认不代替强制确认"
+    if age_sec is None or float(age_sec) + 1e-9 < float(wait_sec):
+        return "wait", None
+    return "fire", None
 
 
 def in_us_rth(now: datetime) -> bool:

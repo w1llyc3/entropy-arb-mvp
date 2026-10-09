@@ -147,7 +147,8 @@ def size_above_min_notional(
     the result is ``(None, "below_min_notional")`` and the caller must not
     send the hedge leg.
 
-    A probe passes ``target_notional`` (about $10.50–$20). The wire quote
+    A probe passes ``target_notional`` (the order, at least about $10.50).
+    The wire quote
     is ceiled to that target so szDecimals truncation cannot land under
     $10. Without a target, a size that already clears is kept; only a
     sub-minimum size is lifted, and only when the lift stays within one

@@ -427,6 +427,9 @@
         </article>
       </div>
       <p class="hint" id="acct-note">密钥只留在服务器。页面不接收私钥。</p>
+      <p class="hint" id="cap-line">动态上限：余额未读到。单笔与持仓须在 $10.50 和两边可用较小值 × 0.9 之间。</p>
+      <p class="hint" id="auto-line">自动确认未武装。勾选任务里的「自动确认」（默认关），保持人工确认，再点启动。</p>
+      <p class="hint" id="session-line" hidden></p>
     </div>
 
     <div class="panel">
@@ -507,7 +510,7 @@
     </section>
     <section class="sec">
       <h3><span class="num">02</span> 策略参数</h3>
-      <p class="hint">默认锁定 Decision Card。改中枢或关掉人工确认会提示偏离。</p>
+      <p class="hint">默认锁定 Decision Card。改中枢或关掉人工确认会提示偏离。自动确认默认关，要武装须勾选后再启动。</p>
       <div class="grid">
         <div>
           <label for="f-mid">中枢 midline (bps)</label>
@@ -524,14 +527,15 @@
       </div>
       <div class="grid two">
         <div>
-          <label for="f-ord">单笔名义 (USD, 10.5–20)</label>
-          <input id="f-ord" name="order_notional_usd" type="number" step="0.1" value="11" min="10.5" max="20" required>
+          <label for="f-ord">单笔名义 (USD，下限 10.5)</label>
+          <input id="f-ord" name="order_notional_usd" type="number" step="0.1" value="11" min="10.5" required>
         </div>
         <div>
-          <label for="f-cap">单边持仓上限 (USD, ≤20)</label>
-          <input id="f-cap" name="max_position_usd" type="number" step="0.1" value="11" min="10.5" max="20" required>
+          <label for="f-cap">单边持仓上限 (USD)</label>
+          <input id="f-cap" name="max_position_usd" type="number" step="0.1" value="11" min="10.5" required>
         </div>
       </div>
+      <p class="hint" id="form-cap">下限 $10.50。上限 = min(Entropy 可用, Lighter 可用) × 0.9。余额未读到时不猜数字。</p>
       <div class="modes" role="group" aria-label="模式">
         <button type="button" class="on" id="mode-record" data-mode="record">只记录</button>
         <button type="button" id="mode-live" data-mode="live">探针实盘</button>
@@ -539,6 +543,17 @@
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
         <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
+        <label><input id="f-auto" type="checkbox"> 自动确认（默认关。确认卡保持打开达到下面的秒数，且盘口仍新鲜、仍达标、名义不超过自动上限时，走同一条确认发单。HALT、余额不足、盘口不新鲜或不在 RTH 不会自动发。人可以取消。）</label>
+      </div>
+      <div class="grid two">
+        <div>
+          <label for="f-auto-sec">自动确认等待 (秒, 2–5)</label>
+          <input id="f-auto-sec" name="auto_confirm_sec" type="number" step="0.5" value="3" min="2" max="5">
+        </div>
+        <div>
+          <label for="f-auto-max">自动确认名义上限 (USD，默认同单笔)</label>
+          <input id="f-auto-max" name="auto_confirm_max_usd" type="number" step="0.1" min="10.5" placeholder="默认同单笔">
+        </div>
       </div>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
@@ -583,7 +598,8 @@
       <div id="c-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
     </div>
     <p class="hint" id="c-block" hidden></p>
-    <p class="hint" id="c-send-hint">确认会通过实盘引擎同时发送两腿。取消则不下单。中枢不会随时段自动改变。</p>
+    <p class="hint" id="c-auto" hidden></p>
+    <p class="hint" id="c-send-hint">确认会通过实盘引擎同时发送两腿。取消则不下单。实盘武装后，只有时段切换且两所都空仓才会改中枢。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
@@ -597,6 +613,7 @@ let lastProposalId = null;
 let lastPayload = null;
 let formMode = "record";
 let seenConfirm = false;
+let liveBalance = null;
 
 function dash(v) {
   return v == null || v === "" ? "—" : String(v);
@@ -647,8 +664,33 @@ function deviationWarning() {
   $("form-warn").hidden = !off;
 }
 
-function openCreate(task) {
+function applyCapInputs(balance) {
+  liveBalance = balance || null;
+  const cap = liveBalance && liveBalance.dynamic_cap_usd;
+  $("f-ord").min = "10.5";
+  $("f-cap").min = "10.5";
+  if (cap != null && Number(cap) >= 10.5) {
+    $("f-ord").max = String(cap);
+    $("f-cap").max = String(cap);
+    $("form-cap").textContent = "Entropy 可用 " + usd(liveBalance.entropy_available)
+      + " · Lighter 可用 " + usd(liveBalance.lighter_available)
+      + " · 动态上限 " + usd(cap)
+      + "（×" + liveBalance.safety + "）· 下限 $10.50";
+  } else if (cap != null) {
+    $("f-ord").removeAttribute("max");
+    $("f-cap").removeAttribute("max");
+    $("form-cap").textContent = "动态上限 " + usd(cap)
+      + " 低于交易所最小名义 $10.50，当前不能保存探针单。";
+  } else {
+    $("f-ord").removeAttribute("max");
+    $("f-cap").removeAttribute("max");
+    $("form-cap").textContent = "余额未读到，不猜上限。读到两边可用后，单笔和持仓须落在 $10.50 与动态上限之间（较小可用 × 0.9）。";
+  }
+}
+
+function openCreate(task, balance) {
   const t = task || {};
+  applyCapInputs(balance);
   $("f-mid").value = t.midline_bps != null ? t.midline_bps : -1.7;
   $("f-up").value = t.upper_bps != null ? t.upper_bps : 1;
   $("f-lo").value = t.lower_bps != null ? t.lower_bps : 1;
@@ -657,6 +699,11 @@ function openCreate(task) {
   formMode = t.mode || "record";
   $("f-confirm").checked = t.manual_confirm !== false;
   $("f-rth").checked = t.rth_only !== false;
+  $("f-auto").checked = t.auto_confirm === true;
+  $("f-auto-sec").value = t.auto_confirm_sec != null ? t.auto_confirm_sec : 3;
+  $("f-auto-max").value = t.auto_confirm_max_usd != null && t.order_notional_usd != null
+    && Number(t.auto_confirm_max_usd) !== Number(t.order_notional_usd)
+    ? t.auto_confirm_max_usd : "";
   applyModeButtons();
   deviationWarning();
   $("create-save").textContent = task ? "保存任务" : "创建任务";
@@ -699,8 +746,18 @@ function showConfirm(payload) {
   $("c-mid").textContent = num(payload.midline_bps, 1) + " bps";
   $("c-rth").textContent = payload.rth ? "交易时段 " + (payload.rth_window || "") : "非交易时段";
   $("c-send-hint").textContent = payload.rth
-    ? "确认会通过实盘引擎同时发送两腿。取消则不下单。中枢不会随时段自动改变。"
-    : "确认会通过实盘引擎同时发送两腿。当前非 RTH，必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。";
+    ? "确认会通过实盘引擎同时发送两腿。取消则不下单。时段切换且两所都空仓时才会改中枢。"
+    : "确认会通过实盘引擎同时发送两腿。当前非 RTH，必须再点一次「强制确认」。自动确认不会代替这一步。";
+  const auto = payload.auto || {};
+  if (auto.armed) {
+    const left = auto.remaining_sec == null ? "—" : Number(auto.remaining_sec).toFixed(1) + "s";
+    $("c-auto").hidden = false;
+    $("c-auto").textContent = "自动确认已武装 · 剩余 " + left
+      + (auto.last_action && auto.last_action.text ? " · " + auto.last_action.text : "");
+  } else {
+    $("c-auto").hidden = true;
+    $("c-auto").textContent = "";
+  }
   renderLegs(payload.legs);
   const tail = payload.tail_vs_median;
   $("c-tail").hidden = !tail;
@@ -815,6 +872,29 @@ function render(s) {
   const creds = acct.creds || {};
   $("acct-note").textContent = acct.note
     || ((creds.entropy || creds.lighter) ? "已检测到密钥，数值来自只读查询。" : "密钥只留在服务器。页面不接收私钥。");
+  const bal = s.balance || {};
+  liveBalance = bal;
+  if (bal.dynamic_cap_usd == null) {
+    $("cap-line").textContent = "动态上限：余额未读到。不猜测可用。下限 $10.50。";
+  } else {
+    $("cap-line").textContent = "Entropy 可用 " + usd(bal.entropy_available)
+      + " · Lighter 可用 " + usd(bal.lighter_available)
+      + " · 动态上限 " + usd(bal.dynamic_cap_usd)
+      + "（×" + bal.safety + "）"
+      + (bal.tradable ? "" : " · 低于 $10.50，不能下探针单");
+  }
+  const auto = s.auto_confirm || {};
+  if (!auto.armed) {
+    $("auto-line").textContent = "自动确认未武装。勾选任务里的「自动确认」（默认关），保持人工确认，再点启动。停机、暂停、HALT 仍由人控制。";
+  } else {
+    const left = auto.remaining_sec == null ? "—" : Number(auto.remaining_sec).toFixed(1) + "s";
+    const last = auto.last_action && auto.last_action.text ? " · 最近：" + auto.last_action.text : "";
+    $("auto-line").textContent = "自动确认已武装 · 等待 " + auto.sec + "s · 剩余 " + left
+      + " · 上限 " + usd(auto.max_usd) + last;
+  }
+  const blocked = s.session_switch_block;
+  $("session-line").hidden = !blocked;
+  $("session-line").textContent = blocked || "";
 
   const fee = s.fee_check || {};
   const feeNode = $("fee-line");
@@ -865,7 +945,7 @@ $("open-create").addEventListener("click", async () => {
     alert("先停止，再修改任务。");
     return;
   }
-  openCreate(status.task);
+  openCreate(status.task, status.balance);
 });
 $("create-close").addEventListener("click", () => { $("create-modal").hidden = true; });
 $("create-cancel").addEventListener("click", () => { $("create-modal").hidden = true; });
@@ -885,26 +965,40 @@ $("create-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const orderUsd = Number($("f-ord").value);
   const posUsd = Number($("f-cap").value);
-  if (!(orderUsd >= 10.5 && orderUsd <= 20)) {
-    alert("单笔名义须在 10.5–20");
+  const cap = liveBalance && liveBalance.dynamic_cap_usd;
+  if (!(orderUsd >= 10.5)) {
+    alert("单笔名义须不低于 10.50");
     return;
   }
-  if (!(posUsd >= orderUsd && posUsd <= 20)) {
-    alert("单边上限须覆盖单笔，且不超过 20");
+  if (!(posUsd >= orderUsd)) {
+    alert("单边上限须覆盖单笔");
     return;
   }
+  if (cap != null && (orderUsd - Number(cap) > 1e-6 || posUsd - Number(cap) > 1e-6)) {
+    alert("超过动态上限 " + Number(cap).toFixed(2));
+    return;
+  }
+  const autoSec = Number($("f-auto-sec").value);
+  if ($("f-auto").checked && !(autoSec >= 2 && autoSec <= 5)) {
+    alert("自动确认等待须在 2–5 秒");
+    return;
+  }
+  const body = {
+    midline_bps: Number($("f-mid").value),
+    upper_bps: Number($("f-up").value),
+    lower_bps: Number($("f-lo").value),
+    order_notional_usd: orderUsd,
+    max_position_usd: posUsd,
+    mode: formMode,
+    manual_confirm: $("f-confirm").checked,
+    rth_only: $("f-rth").checked,
+    auto_confirm: $("f-auto").checked,
+    auto_confirm_sec: autoSec,
+  };
+  if ($("f-auto-max").value !== "") body.auto_confirm_max_usd = Number($("f-auto-max").value);
   $("create-save").disabled = true;
   try {
-    await post("/api/task", {
-      midline_bps: Number($("f-mid").value),
-      upper_bps: Number($("f-up").value),
-      lower_bps: Number($("f-lo").value),
-      order_notional_usd: orderUsd,
-      max_position_usd: posUsd,
-      mode: formMode,
-      manual_confirm: $("f-confirm").checked,
-      rth_only: $("f-rth").checked,
-    });
+    await post("/api/task", body);
     $("create-modal").hidden = true;
     await refresh();
   } catch (err) {

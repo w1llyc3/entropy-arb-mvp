@@ -88,18 +88,18 @@ def test_decision_card_defaults_and_warning():
         normalize_task({"symbol": "BTC"})
     with pytest.raises(ValueError):
         normalize_task({"hedge": "lighter-rh"})
+    assert spec["auto_confirm"] is False
+    assert spec["auto_confirm_sec"] == 3
     assert normalize_task({
         "order_notional_usd": 10.5, "max_position_usd": 10.5,
     })["order_notional_usd"] == 10.5
     assert normalize_task({
-        "order_notional_usd": 20, "max_position_usd": 20,
-    })["max_position_usd"] == 20
+        "order_notional_usd": 50, "max_position_usd": 50,
+    })["max_position_usd"] == 50
     with pytest.raises(ValueError, match=">= 10.5"):
         normalize_task({"order_notional_usd": 10})
-    with pytest.raises(ValueError, match="cap is \\$20"):
-        normalize_task({"order_notional_usd": 21})
-    with pytest.raises(ValueError, match="cap is \\$20"):
-        normalize_task({"max_position_usd": 25})
+    with pytest.raises(ValueError, match="between 2 and 5"):
+        normalize_task({"auto_confirm_sec": 9})
     with pytest.raises(ValueError, match="cover one order"):
         normalize_task({"order_notional_usd": 15, "max_position_usd": 12})
 
@@ -655,9 +655,9 @@ def test_http_confirm_gate(tmp_path):
                      executor=executor,
                      account_reader=lambda: {
                          "creds": {"entropy": True, "lighter": True},
-                         "entropy": {"equity": 10, "available": 8,
+                         "entropy": {"equity": 80, "available": 40,
                                      "position": 0, "isolated": True},
-                         "lighter": {"equity": 12, "available": 9,
+                         "lighter": {"equity": 90, "available": 50,
                                      "position": 0, "isolated": False},
                          "note": None,
                      })
@@ -709,7 +709,9 @@ def test_http_confirm_gate(tmp_path):
         del missing["accrual_label"]
         bad = client.post("/api/confirm", json=missing)
         assert bad.status_code == 400
-        clock["t"] = OUTSIDE
+        # Saturday during cash hours is outside RTH but still us_regular,
+        # so this click does not cross a session boundary.
+        clock["t"] = _ts(datetime(2026, 1, 10, 10, 0, tzinfo=NY))
         payload["rth"] = False
         held = client.post("/api/confirm", json=payload)
         assert held.status_code == 200, held.text
@@ -718,8 +720,8 @@ def test_http_confirm_gate(tmp_path):
         assert calls == []
         card = held.json()["force_card"]
         assert card["risk_line"] == "带宽 1 bps，错中枢风险大于费率缺口"
-        assert card["name"] == "us_post_overnight"
-        assert card["deviation_text"] == "偏离约 4 bps"
+        assert card["name"] == "us_regular"
+        assert card["deviation_text"] == "偏离约 0 bps"
         clock["t"] = INSIDE
         # The pending net may have been refreshed; re-read so the echo matches.
         payload = client.get("/api/status").json()["proposal"]
