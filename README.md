@@ -123,6 +123,12 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 Running without `--record-only` sends real orders immediately once both
 feeds are fresh and the band is crossed.
 
+**Localhost panel.** `python3 -m web` serves http://127.0.0.1:8765 only.
+Click path, Decision Card defaults, and the confirm-queue gaps are in
+[MVP.md](MVP.md). The page does not arm live trading by itself and does not
+receive API keys. Record-only from the panel always passes `--record-only`.
+The CLI live command above is unchanged.
+
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
 executable premium of each direction against its full hurdle (fees and

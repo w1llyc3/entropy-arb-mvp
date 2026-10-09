@@ -301,12 +301,21 @@ def test_panel_pages_and_routes(tmp_path):
 
     app = create_app(tmp_path)
     paths = {getattr(route, "path", None) for route in app.routes}
-    assert paths == {"/", "/api/status", "/api/start", "/api/stop", "/api/analyze"}
+    assert paths == {
+        "/", "/api/status", "/api/start", "/api/stop", "/api/analyze",
+        "/api/probe", "/api/task", "/api/task/clear", "/api/session/start",
+        "/api/pause", "/api/reconcile", "/api/confirm", "/api/confirm/cancel",
+    }
     with TestClient(app) as client:
         page = client.get("/")
         assert page.status_code == 200
         html = page.text
-        assert "Start record-only" in html
+        assert "创建套利任务" in html
+        assert "NEW STRATEGY" in html
+        assert "只记录" in html
+        assert "探针实盘" in html
+        assert "会偏离 Decision Card" in html
+        assert "未到账" in html
         assert "logs/minutes.csv" in html
         for label in ("G1", "G2", "G3", "G4", "depth_ok_frac",
                       "worse of SELL/BUY", "±50%", "slip@$100 p90",

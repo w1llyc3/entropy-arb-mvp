@@ -35,7 +35,7 @@ Credentials stay in `.env` and are required only for live orders.
 
 ```yaml
 fees_ledger:
-  referral_mode: referred_t4   # referred_t4 | self_t3 | self_t4
+  referral_mode: referred_t4   # referred_t4 | self_t2 | self_t3 | self_t4
   rebate_accrual_only: true    # false is rejected
   growth_haircut: 0.90         # must be in [0.90, 1.0]
 ```
@@ -136,16 +136,10 @@ G2 uses that same p90 **before** the floor.
 
 ## Localhost panel
 
-A browser on this machine can start and stop record-only collection and run
-the analyzer. The panel binds **127.0.0.1** only. It has no trading control,
-no API-key form, and no `.env` editor. Start always launches:
-
-```bash
-python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter
-```
-
-Symbol and hedge can be changed in the page. The default hedge is `lighter`.
-The recorder's pid file is `.web/recorder.pid`.
+A browser on this machine runs the SNDK · Entropy (dex=`io`) ↔ Lighter probe.
+The panel binds **127.0.0.1** only. There is no host flag and no API-key
+form. Credentials stay in the server `.env` and are never sent to the
+browser. Opening the page does **not** arm live trading.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -154,6 +148,46 @@ python3 -m web
 ```
 
 Open <http://127.0.0.1:8765>. Optional: `python3 -m web --port 8765`.
+
+The CLI live command is unchanged and is separate from the panel. It still
+sends real orders once feeds are fresh:
+
+```bash
+python3 main.py --symbol SNDK --hedge lighter
+```
+
+### Click path
+
+1. **创建套利任务** (eyebrow NEW STRATEGY). The form opens on the Decision
+   Card: pair SNDK, Entropy dex `io` ↔ Lighter, midline **-1.7**, upper/lower
+   **1.0 / 1.0**, order **$10**, position cap **$10** per side, fees **0.9 / 0**
+   (read-only), referral **self_t2** accrual **≈ 0.54 bps** labeled **未到账**,
+   manual confirm **on**, US RTH window **on**. Mode is **只记录** or
+   **探针实盘**.
+2. If midline is moved off -1.7, or manual confirm is turned off, the form
+   shows **会偏离 Decision Card**. Confirm-off refuses to arm 探针实盘.
+3. **启动** in 只记录 runs record-only collection. **启动** in 探针实盘 arms
+   the confirm queue and still launches only:
+
+```bash
+python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter --config .web/probe.yaml
+```
+
+   Arming 探针实盘 is refused outside US RTH when the RTH toggle is on
+   (America/New_York, Monday–Friday 09:30 inclusive to 16:00 exclusive).
+4. Task-card statuses are **记录中 / 暖机 / LIVE / 暂停 / 已停止**. **暂停**
+   freezes the recorder. **停止** ends it. **对账** writes a local request
+   and does not call a venue.
+5. When 探针实盘 is armed and the latest minute clears the band, a confirm
+   card opens. It shows net edge **after 0.9 bps** (rebate not included) and,
+   on a separate line, Tier2 Self accrual **≈ 0.54 bps** marked **未到账**.
+   It also shows midline, the RTH flag, each leg's direction / notional /
+   available / isolated, and a tail-vs-median warning when the live net is
+   outside the recent central 80%. **确认** is disabled outside RTH. Cancel
+   skips. Confirm queues the intent and does not send an order.
+
+The recorder pid file is `.web/recorder.pid`. The task and the confirm queue
+live in `.web/` and are not committed.
 
 The Analyze button runs exactly:
 
@@ -167,6 +201,30 @@ the gates, not Gate ids. Read the four numbers the same way as the table
 in [Locked gates](#locked-gates).
 
 Minute bars stay at `logs/minutes.csv` (one row per completed minute). The
-status view reads that file for minutes collected, samples coverage, and the
-latest top-of-book and fillable@$100 cells. It warns when the pid file's
-process is gone or when recent minutes are thin or stale.
+status view reads that file for minutes collected, samples coverage, the
+latest top-of-book and fillable@$100 cells, and deviation versus the task
+midline. It warns when the pid file's process is gone or when recent minutes
+are thin or stale.
+
+### Probe gaps
+
+The panel is a confirm queue in front of record-only collection. It is not
+an order router.
+
+- **No venue orders from the browser.** `POST /api/confirm` returns
+  `queued: true`, `routed: false`, `sent: false` after the gates pass.
+  Wiring that queue into `Engine._execute` is not done. The process the
+  panel starts always includes `--record-only`.
+- **对账 is a log line** in `.web/reconcile.json`. It does not read or
+  flatten on-chain positions.
+- **RTH is weekdays 09:30–16:00 America/New_York.** NYSE holidays are not
+  on the calendar. Confirm stays disabled outside that window even if the
+  “仅美国 RTH” toggle is off. The toggle only blocks **启动** of 探针实盘.
+- **self_t2 display accrual is 0.54 bps** (`0.9 × 0.50 × 1.20`), gross, not
+  cash. `recognized_rebate_bps` still applies the 0.90 growth haircut
+  (0.054 bps) inside the analyzer. Neither number enters G1–G4.
+- **Balances** are a public read when `.env` has an account address or
+  Lighter index. Private keys are not returned. Position / isolated stay
+  empty when the payload does not name SNDK.
+- **One task.** The form cannot target another symbol or venue. Unattended
+  live (manual confirm off) is refused.

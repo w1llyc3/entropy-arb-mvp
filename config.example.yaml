@@ -95,7 +95,7 @@ recorder:
 # ============ FEE LEDGER / 手续费与返佣（只计应计） ========================
 # Rebates are accrual-only. Never add them to cash PnL or to the Gate.
 # growth_haircut >= 0.90: recognize at most 10% of (Entropy fee share × rate).
-# referral_mode: referred_t4 | self_t3 | self_t4
+# referral_mode: referred_t4 | self_t2 | self_t3 | self_t4
 # 返佣只记应计，不得当成已实现现金，也不进入 Gate。
 fees_ledger:
   referral_mode: referred_t4

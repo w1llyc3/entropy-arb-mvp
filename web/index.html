@@ -1,380 +1,972 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>entropy-arb record-only</title>
+  <title>SNDK · Entropy ↔ Lighter</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #10151c;
-      --card: #1a222d;
-      --line: #2c3848;
+      --bg: #07090c;
+      --bg-2: #0c1016;
+      --card: #11181f;
+      --card-2: #0e141b;
+      --line: #243140;
+      --line-2: #1a2430;
       --text: #e7eef6;
-      --muted: #93a2b5;
-      --accent: #3ddec8;
-      --warn: #ffd27a;
-      --warn-bg: #3a2e14;
-      --bad: #ff8f8f;
+      --muted: #8ea0b3;
+      --faint: #66788a;
+      --green: #3ee0a2;
+      --green-dim: #14352c;
+      --green-line: #1f6b52;
+      --amber: #e6b15a;
+      --amber-dim: #3a2c14;
+      --red: #ff7b7b;
+      --red-dim: #3a1c1c;
+      --cyan: #7fd0ff;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .45);
     }
     * { box-sizing: border-box; }
+    html, body { height: 100%; }
     body {
       margin: 0;
-      font: 15px/1.45 ui-sans-serif, system-ui, sans-serif;
-      background: var(--bg);
+      font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+      background:
+        radial-gradient(1200px 500px at 10% -10%, rgba(62, 224, 162, .06), transparent 50%),
+        var(--bg);
       color: var(--text);
     }
-    main { max-width: 880px; margin: 0 auto; padding: 28px 18px 48px; }
-    h1 { font-size: 1.35rem; margin: 0 0 6px; }
-    h2 { font-size: 1rem; margin: 0 0 12px; }
-    p { margin: 0 0 10px; }
-    .lede { color: var(--muted); margin-bottom: 18px; }
-    section {
+    button, input, select { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    button:disabled { opacity: .42; cursor: not-allowed; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    header.top {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--line-2);
+      background: rgba(7, 9, 12, .9);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    .brand { display: flex; gap: 12px; align-items: center; }
+    .mark {
+      width: 34px; height: 34px; border-radius: 9px;
+      display: grid; place-items: center;
+      background: var(--green-dim);
+      color: var(--green);
+      border: 1px solid var(--green-line);
+      font-weight: 700;
+    }
+    h1 { font-size: 15px; margin: 0; letter-spacing: .01em; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .top-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .pill {
+      border: 1px solid var(--line);
+      background: var(--card-2);
+      border-radius: 999px;
+      padding: 4px 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .pill strong { color: var(--text); font-weight: 650; }
+    .pill.ok { color: var(--green); border-color: var(--green-line); background: var(--green-dim); }
+    .pill.warn { color: var(--amber); border-color: #6a5424; background: var(--amber-dim); }
+    .pill.bad { color: var(--red); border-color: #6a3030; background: var(--red-dim); }
+    main {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      gap: 16px;
+      padding: 16px 22px 40px;
+      max-width: 1240px;
+      margin: 0 auto;
+    }
+    .stats {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    .stat, .card, .panel {
       background: var(--card);
       border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 16px;
-      margin-bottom: 14px;
+      border-radius: 14px;
     }
-    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
-    input, select, button {
-      font: inherit;
-      color: var(--text);
-      background: #0e141c;
+    .stat { padding: 14px 16px; }
+    .stat .k { color: var(--faint); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+    .stat .v { margin-top: 6px; font-size: 22px; font-weight: 650; }
+    .stat .d { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .side { padding: 14px; }
+    .eyebrow {
+      color: var(--green);
+      font-size: 11px;
+      letter-spacing: .14em;
+      font-weight: 700;
+    }
+    .side h2 { margin: 8px 0 12px; font-size: 16px; }
+    .task {
+      border: 1px solid var(--line);
+      background: var(--bg-2);
+      border-radius: 12px;
+      padding: 12px;
+      border-left: 3px solid var(--green);
+    }
+    .task .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .pair { font-weight: 700; }
+    .status {
+      font-size: 11px;
+      letter-spacing: .06em;
+      border-radius: 999px;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .status.rec { color: var(--cyan); border-color: #245068; }
+    .status.warm { color: var(--amber); border-color: #6a5424; }
+    .status.live { color: var(--green); border-color: var(--green-line); background: var(--green-dim); }
+    .status.pause { color: var(--amber); border-color: #6a5424; background: var(--amber-dim); }
+    .status.stop { color: var(--faint); }
+    .mode-flag {
+      display: inline-block;
+      margin-top: 8px;
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+    }
+    .mode-flag.record { color: var(--cyan); }
+    .mode-flag.live { color: var(--amber); border-color: #6a5424; background: var(--amber-dim); }
+    .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin-top: 10px; }
+    .kv span { color: var(--faint); font-size: 11px; display: block; }
+    .kv b { font-weight: 600; }
+    .warn-line {
+      margin-top: 10px;
+      background: var(--amber-dim);
+      color: var(--amber);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+    }
+    .ghost, .primary, .danger, .amber {
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #18222c;
+      padding: 8px 12px;
+    }
+    .primary { background: #14614f; border-color: var(--green-line); color: white; }
+    .danger { background: transparent; border-color: #6a3030; color: var(--red); }
+    .amber { background: transparent; border-color: #6a5424; color: var(--amber); }
+    .side .actions, .head-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .panel { padding: 16px; }
+    .panel + .panel { margin-top: 12px; }
+    .head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .head h2 { margin: 0; font-size: 18px; }
+    .idline { color: var(--faint); font-size: 12px; margin-top: 4px; }
+    .track-wrap { margin-top: 16px; }
+    .track-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .track {
+      position: relative;
+      height: 8px;
+      background: #0c1218;
+      border-radius: 99px;
+      border: 1px solid var(--line);
+    }
+    .track i {
+      position: absolute;
+      display: block;
+      top: -5px;
+      width: 16px; height: 16px;
+      border-radius: 4px;
+      background: var(--green);
+      border: 2px solid #06281e;
+      transform: translateX(-50%);
+    }
+    .meters, .gates, .books {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .meter, .gate, .book {
+      background: var(--bg-2);
+      border: 1px solid var(--line-2);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .meter .k, .gate .k, .book .k { color: var(--faint); font-size: 12px; }
+    .meter .v, .gate .v, .book .v { font-size: 20px; margin-top: 6px; font-weight: 650; }
+    .meter .s, .gate .s { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .pos { color: var(--green); }
+    .neg { color: var(--red); }
+    .ok { color: var(--green); }
+    .bad { color: var(--red); }
+    .books { grid-template-columns: 1fr 1fr; }
+    .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+    .legend { color: var(--faint); font-size: 12px; margin-top: 8px; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0b1016;
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 220px;
+      overflow: auto;
+      margin: 8px 0 0;
+      color: var(--muted);
+    }
+    .banner {
+      background: var(--amber-dim);
+      color: var(--amber);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+    }
+    .modal-back {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, .62);
+      display: grid; place-items: center;
+      z-index: 20;
+      padding: 18px;
+    }
+    .modal-back[hidden] { display: none; }
+    .modal {
+      width: min(760px, 100%);
+      max-height: min(92vh, 900px);
+      overflow: auto;
+      background: #0e151c;
+      border: 1px solid #2a3a48;
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      padding: 18px 18px 16px;
+    }
+    .modal header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .modal h2 { margin: 2px 0 0; font-size: 20px; }
+    .x {
+      width: 32px; height: 32px; border-radius: 8px;
+      border: 1px solid var(--line); background: transparent; color: var(--muted);
+    }
+    .sec { margin-top: 16px; }
+    .sec h3 { margin: 0 0 4px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+    .num { color: var(--green); font-size: 12px; font-weight: 700; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .grid.two { grid-template-columns: 1fr 1fr; }
+    label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    input[type="text"], input[type="number"] {
+      width: 100%;
+      background: #0b1117;
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 8px 10px;
     }
-    button { cursor: pointer; background: #243140; }
-    button.primary { background: #145e54; border-color: #1d7a6d; color: white; }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
-    .field { min-width: 140px; }
-    .hint { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
-    code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    dl {
-      display: grid;
-      grid-template-columns: 11rem 1fr;
-      gap: 6px 12px;
-      margin: 0;
-    }
-    dt { color: var(--muted); }
-    dd { margin: 0; }
-    #warn-box {
-      background: var(--warn-bg);
-      color: var(--warn);
+    input:focus { outline: 2px solid var(--green-line); border-color: var(--green); }
+    input[readonly] { color: var(--muted); }
+    .checks { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+    .checks label { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 13px; }
+    .modes { display: flex; gap: 8px; margin-top: 10px; }
+    .modes button { flex: 1; }
+    .modes button.on { border-color: var(--green-line); color: var(--green); background: var(--green-dim); }
+    .foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .legs { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+    .legs th { text-align: left; color: var(--faint); font-weight: 500; padding: 6px 4px; }
+    .legs td { padding: 6px 4px; border-top: 1px solid var(--line-2); }
+    .accrual {
+      margin-top: 8px;
+      padding: 8px 10px;
       border-radius: 8px;
-      padding: 8px 12px;
-      margin-bottom: 12px;
+      background: #121820;
+      border: 1px dashed #3a4a5c;
     }
-    #warn-box ul { margin: 0; padding-left: 1.1rem; }
-    .gates {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
+    .netline { font-size: 22px; font-weight: 700; margin-top: 4px; }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      .stats, .meters, .gates { grid-template-columns: 1fr 1fr; }
+      .grid { grid-template-columns: 1fr 1fr; }
     }
-    .gate {
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 10px 12px;
-    }
-    .gate .id { color: var(--accent); font-weight: 650; }
-    .gate .val { font-size: 1.25rem; margin-top: 4px; }
-    .gate .sub { color: var(--muted); font-size: 0.85rem; }
-    .ok { color: #7dffa1; }
-    .bad { color: var(--bad); }
-    pre {
-      white-space: pre-wrap;
-      word-break: break-word;
-      background: #0e141c;
-      border-radius: 8px;
-      padding: 10px;
-      max-height: 320px;
-      overflow: auto;
-      margin: 8px 0 0;
-    }
-    .err { color: var(--bad); }
     @media (max-width: 640px) {
-      dl { grid-template-columns: 1fr; }
-      .gates { grid-template-columns: 1fr; }
+      .stats, .meters, .gates, .books, .grid, .grid.two { grid-template-columns: 1fr; }
+      header.top { align-items: flex-start; flex-direction: column; }
     }
   </style>
 </head>
 <body>
-<main>
-  <h1>entropy-arb record-only</h1>
-  <p class="lede">Localhost panel. Starts and stops data collection only. It does not send orders and it does not read API keys.</p>
-
-  <section>
-    <h2>Recorder</h2>
-    <form id="form" class="row">
-      <div class="field">
-        <label for="symbol">Symbol</label>
-        <input id="symbol" name="symbol" value="SNDK" maxlength="16" autocomplete="off" required>
-      </div>
-      <div class="field">
-        <label for="hedge">Hedge</label>
-        <select id="hedge" name="hedge">
-          <option value="lighter" selected>lighter</option>
-          <option value="lighter-rh">lighter-rh</option>
-          <option value="tradexyz">tradexyz</option>
-        </select>
-      </div>
-      <button class="primary" id="start" type="submit">Start record-only</button>
-      <button id="stop" type="button" disabled>Stop</button>
-    </form>
-    <p class="hint">Runs <span class="mono" id="cmd-preview">python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter</span></p>
-  </section>
-
-  <section>
-    <h2>Status</h2>
-    <div id="warn-box" hidden><ul id="warnings"></ul></div>
-    <dl>
-      <dt>State</dt><dd id="running">—</dd>
-      <dt>PID</dt><dd id="pid">—</dd>
-      <dt>Uptime</dt><dd id="uptime">—</dd>
-      <dt>Market</dt><dd id="market">—</dd>
-      <dt>Minutes collected</dt><dd id="minutes">—</dd>
-      <dt>Samples coverage</dt><dd id="coverage">—</dd>
-      <dt>Latest minute</dt><dd id="latest-time">—</dd>
-      <dt>Latest TOB</dt><dd id="latest-tob">—</dd>
-      <dt>Fillable @ $100</dt><dd id="latest-fill">—</dd>
-      <dt>CSV</dt><dd id="csv-path">logs/minutes.csv</dd>
-    </dl>
-    <p class="hint" id="csv-hint">Minute bars are written to logs/minutes.csv (one row per completed minute). A blank fillable@$100 cell means that side was too thin for every sample in the minute.</p>
-    <pre id="log-tail" hidden></pre>
-  </section>
-
-  <section>
-    <h2>Analyze</h2>
-    <p class="hint">One click runs <span class="mono">python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48</span> on logs/minutes.csv.</p>
-    <button id="analyze" type="button">Analyze last 24h</button>
-    <p id="analyze-msg" class="hint"></p>
-    <div class="gates" id="gates">
-      <article class="gate">
-        <div class="id">G1</div>
-        <div class="sub" id="g1-sub">fillable@$100 conservative net-fee median &gt; 0 (worse of SELL/BUY, rebate 0)</div>
-        <div class="val" id="g1">—</div>
-      </article>
-      <article class="gate">
-        <div class="id">G2</div>
-        <div class="sub" id="g2-sub">±50% shift of p90 upper/lower (before 1 bps floor); worst firing net edge &gt;= 0</div>
-        <div class="val" id="g2">—</div>
-      </article>
-      <article class="gate">
-        <div class="id">G3</div>
-        <div class="sub" id="g3-sub">slip@$100 p90 &lt; net-edge p50 (worse slack, not slip alone)</div>
-        <div class="val" id="g3">—</div>
-      </article>
-      <article class="gate">
-        <div class="id">G4 · depth_ok_frac</div>
-        <div class="sub" id="g4-sub">thin_frac &lt; 0.30 (shallow book / sizing signal only)</div>
-        <div class="val" id="g4">—</div>
-      </article>
+<header class="top">
+  <div class="brand">
+    <div class="mark">S</div>
+    <div>
+      <h1>SNDK · Entropy ↔ Lighter</h1>
+      <div class="sub">Entropy HIP-3 dex=io · 本地探针 · 不会自动启动实盘</div>
     </div>
-    <p class="hint" id="contrast-line">Contrast (not Gate ids): SELL entropy net p50 — · BUY entropy net p50 —</p>
-    <pre id="analyze-out" hidden></pre>
+  </div>
+  <div class="top-meta">
+    <span class="pill" id="rth-pill">RTH —</span>
+    <span class="pill">localhost <strong>127.0.0.1</strong></span>
+  </div>
+</header>
+<main>
+  <section class="stats">
+    <article class="stat">
+      <div class="k">任务状态</div>
+      <div class="v" id="stat-status">已停止</div>
+      <div class="d" id="stat-status-d">尚未启动</div>
+    </article>
+    <article class="stat">
+      <div class="k">模式</div>
+      <div class="v" id="stat-mode">—</div>
+      <div class="d">只记录 与 探针实盘 分开</div>
+    </article>
+    <article class="stat">
+      <div class="k">最近对账</div>
+      <div class="v" id="stat-rec">0</div>
+      <div class="d" id="stat-rec-d">尚未对账</div>
+    </article>
+    <article class="stat">
+      <div class="k">待确认</div>
+      <div class="v" id="stat-q">0</div>
+      <div class="d" id="stat-q-d">没有待确认的订单</div>
+    </article>
+  </section>
+
+  <aside class="side">
+    <div class="eyebrow">TASK</div>
+    <h2>套利任务</h2>
+    <article class="task" id="task-card">
+      <div class="row">
+        <div class="pair">SNDK · Entropy ↔ Lighter</div>
+        <span class="status stop" id="task-status">已停止</span>
+      </div>
+      <div class="mode-flag record" id="task-mode">未创建</div>
+      <div class="kv">
+        <div><span>中枢</span><b id="card-mid">-1.7</b></div>
+        <div><span>带宽</span><b id="card-band">±1.0</b></div>
+        <div><span>单笔</span><b id="card-order">$10</b></div>
+        <div><span>单边上限</span><b id="card-pos">$10</b></div>
+      </div>
+      <div class="warn-line" id="card-warn" hidden>会偏离 Decision Card</div>
+      <p class="hint" id="card-empty">还没有任务。创建一个 SNDK 探针。</p>
+    </article>
+    <div class="actions">
+      <button class="primary" id="open-create" type="button">创建套利任务</button>
+      <button class="ghost" id="clear-task" type="button" disabled>清除</button>
+    </div>
+    <p class="legend">状态：记录中 · 暖机 · LIVE · 暂停 · 已停止</p>
+  </aside>
+
+  <section>
+    <div class="panel">
+      <div class="head">
+        <div>
+          <h2>SNDK <span class="muted">/</span> Entropy ↔ Lighter</h2>
+          <div class="idline" id="run-line">记录进程未启动 · 分钟数据 logs/minutes.csv</div>
+        </div>
+        <div class="head-actions">
+          <button class="primary" id="btn-start" type="button">启动</button>
+          <button class="amber" id="btn-pause" type="button">暂停</button>
+          <button class="ghost" id="btn-recon" type="button">对账</button>
+          <button class="danger" id="btn-stop" type="button">停止</button>
+          <button class="ghost" id="btn-card" type="button" disabled>确认单</button>
+        </div>
+      </div>
+      <div id="run-warn" class="banner" hidden></div>
+      <div class="track-wrap">
+        <div class="track-label">
+          <span>偏离中枢</span>
+          <span id="dev-text">—</span>
+        </div>
+        <div class="track" aria-hidden="true"><i id="dev-mark" style="left:50%"></i></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="eyebrow">LIVE</div>
+      <h2 style="margin:6px 0 0;font-size:15px">实时边际</h2>
+      <div class="meters">
+        <article class="meter">
+          <div class="k">可成交卖出</div>
+          <div class="v" id="m-sell">—</div>
+          <div class="s">fillable 卖 Entropy，费前</div>
+        </article>
+        <article class="meter">
+          <div class="k">可成交买入</div>
+          <div class="v" id="m-buy">—</div>
+          <div class="s">fillable 买 Entropy，费前</div>
+        </article>
+        <article class="meter">
+          <div class="k">扣 0.9 bps 后</div>
+          <div class="v" id="m-net">—</div>
+          <div class="s">净边际，返佣不计入</div>
+        </article>
+        <article class="meter">
+          <div class="k">相对中枢</div>
+          <div class="v" id="m-dev">—</div>
+          <div class="s" id="m-dev-s">premium − midline</div>
+        </article>
+      </div>
+      <p class="hint" id="sample-line">分钟样本尚未到达。空白的 fillable 表示该分钟深度不足。</p>
+    </div>
+
+    <div class="panel">
+      <div class="eyebrow">ACCOUNTS</div>
+      <h2 style="margin:6px 0 0;font-size:15px">权益 / 可用 / 持仓</h2>
+      <div class="books">
+        <article class="book">
+          <div class="k">Entropy · dex=io</div>
+          <div class="v" id="eq-e">—</div>
+          <div class="s">可用 <span id="av-e">—</span> · 持仓 <span id="pos-e">—</span> · 逐仓 <span id="iso-e">—</span></div>
+        </article>
+        <article class="book">
+          <div class="k">Lighter</div>
+          <div class="v" id="eq-l">—</div>
+          <div class="s">可用 <span id="av-l">—</span> · 持仓 <span id="pos-l">—</span> · 逐仓 <span id="iso-l">—</span></div>
+        </article>
+      </div>
+      <p class="hint" id="acct-note">密钥只留在服务器。页面不接收私钥。</p>
+    </div>
+
+    <div class="panel">
+      <div class="eyebrow">GATES</div>
+      <h2 style="margin:6px 0 0;font-size:15px">G1–G4</h2>
+      <p class="hint">刷新会运行 <span class="mono">python3 tools/analyze.py --hours 24 --fees-bps 0.9 --min-samples 48</span>，读 logs/minutes.csv。</p>
+      <button class="ghost" id="analyze" type="button">刷新 G1–G4</button>
+      <p class="hint" id="analyze-msg"></p>
+      <div class="gates">
+        <article class="gate">
+          <div class="k">G1</div>
+          <div class="s" id="g1-sub">fillable@$100 conservative net-fee median &gt; 0 (worse of SELL/BUY, rebate 0)</div>
+          <div class="v" id="g1">—</div>
+        </article>
+        <article class="gate">
+          <div class="k">G2</div>
+          <div class="s" id="g2-sub">±50% shift of p90 upper/lower (before 1 bps floor); worst firing net edge &gt;= 0</div>
+          <div class="v" id="g2">—</div>
+        </article>
+        <article class="gate">
+          <div class="k">G3</div>
+          <div class="s" id="g3-sub">slip@$100 p90 &lt; net-edge p50 (worse slack, not slip alone)</div>
+          <div class="v" id="g3">—</div>
+        </article>
+        <article class="gate">
+          <div class="k">G4 · depth_ok_frac</div>
+          <div class="s" id="g4-sub">thin_frac &lt; 0.30 (shallow book / sizing signal only)</div>
+          <div class="v" id="g4">—</div>
+        </article>
+      </div>
+      <p class="hint" id="contrast-line">Contrast (not Gate ids): SELL entropy net p50 — · BUY entropy net p50 —</p>
+      <pre id="analyze-out" hidden></pre>
+      <p class="hint">确认入队不会向交易所发单。对账只记请求。RTH 为美东周一至周五 09:30–16:00，不含假日。CLI 实盘仍是 <span class="mono">python main.py --symbol SNDK --hedge lighter</span>。</p>
+    </div>
   </section>
 </main>
+
+<div class="modal-back" id="create-modal" hidden>
+  <form class="modal" id="create-form">
+    <header>
+      <div>
+        <div class="eyebrow">NEW STRATEGY</div>
+        <h2>创建套利任务</h2>
+      </div>
+      <button class="x" type="button" id="create-close" aria-label="关闭">×</button>
+    </header>
+    <section class="sec">
+      <h3><span class="num">01</span> 交易市场</h3>
+      <p class="hint">仅此一个 SNDK 探针。Entropy 为 HIP-3 dex=io，对冲腿为 Lighter 主网。</p>
+      <div class="grid">
+        <div>
+          <label for="f-symbol">品种</label>
+          <input id="f-symbol" value="SNDK" readonly>
+        </div>
+        <div>
+          <label for="f-dex">Entropy dex</label>
+          <input id="f-dex" value="io" readonly>
+        </div>
+        <div>
+          <label for="f-hedge">对冲腿</label>
+          <input id="f-hedge" value="Lighter" readonly>
+        </div>
+      </div>
+      <div class="grid">
+        <div>
+          <label for="f-efee">Entropy 吃单费 (bps)</label>
+          <input id="f-efee" value="0.9" readonly>
+        </div>
+        <div>
+          <label for="f-lfee">Lighter 吃单费 (bps)</label>
+          <input id="f-lfee" value="0" readonly>
+        </div>
+        <div>
+          <label for="f-ref">推荐应计</label>
+          <input id="f-ref" value="self_t2 ≈ 0.54 bps · 未到账" readonly>
+        </div>
+      </div>
+    </section>
+    <section class="sec">
+      <h3><span class="num">02</span> 策略参数</h3>
+      <p class="hint">默认锁定 Decision Card。改中枢或关掉人工确认会提示偏离。</p>
+      <div class="grid">
+        <div>
+          <label for="f-mid">中枢 midline (bps)</label>
+          <input id="f-mid" name="midline_bps" type="number" step="0.1" value="-1.7" required>
+        </div>
+        <div>
+          <label for="f-up">上沿 upper (bps)</label>
+          <input id="f-up" name="upper_bps" type="number" step="0.1" value="1.0" min="0.1" required>
+        </div>
+        <div>
+          <label for="f-lo">下沿 lower (bps)</label>
+          <input id="f-lo" name="lower_bps" type="number" step="0.1" value="1.0" min="0.1" required>
+        </div>
+      </div>
+      <div class="grid two">
+        <div>
+          <label for="f-ord">单笔名义 (USD)</label>
+          <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" required>
+        </div>
+        <div>
+          <label for="f-cap">单边持仓上限 (USD)</label>
+          <input id="f-cap" name="max_position_usd" type="number" step="1" value="10" min="10" required>
+        </div>
+      </div>
+      <div class="modes" role="group" aria-label="模式">
+        <button type="button" class="on" id="mode-record" data-mode="record">只记录</button>
+        <button type="button" id="mode-live" data-mode="live">探针实盘</button>
+      </div>
+      <div class="checks">
+        <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
+        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
+      </div>
+      <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
+    </section>
+    <div class="foot">
+      <button class="ghost" type="button" id="create-cancel">取消</button>
+      <button class="primary" type="submit" id="create-save">创建任务</button>
+    </div>
+  </form>
+</div>
+
+<div class="modal-back" id="confirm-modal" hidden>
+  <div class="modal" role="dialog" aria-labelledby="confirm-title">
+    <header>
+      <div>
+        <div class="eyebrow">CONFIRM</div>
+        <h2 id="confirm-title">确认探针订单</h2>
+      </div>
+      <button class="x" type="button" id="confirm-x" aria-label="关闭">×</button>
+    </header>
+    <p class="hint">净边际已扣除 0.9 bps。Tier2 Self 应计单独一行，未到账，不加进净边际。</p>
+    <div class="k" style="color:var(--faint);margin-top:12px">扣费后净边际</div>
+    <div class="netline" id="c-net">—</div>
+    <div class="accrual">
+      <div>Tier2 Self 应计 <span class="mono" id="c-accrual">≈ 0.54 bps</span></div>
+      <div style="margin-top:4px">标记：<strong id="c-accrual-label">未到账</strong> · self_t2 · 不是现金</div>
+    </div>
+    <div class="kv" style="margin-top:12px">
+      <div><span>中枢</span><b id="c-mid">—</b></div>
+      <div><span>RTH</span><b id="c-rth">—</b></div>
+    </div>
+    <table class="legs">
+      <thead>
+        <tr><th>腿</th><th>方向</th><th>名义</th><th>可用</th><th>逐仓</th></tr>
+      </thead>
+      <tbody id="c-legs"></tbody>
+    </table>
+    <div class="warn-line" id="c-tail" hidden></div>
+    <p class="hint" id="c-block" hidden>非美股 RTH，确认已禁用。</p>
+    <p class="hint">确认入队。取消则跳过。当前不会向交易所发单。</p>
+    <div class="foot">
+      <button class="ghost" type="button" id="c-cancel">取消</button>
+      <button class="primary" type="button" id="c-ok">确认</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
+let lastProposalId = null;
+let lastPayload = null;
+let formMode = "record";
+let seenConfirm = false;
 
-function dash(value) {
-  return value == null || value === "" ? "—" : String(value);
+function dash(v) {
+  return v == null || v === "" ? "—" : String(v);
+}
+function num(v, digits) {
+  if (v == null || Number.isNaN(Number(v))) return "—";
+  const n = Number(v);
+  const sign = n > 0 ? "+" : "";
+  return sign + n.toFixed(digits == null ? 2 : digits);
+}
+function usd(v) {
+  if (v == null || Number.isNaN(Number(v))) return "—";
+  return "$" + Number(v).toFixed(2);
+}
+function iso(v) {
+  if (v === true) return "逐仓";
+  if (v === false) return "全仓";
+  return "未知";
 }
 
-function fmtUptime(sec) {
-  if (sec == null) return "—";
-  sec = Math.floor(sec);
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  if (h) return h + "h " + m + "m " + s + "s";
-  if (m) return m + "m " + s + "s";
-  return s + "s";
+function setStatus(el, label) {
+  el.textContent = label || "已停止";
+  el.className = "status " + ({
+    "记录中": "rec",
+    "暖机": "warm",
+    "LIVE": "live",
+    "暂停": "pause",
+    "已停止": "stop",
+  }[label] || "stop");
 }
 
-function pct(frac) {
-  if (frac == null || Number.isNaN(frac)) return "—";
-  return (frac * 100).toFixed(1) + "%";
+function applyModeButtons() {
+  $("mode-record").classList.toggle("on", formMode === "record");
+  $("mode-live").classList.toggle("on", formMode === "live");
 }
 
-function preview() {
-  const symbol = ($("symbol").value || "SNDK").trim().toUpperCase();
-  const hedge = $("hedge").value;
-  $("cmd-preview").textContent =
-    "python3 main.py --record-only --no-dashboard --symbol " + symbol + " --hedge " + hedge;
+function deviationWarning() {
+  const mid = Number($("f-mid").value);
+  const confirmOn = $("f-confirm").checked;
+  const off = Math.abs(mid - (-1.7)) > 1e-9 || !confirmOn;
+  $("form-warn").hidden = !off;
 }
 
-function renderStatus(s) {
-  $("running").textContent = s.running ? "running" : "stopped";
-  $("pid").textContent = dash(s.pid);
-  $("uptime").textContent = fmtUptime(s.uptime_sec);
-  $("market").textContent = (s.symbol && s.hedge) ? (s.symbol + " / " + s.hedge) : "—";
-  $("minutes").textContent = dash(s.minutes_collected);
-  const cov = s.samples_coverage || {};
-  const latestN = cov.latest_samples == null ? "—" : (cov.latest_samples + "/60");
-  $("coverage").textContent =
-    "latest " + latestN + " (" + pct(cov.latest_frac) + ")" +
-    " · recent " + pct(cov.recent_frac) +
-    " · all minutes " + pct(cov.mean_frac);
-  const latest = s.latest;
-  if (!latest) {
-    $("latest-time").textContent = "—";
-    $("latest-tob").textContent = "—";
-    $("latest-fill").textContent = "—";
-  } else {
-    $("latest-time").textContent = dash(latest.time_utc);
-    const tob = latest.tob || {};
-    $("latest-tob").textContent =
-      "entropy " + dash(tob.entropy_bid) + " / " + dash(tob.entropy_ask) +
-      " · hedge " + dash(tob.hedge_bid) + " / " + dash(tob.hedge_ask) +
-      " · premium close " + dash(tob.premium_close_bps) + " bps" +
-      " · sell edge " + dash(tob.sell_edge_mean_bps) +
-      " · buy edge " + dash(tob.buy_edge_mean_bps);
-    const fill = latest.fillable_100 || {};
-    $("latest-fill").textContent =
-      "sell " + dash(fill.sell_bps) + " bps · buy " + dash(fill.buy_bps) + " bps";
+function openCreate(task) {
+  const t = task || {};
+  $("f-mid").value = t.midline_bps != null ? t.midline_bps : -1.7;
+  $("f-up").value = t.upper_bps != null ? t.upper_bps : 1;
+  $("f-lo").value = t.lower_bps != null ? t.lower_bps : 1;
+  $("f-ord").value = t.order_notional_usd != null ? t.order_notional_usd : 10;
+  $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 10;
+  formMode = t.mode || "record";
+  $("f-confirm").checked = t.manual_confirm !== false;
+  $("f-rth").checked = t.rth_only !== false;
+  applyModeButtons();
+  deviationWarning();
+  $("create-save").textContent = task ? "保存任务" : "创建任务";
+  $("create-modal").hidden = false;
+  $("f-mid").focus();
+}
+
+function renderLegs(legs) {
+  const body = $("c-legs");
+  body.replaceChildren();
+  for (const leg of legs || []) {
+    const tr = document.createElement("tr");
+    for (const text of [
+      leg.venue + (leg.dex ? " (" + leg.dex + ")" : ""),
+      leg.direction,
+      "$" + Number(leg.notional_usd).toFixed(0),
+      usd(leg.available),
+      iso(leg.isolated),
+    ]) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
   }
-  $("csv-path").textContent = s.csv_path || "logs/minutes.csv";
-  if (s.csv_hint) $("csv-hint").textContent = s.csv_hint +
-    " A blank fillable@$100 cell means that side was too thin for every sample in the minute.";
+}
+
+function showConfirm(payload) {
+  if (!payload) {
+    $("confirm-modal").hidden = true;
+    lastProposalId = null;
+    lastPayload = null;
+    return;
+  }
+  lastPayload = payload;
+  $("c-net").textContent = num(payload.net_edge_bps, 2) + " bps";
+  $("c-net").className = "netline " + (Number(payload.net_edge_bps) >= 0 ? "pos" : "neg");
+  $("c-accrual").textContent = "≈ " + Number(payload.accrual_bps).toFixed(2) + " bps";
+  $("c-accrual-label").textContent = payload.accrual_label || "未到账";
+  $("c-mid").textContent = num(payload.midline_bps, 1) + " bps";
+  $("c-rth").textContent = payload.rth ? "交易时段 " + (payload.rth_window || "") : "非交易时段";
+  renderLegs(payload.legs);
+  const tail = payload.tail_vs_median;
+  $("c-tail").hidden = !tail;
+  $("c-tail").textContent = tail || "";
+  const enabled = !!payload.confirm_enabled;
+  $("c-ok").disabled = !enabled;
+  $("c-block").hidden = enabled;
+  if (payload.proposal_id !== lastProposalId) {
+    lastProposalId = payload.proposal_id;
+    $("confirm-modal").hidden = false;
+  }
+}
+
+function render(s) {
+  const task = s.task;
+  const label = s.status_label || "已停止";
+  setStatus($("task-status"), label);
+  $("stat-status").textContent = label;
+  $("stat-status-d").textContent = s.running
+    ? ("pid " + dash(s.pid) + (s.paused ? " · 已暂停" : ""))
+    : "尚未启动";
+  const modeLabel = task ? task.mode_label : "—";
+  $("stat-mode").textContent = modeLabel;
+  const flag = $("task-mode");
+  flag.textContent = task ? modeLabel : "未创建";
+  flag.className = "mode-flag " + (task && task.mode === "live" ? "live" : "record");
+  if (task) {
+    $("card-mid").textContent = num(task.midline_bps, 1);
+    $("card-band").textContent = "±" + Number(task.upper_bps).toFixed(1) + " / " + Number(task.lower_bps).toFixed(1);
+    $("card-order").textContent = "$" + Number(task.order_notional_usd).toFixed(0);
+    $("card-pos").textContent = "$" + Number(task.max_position_usd).toFixed(0);
+    $("card-empty").hidden = true;
+    $("card-warn").hidden = !(task.warnings && task.warnings.length);
+  } else {
+    $("card-empty").hidden = false;
+    $("card-warn").hidden = true;
+  }
+  $("clear-task").disabled = !task || !!s.running;
+  $("open-create").textContent = task ? "修改参数" : "创建套利任务";
+
+  const rth = $("rth-pill");
+  rth.textContent = s.rth ? "RTH 交易时段" : "非 RTH";
+  rth.className = "pill " + (s.rth ? "ok" : "warn");
+
+  const rec = s.reconcile;
+  $("stat-rec").textContent = rec ? "1" : "0";
+  $("stat-rec-d").textContent = rec
+    ? ("已记录 · 未上链")
+    : "尚未对账";
+  const pending = !!(s.proposal);
+  $("stat-q").textContent = pending ? "1" : "0";
+  $("stat-q-d").textContent = pending ? "有一张确认单" : "没有待确认的订单";
+
+  $("run-line").textContent = (s.running ? "采集中" : "记录进程未启动")
+    + " · " + (task && task.mode === "live" ? (s.live_armed ? "探针已武装" : "探针未武装") : "只记录")
+    + " · 分钟数据 logs/minutes.csv";
 
   const warnings = s.warnings || [];
-  const list = $("warnings");
-  list.replaceChildren();
-  for (const w of warnings) {
-    const li = document.createElement("li");
-    li.textContent = w;
-    list.appendChild(li);
+  $("run-warn").hidden = warnings.length === 0;
+  $("run-warn").textContent = warnings.join(" ");
+
+  const edge = s.edge || {};
+  $("m-sell").textContent = num(edge.sell_pre_bps, 2);
+  $("m-buy").textContent = num(edge.buy_pre_bps, 2);
+  const netShow = edge.net_sell_bps == null && edge.net_buy_bps == null
+    ? null
+    : (edge.net_sell_bps == null ? edge.net_buy_bps
+      : (edge.net_buy_bps == null ? edge.net_sell_bps
+        : Math.max(edge.net_sell_bps, edge.net_buy_bps)));
+  $("m-net").textContent = num(netShow, 2);
+  $("m-dev").textContent = num(edge.deviation_bps, 2);
+  $("m-dev-s").textContent = "中枢 " + num(edge.midline_bps, 1) + " bps";
+  $("dev-text").textContent = edge.deviation_bps == null ? "—" : (num(edge.deviation_bps, 2) + " bps");
+  const dev = Number(edge.deviation_bps);
+  const clamped = Number.isFinite(dev) ? Math.max(-10, Math.min(10, dev)) : 0;
+  $("dev-mark").style.left = (50 + clamped * 5) + "%";
+
+  const latest = s.latest;
+  if (latest) {
+    const cov = s.samples_coverage || {};
+    $("sample-line").textContent = "最近分钟 " + dash(latest.time_utc)
+      + " · 样本 " + dash(latest.samples) + "/60";
   }
-  $("warn-box").hidden = warnings.length === 0;
 
-  const tail = s.log_tail || [];
-  $("log-tail").hidden = tail.length === 0;
-  $("log-tail").textContent = tail.join("\n");
+  const acct = s.accounts || {};
+  const ent = acct.entropy || {};
+  const lig = acct.lighter || {};
+  $("eq-e").textContent = usd(ent.equity);
+  $("av-e").textContent = usd(ent.available);
+  $("pos-e").textContent = dash(ent.position);
+  $("iso-e").textContent = iso(ent.isolated);
+  $("eq-l").textContent = usd(lig.equity);
+  $("av-l").textContent = usd(lig.available);
+  $("pos-l").textContent = dash(lig.position);
+  $("iso-l").textContent = iso(lig.isolated);
+  const creds = acct.creds || {};
+  $("acct-note").textContent = acct.note
+    || ((creds.entropy || creds.lighter) ? "已检测到密钥，数值来自只读查询。" : "密钥只留在服务器。页面不接收私钥。");
 
-  $("start").disabled = !!s.running;
-  $("stop").disabled = !s.running && s.pid == null;
+  $("btn-start").disabled = !!s.running && !s.paused;
+  $("btn-pause").disabled = !s.running || !!s.paused;
+  $("btn-stop").disabled = !s.running && !s.pid;
+  showConfirm(s.proposal || null);
+  $("btn-card").disabled = !s.proposal;
 }
 
 async function refresh() {
   try {
     const res = await fetch("/api/status");
-    renderStatus(await res.json());
+    render(await res.json());
   } catch (err) {
-    $("running").textContent = "status unavailable";
+    $("stat-status").textContent = "状态不可用";
   }
 }
 
-$("symbol").addEventListener("input", preview);
-$("hedge").addEventListener("change", preview);
-
-$("form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  $("start").disabled = true;
-  const res = await fetch("/api/start", {
+async function post(url, body) {
+  const res = await fetch(url, {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      symbol: $("symbol").value,
-      hedge: $("hedge").value,
-    }),
+    headers: body ? {"Content-Type": "application/json"} : undefined,
+    body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    alert(body.detail || "start failed");
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || res.statusText || "request failed");
+  return data;
+}
+
+$("open-create").addEventListener("click", async () => {
+  const status = await fetch("/api/status").then((r) => r.json());
+  if (status.running) {
+    alert("先停止，再修改任务。");
+    return;
+  }
+  openCreate(status.task);
+});
+$("create-close").addEventListener("click", () => { $("create-modal").hidden = true; });
+$("create-cancel").addEventListener("click", () => { $("create-modal").hidden = true; });
+$("f-mid").addEventListener("input", deviationWarning);
+$("f-confirm").addEventListener("change", deviationWarning);
+for (const id of ["mode-record", "mode-live"]) {
+  $(id).addEventListener("click", () => {
+    formMode = $(id).dataset.mode;
+    applyModeButtons();
+  });
+}
+$("create-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("create-save").disabled = true;
+  try {
+    await post("/api/task", {
+      midline_bps: Number($("f-mid").value),
+      upper_bps: Number($("f-up").value),
+      lower_bps: Number($("f-lo").value),
+      order_notional_usd: Number($("f-ord").value),
+      max_position_usd: Number($("f-cap").value),
+      mode: formMode,
+      manual_confirm: $("f-confirm").checked,
+      rth_only: $("f-rth").checked,
+    });
+    $("create-modal").hidden = true;
+    await refresh();
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    $("create-save").disabled = false;
+  }
+});
+
+$("clear-task").addEventListener("click", async () => {
+  try {
+    await post("/api/task/clear");
+    await refresh();
+  } catch (err) {
+    alert(err.message);
+  }
+});
+
+$("btn-start").addEventListener("click", async () => {
+  $("btn-start").disabled = true;
+  try {
+    await post("/api/session/start");
+  } catch (err) {
+    alert(err.message);
+  }
+  await refresh();
+});
+$("btn-pause").addEventListener("click", async () => {
+  try { await post("/api/pause"); } catch (err) { alert(err.message); }
+  await refresh();
+});
+$("btn-stop").addEventListener("click", async () => {
+  try { await post("/api/stop"); } catch (err) { alert(err.message); }
+  await refresh();
+});
+$("btn-card").addEventListener("click", () => {
+  if (lastPayload) $("confirm-modal").hidden = false;
+});
+$("btn-recon").addEventListener("click", async () => {
+  try {
+    const body = await post("/api/reconcile");
+    $("stat-rec-d").textContent = body.gap || "已记录";
+  } catch (err) {
+    alert(err.message);
   }
   await refresh();
 });
 
-$("stop").addEventListener("click", async () => {
-  $("stop").disabled = true;
-  await fetch("/api/stop", {method: "POST"});
+$("c-cancel").addEventListener("click", async () => {
+  try { await post("/api/confirm/cancel"); } catch (err) { alert(err.message); }
+  $("confirm-modal").hidden = true;
+  await refresh();
+});
+$("confirm-x").addEventListener("click", () => { $("confirm-modal").hidden = true; });
+$("c-ok").addEventListener("click", async () => {
+  if (!lastPayload || $("c-ok").disabled) return;
+  $("c-ok").disabled = true;
+  try {
+    const body = await post("/api/confirm", lastPayload);
+    alert(body.gap || "已入队");
+    $("confirm-modal").hidden = true;
+  } catch (err) {
+    alert(err.message);
+  }
   await refresh();
 });
 
 function showG4(node, gate) {
   if (!gate || (gate.text == null && gate.thin_text == null && gate.pass == null)) {
     node.textContent = "—";
-    node.className = "val";
+    node.className = "v";
     return;
   }
   const mark = gate.pass === true ? "PASS" : (gate.pass === false ? "FAIL" : "");
   const depth = gate.text == null ? "n/a" : gate.text;
   const thin = gate.thin_text == null ? "n/a" : gate.thin_text;
-  node.textContent = (mark ? mark + " · " : "") + depth + " · thin_frac " + thin + " (<0.30)";
-  node.className = "val " + (gate.pass === true ? "ok" : (gate.pass === false ? "bad" : ""));
+  node.textContent = (mark ? mark + " · " : "") + depth + " · thin_frac " + thin;
+  node.className = "v " + (gate.pass === true ? "ok" : (gate.pass === false ? "bad" : ""));
 }
-
-function showVerdict(node, gate, suffix) {
+function showVerdict(node, gate) {
   if (!gate || (gate.text == null && gate.pass == null)) {
     node.textContent = "—";
-    node.className = "val";
+    node.className = "v";
     return;
   }
   const mark = gate.pass === true ? "PASS" : (gate.pass === false ? "FAIL" : "");
-  const num = gate.text == null ? "n/a" : (gate.text + (suffix || ""));
-  node.textContent = mark ? (mark + " · " + num) : num;
-  node.className = "val " + (gate.pass === true ? "ok" : (gate.pass === false ? "bad" : ""));
+  const numText = gate.text == null ? "n/a" : (gate.text + (gate.text ? " bps" : ""));
+  node.textContent = mark ? (mark + " · " + numText) : numText;
+  node.className = "v " + (gate.pass === true ? "ok" : (gate.pass === false ? "bad" : ""));
 }
-
 $("analyze").addEventListener("click", async () => {
   $("analyze").disabled = true;
-  $("analyze-msg").textContent = "running analyzer…";
-  $("analyze-msg").className = "hint";
+  $("analyze-msg").textContent = "正在分析…";
   try {
     const res = await fetch("/api/analyze", {method: "POST"});
     const body = await res.json();
     const gates = body.gates || {};
-    const g1 = gates.G1 || {};
-    const g2 = gates.G2 || {};
+    if (gates.G1 && gates.G1.label) $("g1-sub").textContent = gates.G1.label;
+    if (gates.G2 && gates.G2.label) $("g2-sub").textContent = gates.G2.label;
+    if (gates.G3 && gates.G3.label) $("g3-sub").textContent = gates.G3.label;
+    showVerdict($("g1"), gates.G1);
+    showVerdict($("g2"), gates.G2);
+    showVerdict($("g3"), gates.G3);
     const g3 = gates.G3 || {};
-    const g4 = gates.G4 || {};
-    if (g1.label) $("g1-sub").textContent = g1.label;
-    if (g2.label) $("g2-sub").textContent = g2.label;
-    if (g3.label) $("g3-sub").textContent = g3.label;
-    showVerdict($("g1"), g1, g1.text ? " bps" : "");
-    showVerdict($("g2"), g2, g2.text ? " bps" : "");
-    showVerdict($("g3"), g3, g3.text ? " bps" : "");
-    const slipSell = g3.sell_text || "n/a";
-    const slipBuy = g3.buy_text || "n/a";
-    const netSell = g3.sell_net_text || "n/a";
-    const netBuy = g3.buy_net_text || "n/a";
-    $("g3-sub").textContent =
-      (g3.label || "slip@$100 p90 < net-edge p50") +
-      " · SELL slip " + slipSell + " vs net " + netSell +
-      " · BUY slip " + slipBuy + " vs net " + netBuy;
-    if (g4.label) $("g4-sub").textContent = g4.label;
-    showG4($("g4"), g4);
+    $("g3-sub").textContent = (g3.label || "slip@$100 p90 < net-edge p50")
+      + " · SELL slip " + (g3.sell_text || "n/a")
+      + " vs net " + (g3.sell_net_text || "n/a")
+      + " · BUY slip " + (g3.buy_text || "n/a")
+      + " vs net " + (g3.buy_net_text || "n/a");
+    if (gates.G4 && gates.G4.label) $("g4-sub").textContent = gates.G4.label;
+    showG4($("g4"), gates.G4);
     const contrast = body.contrast || {};
-    $("contrast-line").textContent =
-      "Contrast (not Gate ids): SELL entropy net p50 " +
-      dash(contrast.sell_net_p50_text) + " bps · BUY entropy net p50 " +
-      dash(contrast.buy_net_p50_text) + " bps";
+    $("contrast-line").textContent = "Contrast (not Gate ids): SELL entropy net p50 "
+      + dash(contrast.sell_net_p50_text) + " bps · BUY entropy net p50 "
+      + dash(contrast.buy_net_p50_text) + " bps";
     const chunks = [];
     if (body.stderr) chunks.push(body.stderr.trim());
     if (body.stdout) chunks.push(body.stdout.trim());
     $("analyze-out").hidden = chunks.length === 0;
     $("analyze-out").textContent = chunks.join("\n\n");
-    if (!body.ok) {
-      $("analyze-msg").textContent = body.stderr
-        ? "analyzer exited without a full report — see the output below"
-        : "analyzer failed";
-      $("analyze-msg").className = "hint err";
-    } else {
-      $("analyze-msg").textContent = body.basis || "analyzer finished";
-      $("analyze-msg").className = "hint";
-    }
+    $("analyze-msg").textContent = body.ok ? (body.basis || "分析完成") : "分析未完成";
   } catch (err) {
-    $("analyze-msg").textContent = "analyze request failed";
-    $("analyze-msg").className = "hint err";
+    $("analyze-msg").textContent = "分析请求失败";
   } finally {
     $("analyze").disabled = false;
   }
 });
 
-preview();
 refresh();
 setInterval(refresh, 2000);
 </script>
