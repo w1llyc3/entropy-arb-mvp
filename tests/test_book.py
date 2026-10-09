@@ -7,7 +7,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
+from entropy_arb.book import (  # noqa: E402
+    OrderBook, plan_arb, size_above_min_notional, truncate_size,
+)
 
 
 def make_book(bids, asks):
@@ -65,6 +67,40 @@ def test_min_notional():
     sell = make_book(bids=[(100.5, 0.05)], asks=[(100.6, 0.05)])
     plan, reason = plan_arb(buy, sell, **common(min_notional=10.0))
     assert plan is None and reason == "below_min_notional"
+
+
+def test_ceil_size_clears_ten_after_sz_decimals():
+    # Incident: floor($10 / px) = 0.0061 and 0.0061 * px ≈ $9.96.
+    # Hyperliquid then rejects "minimum value of $10" while Lighter fills.
+    px = 1632.7868852459016
+    floored = 0.0061
+    assert floored * px < 10.0
+    qty, reason = size_above_min_notional(
+        floored,
+        [(px * 0.995, 4), (px, 4)],
+        min_notional=10.0,
+        size_step=1e-4,
+        target_notional=11.0,
+    )
+    assert reason == "ok" and qty is not None
+    assert qty > floored
+    for price, dec in ((px * 0.995, 4), (px, 4)):
+        quote = truncate_size(qty, dec) * price
+        assert quote + 1e-6 >= 11.0
+        assert quote > 10.0
+    # Coarse szDecimals cannot clear $11 without a jump to ~$100.
+    # That must refuse so the hedge leg is never sent.
+    refused, why = size_above_min_notional(
+        0.11, [(100.0, 0), (100.0, 4)],
+        min_notional=10.0, size_step=1e-4, target_notional=11.0,
+    )
+    assert refused is None and why == "below_min_notional"
+    # A slice already well above the venue minimum stays put.
+    kept, why = size_above_min_notional(
+        1.0, [(100.0, 4), (100.0, 4)],
+        min_notional=10.0, size_step=1e-4,
+    )
+    assert why == "ok" and kept == 1.0
 
 
 def test_marginal_slice_respects_threshold():

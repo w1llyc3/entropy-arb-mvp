@@ -25,6 +25,9 @@ from web.probe import (
     DECISION_WARNING,
     ENTROPY_FEE_BPS,
     FEE_MISMATCH_TOL_BPS,
+    MAX_ORDER_USD,
+    MAX_POSITION_USD,
+    MIN_ORDER_USD,
     NET_TOL_BASE,
     RTH_WINDOW,
     STATUS_HALT,
@@ -130,7 +133,54 @@ class ProbeSession:
         for key in base:
             if key in data:
                 base[key] = data[key]
-        return base
+        if "halted_at" in data:
+            base["halted_at"] = data["halted_at"]
+        return self._maybe_clear_halt(base)
+
+    def _venue_positions(self):
+        """(entropy, lighter) base positions, or None when either is unknown."""
+        acct = self._accounts()
+        ent = (acct.get("entropy") or {}).get("position")
+        lig = (acct.get("lighter") or {}).get("position")
+        if isinstance(ent, bool) or isinstance(lig, bool):
+            return None
+        if not isinstance(ent, (int, float)) or not isinstance(lig, (int, float)):
+            return None
+        return float(ent), float(lig)
+
+    def _maybe_clear_halt(self, risk: dict) -> dict:
+        """Drop HALT once a post-halt read shows both venues flat.
+
+        A cached flat snapshot from before the fill cannot clear it: the
+        read has to be taken at or after ``halted_at``.
+        """
+        halted = bool(risk.get("halted"))
+        try:
+            net = float(risk.get("net_base") or 0.0)
+        except (TypeError, ValueError):
+            net = 0.0
+        if not halted and abs(net) <= NET_TOL_BASE:
+            return risk
+        halted_at = risk.get("halted_at")
+        try:
+            halted_at_f = float(halted_at) if halted_at is not None else 0.0
+        except (TypeError, ValueError):
+            halted_at_f = 0.0
+        if halted_at_f and self._accounts_at + 1e-9 < halted_at_f:
+            self._accounts(force=True)
+        if halted_at_f and self._accounts_at + 1e-9 < halted_at_f:
+            return risk
+        pos = self._venue_positions()
+        if pos is None:
+            return risk
+        ent, lig = pos
+        if abs(ent) <= NET_TOL_BASE and abs(lig) <= NET_TOL_BASE:
+            risk["halted"] = False
+            risk["halt_reason"] = None
+            risk["net_base"] = 0.0
+            risk["halted_at"] = None
+            self._save_risk(risk)
+        return risk
 
     def _save_risk(self, risk: dict) -> None:
         self._write_json(self.risk_path, risk)
@@ -462,6 +512,13 @@ class ProbeSession:
         """
         spec = self.task()
         queue = self.queue()
+        risk = self.risk()
+        if risk.get("halted") or abs(float(risk.get("net_base") or 0.0)) > NET_TOL_BASE:
+            # A cancel must stick: do not open another confirm card while
+            # the book is halted. Drop any card that was already pending.
+            if queue.get("pending"):
+                self._save_queue({"pending": None, "history": queue["history"]})
+            return None
         if not spec or spec.get("mode") != "live" or not spec.get("live_armed"):
             if queue.get("pending"):
                 self._save_queue({"pending": None, "history": queue["history"]})
@@ -603,8 +660,14 @@ class ProbeSession:
         except (TypeError, ValueError):
             raise ProbeError("confirm refused: numeric fields are not numbers",
                              status_code=400)
-        if order_usd - 10.0 > 1e-9 or pos_usd - 10.0 > 1e-9:
-            raise ProbeError("confirm refused: probe caps are $10", status_code=409)
+        if order_usd < MIN_ORDER_USD - 1e-9 or order_usd - MAX_ORDER_USD > 1e-9:
+            raise ProbeError(
+                "confirm refused: order notional must be $10.50–$20",
+                status_code=409)
+        if pos_usd + 1e-9 < order_usd or pos_usd - MAX_POSITION_USD > 1e-9:
+            raise ProbeError(
+                "confirm refused: position cap must cover the order and be <= $20",
+                status_code=409)
         if not rth:
             force = payload.get("force_confirm") is True
             if not force:
@@ -720,6 +783,9 @@ class ProbeSession:
             risk["halted"] = True
             risk["halt_reason"] = result.get("halt_reason") or "single-leg fill"
             risk["net_base"] = net
+            risk["halted_at"] = self.now()
+            self._account_cache = None
+            self._accounts_at = 0.0
         elif result.get("sent"):
             risk["net_base"] = net
         actual = result.get("entropy_fee_bps")

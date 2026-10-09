@@ -10,7 +10,8 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, List, Optional, Sequence, Tuple
 
 Level = Tuple[float, float]
 
@@ -84,6 +85,137 @@ class OrderBook:
 
 def floor_step(x: float, step: float) -> float:
     return round(math.floor(x / step + 1e-9) * step, 12)
+
+
+def ceil_step(x: float, step: float) -> float:
+    """Smallest multiple of ``step`` that is >= ``x``."""
+    if step <= 0:
+        return float(x)
+    return round(math.ceil(float(x) / float(step) - 1e-12) * step, 12)
+
+
+def truncate_size(qty: float, decimals: int) -> float:
+    """Floor ``qty`` to a venue's szDecimals.
+
+    Hyperliquid and Lighter both send an integer multiple of
+    ``10 ** -szDecimals``. Rounding half-up can look like it cleared $10
+    and then truncate back under the minimum on the wire.
+    """
+    decimals = int(decimals)
+    if decimals < 0:
+        return float(qty)
+    scale = Decimal(1).scaleb(-decimals)
+    # ceil_step already snaps to 12 places. Round here too so a binary
+    # 0.006799999999 does not floor to the previous size tick.
+    rounded = format(round(float(qty), 12), "f")
+    quantized = Decimal(rounded).quantize(scale, rounding=ROUND_DOWN)
+    return float(quantized)
+
+
+# Hyperliquid rejects ``Order must have minimum value of $10``. A quote of
+# $10.00 truncates under that after szDecimals, so a probe aims here.
+QUOTE_CLEAR_USD = 10.50
+
+
+def sync_size_grid(entropy, hedge, min_order_notional: float):
+    """Shared step and minimums for a dual-leg slice.
+
+    The step is the coarser of the two venues' size decimals. Both the
+    strategy engine and the probe's live executor use this so they cannot
+    drift onto different grids.
+    """
+    decimals = min(int(entropy.size_decimals), int(hedge.size_decimals))
+    step = 10.0 ** -decimals
+    min_base = max(float(entropy.min_base), float(hedge.min_base), step)
+    min_notional = max(float(min_order_notional),
+                       float(entropy.min_quote), float(hedge.min_quote))
+    return step, min_base, min_notional
+
+
+def size_above_min_notional(
+        qty: float,
+        legs: Sequence[Tuple[float, int]],
+        *,
+        min_notional: float,
+        size_step: float,
+        target_notional: Optional[float] = None,
+) -> Tuple[Optional[float], str]:
+    """Ceil ``qty`` so every leg's truncated quote clears the minimum.
+
+    ``legs[0]`` is Entropy as ``(limit_price, sz_decimals)``. The other
+    tuple is the hedge. When Entropy would still print under its minimum,
+    the result is ``(None, "below_min_notional")`` and the caller must not
+    send the hedge leg.
+
+    A probe passes ``target_notional`` (about $10.50–$20). The wire quote
+    is ceiled to that target so szDecimals truncation cannot land under
+    $10. Without a target, a size that already clears is kept; only a
+    sub-minimum size is lifted, and only when the lift stays within one
+    grid step of the floor.
+    """
+    if size_step <= 0 or not legs:
+        return None, "below_min_notional"
+    prices: List[float] = []
+    for price, _dec in legs:
+        price = float(price)
+        if not math.isfinite(price) or price <= 0:
+            return None, "below_min_notional"
+        prices.append(price)
+
+    venue_min = max(float(min_notional), 0.0)
+    clear = venue_min
+    if venue_min + 1e-9 >= 10.0:
+        clear = max(venue_min, QUOTE_CLEAR_USD)
+    if target_notional is not None:
+        clear = max(clear, float(target_notional))
+    if clear <= 0:
+        return None, "below_min_notional"
+
+    step = float(size_step)
+    for _px, dec in legs:
+        dec = int(dec)
+        if dec >= 0:
+            step = max(step, 10.0 ** -dec)
+    step_ntl = step * max(prices)
+    # A coarse grid (whole coins on a $100 name) cannot sneak up to $11.
+    # Refuse that jump instead of sending a far larger order.
+    if step_ntl > max(2.0, 0.15 * clear):
+        max_over = 0.50
+    else:
+        max_over = max(0.50, step_ntl)
+
+    ent_floor = 10.0 if venue_min + 1e-9 >= 10.0 else venue_min
+    ent_floor = max(venue_min, ent_floor)
+
+    def quotes(q: float) -> List[float]:
+        return [truncate_size(q, int(dec)) * price
+                for price, dec in legs]
+
+    def clears(q: float) -> bool:
+        qs = quotes(q)
+        if not qs or qs[0] + 1e-6 < ent_floor:
+            return False
+        return all(v + 1e-6 >= clear for v in qs)
+
+    start = float(qty) if qty and qty > 0 else 0.0
+    if start > 0 and clears(start):
+        return start, "ok"
+
+    raw = max(clear / px for px in prices)
+    q = ceil_step(max(start, raw), step)
+    for _ in range(8):
+        qs = quotes(q)
+        if clears(q):
+            if max(qs) > clear + max_over + 1e-6:
+                return None, "below_min_notional"
+            return q, "ok"
+        if qs and min(qs) + 1e-6 >= clear and max(qs) > clear + max_over:
+            return None, "below_min_notional"
+        nxt = ceil_step(q + step, step)
+        if nxt <= q + 1e-15:
+            break
+        q = nxt
+    return None, "below_min_notional"
 
 
 def crossable_base(asks: List[Level], bids: List[Level], threshold: float,
@@ -184,7 +316,22 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     buy_limit, buy_notional = walk_depth(asks, target)
     sell_limit, sell_notional = walk_depth(bids, target)
     if buy_notional < min_notional or sell_notional < min_notional:
-        return None, "below_min_notional"
+        # floor(cap / price) can print $9.96 on a $10 minimum. Ceil onto
+        # the size grid when the book can hold that one step.
+        px = min(asks[0][0], bids[0][0])
+        if px <= 0 or size_step <= 0:
+            return None, "below_min_notional"
+        lifted = ceil_step(min_notional / px, size_step)
+        if lifted < min_base or lifted > q_max + 1e-12:
+            return None, "below_min_notional"
+        step_ntl = size_step * max(asks[0][0], bids[0][0])
+        ceiling = max(cap_notional, min_notional) + max(step_ntl, 0.5)
+        buy_limit, buy_notional = walk_depth(asks, lifted)
+        sell_limit, sell_notional = walk_depth(bids, lifted)
+        if (buy_notional > ceiling + 1e-6 or sell_notional > ceiling + 1e-6
+                or buy_notional < min_notional or sell_notional < min_notional):
+            return None, "below_min_notional"
+        target = lifted
     return ArbPlan(
         qty=target, buy_limit=buy_limit, sell_limit=sell_limit,
         buy_notional=buy_notional, sell_notional=sell_notional,

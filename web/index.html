@@ -343,8 +343,8 @@
       <div class="kv">
         <div><span>中枢</span><b id="card-mid">-1.7</b></div>
         <div><span>带宽</span><b id="card-band">±1.0</b></div>
-        <div><span>单笔</span><b id="card-order">$10</b></div>
-        <div><span>单边上限</span><b id="card-pos">$10</b></div>
+        <div><span>单笔</span><b id="card-order">$11</b></div>
+        <div><span>单边上限</span><b id="card-pos">$11</b></div>
       </div>
       <div class="warn-line" id="card-warn" hidden>会偏离 Decision Card</div>
       <p class="hint" id="fee-line">费率：尚未成交，假设 0.90 bps</p>
@@ -524,12 +524,12 @@
       </div>
       <div class="grid two">
         <div>
-          <label for="f-ord">单笔名义 (USD)</label>
-          <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" max="10" required>
+          <label for="f-ord">单笔名义 (USD, 10.5–20)</label>
+          <input id="f-ord" name="order_notional_usd" type="number" step="0.1" value="11" min="10.5" max="20" required>
         </div>
         <div>
-          <label for="f-cap">单边持仓上限 (USD)</label>
-          <input id="f-cap" name="max_position_usd" type="number" step="1" value="10" min="10" max="10" required>
+          <label for="f-cap">单边持仓上限 (USD, ≤20)</label>
+          <input id="f-cap" name="max_position_usd" type="number" step="0.1" value="11" min="10.5" max="20" required>
         </div>
       </div>
       <div class="modes" role="group" aria-label="模式">
@@ -583,7 +583,7 @@
       <div id="c-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
     </div>
     <p class="hint" id="c-block" hidden></p>
-    <p class="hint">确认会通过实盘引擎同时发送两腿。非 RTH 必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。</p>
+    <p class="hint" id="c-send-hint">确认会通过实盘引擎同时发送两腿。取消则不下单。中枢不会随时段自动改变。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
@@ -610,6 +610,12 @@ function num(v, digits) {
 function usd(v) {
   if (v == null || Number.isNaN(Number(v))) return "—";
   return "$" + Number(v).toFixed(2);
+}
+function usdWhole(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  const text = Math.abs(n - Math.round(n)) < 1e-9 ? n.toFixed(0) : n.toFixed(1);
+  return "$" + text;
 }
 function iso(v) {
   if (v === true) return "逐仓";
@@ -646,8 +652,8 @@ function openCreate(task) {
   $("f-mid").value = t.midline_bps != null ? t.midline_bps : -1.7;
   $("f-up").value = t.upper_bps != null ? t.upper_bps : 1;
   $("f-lo").value = t.lower_bps != null ? t.lower_bps : 1;
-  $("f-ord").value = t.order_notional_usd != null ? t.order_notional_usd : 10;
-  $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 10;
+  $("f-ord").value = t.order_notional_usd != null ? t.order_notional_usd : 11;
+  $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 11;
   formMode = t.mode || "record";
   $("f-confirm").checked = t.manual_confirm !== false;
   $("f-rth").checked = t.rth_only !== false;
@@ -692,6 +698,9 @@ function showConfirm(payload) {
   $("c-accrual-label").textContent = payload.accrual_label || "未到账";
   $("c-mid").textContent = num(payload.midline_bps, 1) + " bps";
   $("c-rth").textContent = payload.rth ? "交易时段 " + (payload.rth_window || "") : "非交易时段";
+  $("c-send-hint").textContent = payload.rth
+    ? "确认会通过实盘引擎同时发送两腿。取消则不下单。中枢不会随时段自动改变。"
+    : "确认会通过实盘引擎同时发送两腿。当前非 RTH，必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。";
   renderLegs(payload.legs);
   const tail = payload.tail_vs_median;
   $("c-tail").hidden = !tail;
@@ -737,8 +746,8 @@ function render(s) {
   if (task) {
     $("card-mid").textContent = num(task.midline_bps, 1);
     $("card-band").textContent = "±" + Number(task.upper_bps).toFixed(1) + " / " + Number(task.lower_bps).toFixed(1);
-    $("card-order").textContent = "$" + Number(task.order_notional_usd).toFixed(0);
-    $("card-pos").textContent = "$" + Number(task.max_position_usd).toFixed(0);
+    $("card-order").textContent = usdWhole(task.order_notional_usd);
+    $("card-pos").textContent = usdWhole(task.max_position_usd);
     $("card-empty").hidden = true;
     $("card-warn").hidden = !(task.warnings && task.warnings.length);
   } else {
@@ -868,16 +877,30 @@ for (const id of ["mode-record", "mode-live"]) {
     applyModeButtons();
   });
 }
+$("f-ord").addEventListener("input", () => {
+  const order = Number($("f-ord").value);
+  if (Number.isFinite(order)) $("f-cap").min = String(Math.max(10.5, order));
+});
 $("create-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  const orderUsd = Number($("f-ord").value);
+  const posUsd = Number($("f-cap").value);
+  if (!(orderUsd >= 10.5 && orderUsd <= 20)) {
+    alert("单笔名义须在 10.5–20");
+    return;
+  }
+  if (!(posUsd >= orderUsd && posUsd <= 20)) {
+    alert("单边上限须覆盖单笔，且不超过 20");
+    return;
+  }
   $("create-save").disabled = true;
   try {
     await post("/api/task", {
       midline_bps: Number($("f-mid").value),
       upper_bps: Number($("f-up").value),
       lower_bps: Number($("f-lo").value),
-      order_notional_usd: Number($("f-ord").value),
-      max_position_usd: Number($("f-cap").value),
+      order_notional_usd: orderUsd,
+      max_position_usd: posUsd,
       mode: formMode,
       manual_confirm: $("f-confirm").checked,
       rth_only: $("f-rth").checked,

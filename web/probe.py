@@ -17,8 +17,13 @@ from tools.analyze import assign_session
 DECISION_MIDLINE_BPS = -1.7
 DECISION_UPPER_BPS = 1.0
 DECISION_LOWER_BPS = 1.0
-DECISION_ORDER_USD = 10.0
-DECISION_POSITION_USD = 10.0
+# Probe orders default to $11 and may sit anywhere in $10.50–$20.
+# $10.00 floors through szDecimals and Hyperliquid rejects the leg.
+DECISION_ORDER_USD = 11.0
+DECISION_POSITION_USD = 11.0
+MIN_ORDER_USD = 10.5
+MAX_ORDER_USD = 20.0
+MAX_POSITION_USD = 20.0
 ENTROPY_FEE_BPS = 0.9
 LIGHTER_FEE_BPS = 0.0
 SYMBOL = "SNDK"
@@ -26,7 +31,6 @@ ENTROPY_DEX = "io"
 HEDGE = "lighter"
 REFERRAL_MODE = "self_t2"
 PERSIST_SEC = 3.0
-MIN_ORDER_USD = 10.0
 
 # Gross Tier2-self accrual on the 0.9 bps fee. Not cash. Not added to net edge.
 # 0.9 * 0.50 * 1.20 = 0.54 bps. Rounded so the confirm card shows 0.54.
@@ -134,14 +138,14 @@ def normalize_task(body: Optional[dict]) -> dict:
         "max_position_usd")
     if spec["upper_bps"] <= 0 or spec["lower_bps"] <= 0:
         raise ValueError("upper_bps and lower_bps must be > 0")
-    if spec["order_notional_usd"] < MIN_ORDER_USD:
+    if spec["order_notional_usd"] < MIN_ORDER_USD - 1e-9:
         raise ValueError(
-            f"order_notional_usd must be >= {MIN_ORDER_USD:.0f}")
-    if spec["order_notional_usd"] - DECISION_ORDER_USD > 1e-9:
-        raise ValueError("order_notional_usd cap is $10")
-    if spec["max_position_usd"] - DECISION_POSITION_USD > 1e-9:
-        raise ValueError("max_position_usd cap is $10")
-    if spec["max_position_usd"] < spec["order_notional_usd"]:
+            f"order_notional_usd must be >= {MIN_ORDER_USD}")
+    if spec["order_notional_usd"] - MAX_ORDER_USD > 1e-9:
+        raise ValueError(f"order_notional_usd cap is ${MAX_ORDER_USD:.0f}")
+    if spec["max_position_usd"] - MAX_POSITION_USD > 1e-9:
+        raise ValueError(f"max_position_usd cap is ${MAX_POSITION_USD:.0f}")
+    if spec["max_position_usd"] + 1e-9 < spec["order_notional_usd"]:
         raise ValueError("max_position_usd must cover one order")
     mode = str(raw.get("mode", spec["mode"]) or "").strip().lower()
     if mode not in ("record", "live"):

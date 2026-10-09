@@ -61,8 +61,8 @@ class TaskIn(BaseModel):
     midline_bps: float = -1.7
     upper_bps: float = 1.0
     lower_bps: float = 1.0
-    order_notional_usd: float = 10.0
-    max_position_usd: float = 10.0
+    order_notional_usd: float = 11.0
+    max_position_usd: float = 11.0
     mode: str = "record"
     manual_confirm: bool = True
     rth_only: bool = True

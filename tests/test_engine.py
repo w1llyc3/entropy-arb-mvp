@@ -195,6 +195,69 @@ def test_execute_confirmed_requires_id_and_halts_on_single_leg(tmp_path):
     asyncio.run(go())
 
 
+def test_confirmed_ceil_clears_min_notional_on_both_legs(tmp_path):
+    """$11 probe at the incident price must not wire a sub-$10 Entropy leg."""
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.cfg.trades_csv = str(tmp_path / "trades.csv")
+    px = 1632.7868852459016
+    eng.entropy.set_book(px * 1.002, px * 1.0022, sz=5)
+    eng.hedge.set_book(px * 0.999, px, sz=5)
+    eng.entropy.size_decimals = 4
+    eng.hedge.size_decimals = 4
+    eng._step = 1e-4
+    seen = []
+
+    async def leg(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append((is_buy, qty, limit_px))
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False}
+
+    eng.hedge.send_taker = leg
+    eng.entropy.send_taker = leg
+
+    async def go():
+        result = await eng.execute_confirmed(
+            direction="sell_entropy", confirm_id="ceil", cap_notional=11)
+        assert result["sent"] is True
+        assert len(seen) == 2
+        for _is_buy, qty, limit_px in seen:
+            assert qty * limit_px + 1e-6 >= 11.0
+            assert qty * limit_px > 10.0
+            assert abs(qty - round(qty, 4)) < 1e-12
+
+    asyncio.run(go())
+
+
+def test_entropy_under_min_does_not_send_lighter(tmp_path):
+    eng = make_engine(midline=5.0, upper=4.0, lower=3.0)
+    eng.cfg.trades_csv = str(tmp_path / "trades.csv")
+    eng.entropy.set_book(101.0, 101.2, sz=50)
+    eng.hedge.set_book(100.0, 100.1, sz=50)
+    # Entropy szDecimals 0 truncates a ~0.11 size to 0. The only size that
+    # clears $10 is 1 coin (~$100), which is not a $11 probe.
+    eng.entropy.size_decimals = 0
+    eng._step = 1e-4
+    calls = {"n": 0}
+
+    async def leg(*, is_buy, qty, limit_px, reduce_only=False):
+        calls["n"] += 1
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False}
+
+    eng.hedge.send_taker = leg
+    eng.entropy.send_taker = leg
+
+    async def go():
+        result = await eng.execute_confirmed(
+            direction="sell_entropy", confirm_id="skip", cap_notional=11)
+        assert result["sent"] is False
+        assert result["routed"] is False
+        assert result["error"] == "below_min_notional"
+        assert calls["n"] == 0
+
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
