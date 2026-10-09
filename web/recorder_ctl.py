@@ -190,10 +190,20 @@ class RecorderControl:
 
     def _signal(self, pid: int, sig: int) -> None:
         try:
-            os.killpg(pid, sig)
+            # Windows has no process groups. killpg is missing entirely.
+            if sys.platform == "win32":
+                os.kill(pid, sig)
+            else:
+                os.killpg(pid, sig)
         except ProcessLookupError:
             return
         except PermissionError:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+        except AttributeError:
+            # os.killpg absent (Windows, or a POSIX build without it).
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
@@ -210,7 +220,14 @@ class RecorderControl:
             if not self._pid_exists(pid):
                 return
             time.sleep(0.05)
-        self._signal(pid, signal.SIGKILL)
+        if sys.platform == "win32":
+            # signal.SIGKILL does not exist on Windows. Kill the tree.
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+            )
+        else:
+            self._signal(pid, signal.SIGKILL)
         deadline = time.time() + 2.0
         while time.time() < deadline:
             self._reap(pid)
