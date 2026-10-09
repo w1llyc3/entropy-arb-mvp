@@ -4,7 +4,7 @@ Binds nowhere by itself. ``python3 -m web`` listens on 127.0.0.1 only.
 Secrets stay in the server ``.env`` and are scrubbed from every response.
 Starting the panel does not arm live trading. Confirm admits an id and then
 calls ``Engine.execute_confirmed``. Outside US RTH that send waits for a
-second 「强制确认」.
+second 「强制确认」. Arming outside US RTH waits for a second 「强制启动」.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -35,6 +35,7 @@ class StartIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     symbol: str = "SNDK"
     hedge: str = "lighter"
+    force_start_outside_rth: bool = False
 
 
 def normalize_symbol(value: str) -> str:
@@ -146,9 +147,15 @@ def create_app(root: Optional[Path] = None, command_builder=None,
         return info
 
     @app.post("/api/session/start")
-    def session_start() -> dict:
+    def session_start(body: Optional[StartIn] = Body(default=None)) -> dict:
+        """Start the saved task. An empty body is a normal start.
+
+        ``force_start_outside_rth`` is the only field this route reads.
+        Symbol and hedge stay on the saved task. Record mode ignores the flag.
+        """
+        force = bool(body.force_start_outside_rth) if body is not None else False
         try:
-            return session.start()
+            return session.start(force_start_outside_rth=force)
         except ProbeError as exc:
             _probe(exc)
 

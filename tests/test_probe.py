@@ -18,9 +18,9 @@ from web.accounts import read_accounts, scrub  # noqa: E402
 from web.live_exec import execute_admitted  # noqa: E402
 from web.probe import (  # noqa: E402
     ACCRUAL_BPS, ACCRUAL_LABEL, CONFIRM_FIELDS, DECISION_WARNING,
-    FORCE_RISK_LINE, build_confirm_payload, confirm_field_errors,
-    decision_warnings, in_us_rth, leg_plan, normalize_task,
-    session_snapshot,
+    FORCE_RISK_LINE, SESSION_MIDLINE_BPS, build_confirm_payload,
+    confirm_field_errors, decision_warnings, in_us_rth, leg_plan,
+    normalize_task, session_snapshot,
 )
 from web.recorder_ctl import RecorderControl  # noqa: E402
 from web.session import ProbeError, ProbeSession  # noqa: E402
@@ -285,20 +285,160 @@ def test_default_start_argv_is_record_only(tmp_path, monkeypatch):
     assert "LIVE" not in joined
 
 
-def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
-    sess = _session(tmp_path, OUTSIDE)
-    sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
-    with pytest.raises(ProbeError) as raised:
-        sess.start()
-    assert raised.value.status_code == 409
-    assert "RTH" in str(raised.value)
-
+def test_live_arm_requires_manual_confirm(tmp_path):
     off = _session(tmp_path / "off", INSIDE)
     off.save_task({"mode": "live", "manual_confirm": False, "rth_only": True})
     with pytest.raises(ProbeError) as raised:
         off.start()
     assert DECISION_WARNING in str(raised.value)
     assert raised.value.status_code == 409
+
+    # Outside RTH does not waive the manual-confirm requirement.
+    outside = _session(tmp_path / "out", OUTSIDE)
+    outside.save_task({"mode": "live", "manual_confirm": False, "rth_only": True})
+    with pytest.raises(ProbeError) as raised:
+        outside.start(force_start_outside_rth=True)
+    assert raised.value.status_code == 409
+    assert DECISION_WARNING in str(raised.value)
+
+
+def _fake_spawn(sess, monkeypatch):
+    spawned = []
+
+    def fake_start(symbol, hedge):
+        argv = list(sess.record_argv(symbol, hedge))
+        spawned.append(argv)
+        return {"pid": 4242, "argv": argv, "symbol": symbol, "hedge": hedge,
+                "running": True}
+
+    monkeypatch.setattr(sess.ctl, "start", fake_start)
+    return spawned
+
+
+def test_outside_rth_start_needs_force_then_arms(tmp_path, monkeypatch):
+    assert SESSION_MIDLINE_BPS == {
+        "us_regular": -1.7,
+        "us_post_overnight": 2.6,
+        "asia": -0.4,
+    }
+    sess = _session(tmp_path, OUTSIDE)
+    sess.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7,
+    })
+    spawned = _fake_spawn(sess, monkeypatch)
+    first = sess.start()
+    assert first["ok"] is False
+    assert first["needs_force_start"] is True
+    assert first["running"] is False
+    assert first["live_armed"] is False
+    assert first["gap"] == "非 RTH：需要第二次点击强制启动才会武装"
+    card = first["force_card"]
+    snap = session_snapshot(datetime.fromtimestamp(OUTSIDE, UTC), -1.7)
+    assert card == snap
+    assert card["name"] == "us_post_overnight"
+    assert card["midline_bps"] == 2.6
+    assert card["task_midline_bps"] == -1.7
+    assert card["deviation_text"] == "偏离约 4 bps"
+    assert card["risk_line"] == "带宽 1 bps，错中枢风险大于费率缺口"
+    assert sess.task()["live_armed"] is False
+    assert sess.task()["force_start_ack"] is True
+    assert spawned == []
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force-ack-start" in log
+    assert "force_start_outside_rth=true" not in log
+
+    jumped = _session(tmp_path / "jump", OUTSIDE)
+    jumped.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+    })
+    jumped_spawned = _fake_spawn(jumped, monkeypatch)
+    with pytest.raises(ProbeError) as raised:
+        jumped.start(force_start_outside_rth=True)
+    assert raised.value.status_code == 409
+    assert "强制启动" in str(raised.value)
+    assert jumped.task()["live_armed"] is False
+    assert jumped_spawned == []
+
+    second = sess.start(force_start_outside_rth=True)
+    assert second["ok"] is True
+    assert second["needs_force_start"] is False
+    assert second["running"] is True
+    assert second["live_armed"] is True
+    assert second["force_start_outside_rth"] is True
+    assert second["record_only"] is True
+    assert "--record-only" in second["argv"]
+    assert sess.task()["live_armed"] is True
+    assert sess.task().get("force_start_ack") is None
+    assert len(spawned) == 1
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force_start_outside_rth=true" in log
+    sess.stop()
+    assert sess.task()["live_armed"] is False
+
+
+def test_inside_rth_start_arms_once_and_record_skips_force(tmp_path, monkeypatch):
+    inside = _session(tmp_path / "in", INSIDE)
+    inside.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7,
+    })
+    spawned = _fake_spawn(inside, monkeypatch)
+    info = inside.start()
+    assert info["needs_force_start"] is False
+    assert info["live_armed"] is True
+    assert info["running"] is True
+    assert info["force_start_outside_rth"] is False
+    assert len(spawned) == 1
+    log_text = (inside.log_path.read_text(encoding="utf-8")
+                if inside.log_path.is_file() else "")
+    assert "force-ack-start" not in log_text
+    snap = session_snapshot(datetime.fromtimestamp(INSIDE, UTC), -1.7)
+    assert snap["name"] == "us_regular"
+    assert snap["midline_bps"] == -1.7
+
+    # The force flag is not required inside RTH, and a lone force call arms.
+    direct = _session(tmp_path / "direct", INSIDE)
+    direct.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+    })
+    direct_spawned = _fake_spawn(direct, monkeypatch)
+    armed = direct.start(force_start_outside_rth=True)
+    assert armed["live_armed"] is True
+    assert armed["needs_force_start"] is False
+    assert armed["force_start_outside_rth"] is False
+    assert len(direct_spawned) == 1
+
+    # rth_only off: one start arms outside the cash session.
+    open_window = _session(tmp_path / "open", OUTSIDE)
+    open_window.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": False,
+    })
+    open_spawned = _fake_spawn(open_window, monkeypatch)
+    opened = open_window.start()
+    assert opened["live_armed"] is True
+    assert opened["needs_force_start"] is False
+    assert len(open_spawned) == 1
+
+    record = _session(tmp_path / "rec", OUTSIDE)
+    record.save_task({"mode": "record", "rth_only": True})
+    record_spawned = _fake_spawn(record, monkeypatch)
+    recorded = record.start()
+    assert recorded["live_armed"] is False
+    assert recorded["needs_force_start"] is False
+    assert recorded["running"] is True
+    assert record.task().get("force_start_ack") is None
+    assert len(record_spawned) == 1
+
+    bare = _session(tmp_path / "bare", OUTSIDE, env=False)
+    bare.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    bare_spawned = _fake_spawn(bare, monkeypatch)
+    with pytest.raises(ProbeError) as raised:
+        bare.start()
+    assert raised.value.status_code == 409
+    assert "密钥" in str(raised.value)
+    assert bare.task().get("force_start_ack") is not True
+    assert bare_spawned == []
 
 
 def test_missing_env_refuses_live_and_confirm(tmp_path):
@@ -700,3 +840,98 @@ def test_pause_resume_and_reconcile_do_not_route(tmp_path):
         status = client.get("/api/status").json()
         assert status["running"] is False
         assert status["status_label"] == "已停止"
+
+
+def test_http_outside_rth_start_force_and_inside_single_start(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    def _sleep(symbol, hedge):
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    clock = {"t": OUTSIDE}
+    _write_env(tmp_path / "out")
+    app = create_app(tmp_path / "out", command_builder=_sleep,
+                     now=lambda: clock["t"])
+    task = {
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
+        "order_notional_usd": 10, "max_position_usd": 10,
+    }
+    with TestClient(app) as client:
+        assert client.post("/api/task", json=task).status_code == 200
+        first = client.post("/api/session/start")
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert body["needs_force_start"] is True
+        assert body["ok"] is False
+        assert body["live_armed"] is False
+        assert body["running"] is False
+        assert body["force_card"]["midline_bps"] == 2.6
+        assert body["force_card"]["task_midline_bps"] == -1.7
+        assert body["force_card"]["risk_line"] == FORCE_RISK_LINE
+        status = client.get("/api/status").json()
+        assert status["running"] is False
+        assert status["live_armed"] is False
+        again = client.post("/api/session/start",
+                            json={"force_start_outside_rth": False})
+        assert again.status_code == 200
+        assert again.json()["needs_force_start"] is True
+        assert again.json()["live_armed"] is False
+        second = client.post("/api/session/start",
+                             json={"force_start_outside_rth": True})
+        assert second.status_code == 200, second.text
+        assert second.json()["live_armed"] is True
+        assert second.json()["force_start_outside_rth"] is True
+        armed = client.get("/api/status").json()
+        assert armed["live_armed"] is True
+        assert armed["running"] is True
+        busy = client.post("/api/session/start",
+                           json={"force_start_outside_rth": True})
+        assert busy.status_code == 409
+        stopped = client.post("/api/stop")
+        assert stopped.status_code == 200
+        assert stopped.json()["live_armed"] is False
+
+    _write_env(tmp_path / "jump")
+    jump = create_app(tmp_path / "jump", command_builder=_sleep,
+                      now=lambda: OUTSIDE)
+    with TestClient(jump) as client:
+        assert client.post("/api/task", json=task).status_code == 200
+        denied = client.post("/api/session/start",
+                             json={"force_start_outside_rth": True})
+        assert denied.status_code == 409
+        assert "强制启动" in denied.json()["detail"]
+
+    _write_env(tmp_path / "in")
+    inside = create_app(tmp_path / "in", command_builder=_sleep,
+                        now=lambda: INSIDE)
+    with TestClient(inside) as client:
+        assert client.post("/api/task", json=task).status_code == 200
+        started = client.post("/api/session/start", json={})
+        assert started.status_code == 200, started.text
+        assert started.json()["live_armed"] is True
+        assert started.json()["needs_force_start"] is False
+        client.post("/api/stop")
+
+    record = create_app(tmp_path / "rec", command_builder=_sleep,
+                        now=lambda: OUTSIDE)
+    with TestClient(record) as client:
+        assert client.post("/api/task", json={"mode": "record"}).status_code == 200
+        started = client.post("/api/session/start")
+        assert started.status_code == 200, started.text
+        assert started.json()["live_armed"] is False
+        assert started.json()["needs_force_start"] is False
+        assert started.json()["running"] is True
+        client.post("/api/stop")
+
+
+def test_index_start_reuses_force_card_copy():
+    html = (Path(__file__).resolve().parents[1] / "web" / "index.html").read_text(
+        encoding="utf-8")
+    assert "force_start_outside_rth" in html
+    assert "needs_force_start" in html
+    assert "强制启动" in html
+    assert "us_regular -1.7 / us_post_overnight +2.6 / asia -0.4" in html
+    assert "带宽 1 bps，错中枢风险大于费率缺口" in html

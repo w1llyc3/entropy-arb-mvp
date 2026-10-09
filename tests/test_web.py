@@ -453,6 +453,51 @@ def test_http_analyze_shows_labeled_gates(tmp_path):
     assert body["depth_ok_frac_text"] == "0.7500"
 
 
+def test_windows_reap_skips_wnohang_and_terminate_uses_taskkill(tmp_path, monkeypatch):
+    import subprocess
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("waitpid")
+
+    monkeypatch.setattr(rc.os, "waitpid", boom)
+    rc.RecorderControl._reap(99)
+
+    ctl = rc.RecorderControl(tmp_path)
+    killed = []
+    monkeypatch.setattr(rc.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    def no_group(*_args, **_kwargs):
+        raise AssertionError("killpg")
+
+    monkeypatch.setattr(rc.os, "killpg", no_group, raising=False)
+    ctl._signal(7, 15)
+    assert killed == [(7, 15)]
+
+    monkeypatch.setattr(ctl, "_pid_exists", lambda pid: True)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(rc.time, "time", lambda: clock["t"])
+
+    def advance(dt):
+        clock["t"] += dt
+
+    monkeypatch.setattr(rc.time, "sleep", advance)
+    seen = []
+
+    def fake_run(cmd, **_kwargs):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    ctl._terminate(4321)
+    assert ["taskkill", "/PID", "4321", "/T"] in seen
+    assert ["taskkill", "/PID", "4321", "/T", "/F"] in seen
+    assert killed == [(7, 15)]
+    assert not any(cmd[:1] == ["kill"] or "SIGKILL" in cmd for cmd in seen)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock path")
 def test_panel_lock_flocks_on_posix(tmp_path, monkeypatch):
     import web.recorder_ctl as rc

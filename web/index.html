@@ -373,6 +373,13 @@
         </div>
       </div>
       <div id="run-warn" class="banner" hidden></div>
+      <div class="warn-line" id="start-force" hidden>
+        <div id="start-force-gap"></div>
+        <div id="start-force-session"></div>
+        <div id="start-force-map">us_regular -1.7 / us_post_overnight +2.6 / asia -0.4</div>
+        <div id="start-force-task"></div>
+        <div id="start-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
+      </div>
       <p class="hint" id="order-line">尚无确认订单</p>
       <div class="track-wrap">
         <div class="track-label">
@@ -538,7 +545,7 @@
       </div>
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
-        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
+        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 直接武装；非 RTH 需强制启动（America/New_York 09:30–16:00，周一至周五）</label>
       </div>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
@@ -597,6 +604,9 @@ let lastProposalId = null;
 let lastPayload = null;
 let formMode = "record";
 let seenConfirm = false;
+let startNeedsForce = false;
+let startForceCard = null;
+let startForceGap = "";
 
 function dash(v) {
   return v == null || v === "" ? "—" : String(v);
@@ -678,6 +688,32 @@ function renderLegs(legs) {
   }
 }
 
+function forceCardText(card) {
+  const c = card || {};
+  return {
+    session: "当前时段 " + (c.name || "—") + " · 该时段实测中枢 " +
+      (c.midline_bps == null ? "—" : Number(c.midline_bps).toFixed(1)) + " bps",
+    task: "任务中枢 " + (c.task_midline_bps == null ? "—" : Number(c.task_midline_bps).toFixed(1)) +
+      " bps · " + (c.deviation_text || ""),
+    line: c.risk_line || "带宽 1 bps，错中枢风险大于费率缺口",
+  };
+}
+
+function paintStartForce() {
+  const node = $("start-force");
+  if (!startNeedsForce) {
+    node.hidden = true;
+    return;
+  }
+  const text = forceCardText(startForceCard);
+  node.hidden = false;
+  $("start-force-gap").textContent = startForceGap
+    || "非 RTH：需要第二次点击强制启动才会武装";
+  $("start-force-session").textContent = text.session;
+  $("start-force-task").textContent = text.task;
+  $("start-force-line").textContent = text.line;
+}
+
 function showConfirm(payload) {
   if (!payload) {
     $("confirm-modal").hidden = true;
@@ -700,13 +736,10 @@ function showConfirm(payload) {
   const card = payload.force_card || {};
   $("c-force").hidden = !force;
   if (force) {
-    $("c-force-session").textContent =
-      "当前时段 " + (card.name || "—") + " · 该时段实测中枢 " +
-      (card.midline_bps == null ? "—" : Number(card.midline_bps).toFixed(1)) + " bps";
-    $("c-force-task").textContent =
-      "任务中枢 " + (card.task_midline_bps == null ? "—" : Number(card.task_midline_bps).toFixed(1)) +
-      " bps · " + (card.deviation_text || "");
-    $("c-force-line").textContent = card.risk_line || "带宽 1 bps，错中枢风险大于费率缺口";
+    const text = forceCardText(card);
+    $("c-force-session").textContent = text.session;
+    $("c-force-task").textContent = text.task;
+    $("c-force-line").textContent = text.line;
   }
   const enabled = !!payload.confirm_enabled;
   $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : "确认";
@@ -823,7 +856,10 @@ function render(s) {
     ? ("最近确认 " + dash(last.confirm_id) + " · "
       + (last.sent ? "已发送" : "未发送") + " · " + dash(last.status || last.error))
     : "尚无确认订单";
+  if (s.running && !s.paused) startNeedsForce = false;
+  $("btn-start").textContent = startNeedsForce ? "强制启动" : "启动";
   $("btn-start").disabled = !!s.running && !s.paused;
+  paintStartForce();
   $("btn-pause").disabled = !s.running || !!s.paused;
   $("btn-stop").disabled = !s.running && !s.pid;
   showConfirm(s.proposal || null);
@@ -901,11 +937,29 @@ $("clear-task").addEventListener("click", async () => {
 });
 
 $("btn-start").addEventListener("click", async () => {
+  const forcing = startNeedsForce;
   $("btn-start").disabled = true;
   try {
-    await post("/api/session/start");
+    const result = await post("/api/session/start", {
+      force_start_outside_rth: forcing,
+    });
+    if (result && result.needs_force_start) {
+      startNeedsForce = true;
+      startForceCard = result.force_card || null;
+      startForceGap = result.gap || "";
+      await refresh();
+      return;
+    }
+    startNeedsForce = false;
+    startForceCard = null;
+    startForceGap = "";
   } catch (err) {
     alert(err.message);
+    if (forcing) {
+      $("btn-start").textContent = "强制启动";
+      $("btn-start").disabled = false;
+      paintStartForce();
+    }
   }
   await refresh();
 });
