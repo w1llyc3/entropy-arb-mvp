@@ -286,6 +286,48 @@ def qualifying_direction(spec: dict, sell_pre: Optional[float],
     }
 
 
+def _money_token(value: Optional[float]) -> str:
+    """Compact USD token for gate text. ``None`` is ``missing``, ``0`` is ``$0``."""
+    if value is None:
+        return "missing"
+    number = float(value)
+    if abs(number - round(number)) < 1e-6:
+        return f"${int(round(number))}"
+    return f"${number:.2f}"
+
+
+def _parse_available(raw: object) -> Optional[float]:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def available_shortfall(accounts: Optional[dict], order_usd: float) -> Optional[str]:
+    """English reason when either venue cannot fund the order, else None.
+
+    A missing available is treated as too small. Equality with the order
+    notional is enough. The text is the block fragment
+    ``entropy available $0 < $10``.
+    """
+    accounts = accounts or {}
+    try:
+        need = float(order_usd)
+    except (TypeError, ValueError):
+        need = DECISION_ORDER_USD
+    bits = []
+    need_token = _money_token(need)
+    for key in ("entropy", "lighter"):
+        avail = _parse_available((accounts.get(key) or {}).get("available"))
+        if avail is None or avail < need - 1e-9:
+            bits.append(f"{key} available {_money_token(avail)} < {need_token}")
+    if not bits:
+        return None
+    return "; ".join(bits)
+
+
 def leg_plan(direction: str, notional: float, accounts: Optional[dict]) -> list:
     """Per-leg direction, notional, available, isolated. Secrets never appear."""
     accounts = accounts or {}

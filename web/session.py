@@ -3,7 +3,10 @@
 Arming 探针实盘 never builds a live ``main.py`` command. The subprocess, when
 one is started, is record-only. A confirm admits an id and only then calls
 ``Engine.execute_confirmed`` (see ``web.live_exec``). Outside US RTH the
-first click does not send; a second 「强制确认」 is required.
+first click does not send; a second 「强制确认」 is required. Starting live
+with the RTH window on, outside that window, is the same two-step shape:
+the first 启动 returns a force card, and 「强制启动」 arms. A venue whose
+available balance is missing or below the order notional cannot be confirmed.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from web.probe import (
     RTH_WINDOW,
     STATUS_HALT,
     SYMBOL,
+    available_shortfall,
     books_fresh,
     build_confirm_payload,
     confirm_field_errors,
@@ -173,6 +177,30 @@ class ProbeSession:
             return "HALT：账户净敞口不为 0，拒绝新开仓"
         return None
 
+    def _available_block(self, spec: dict, *, force: bool = False) -> Optional[str]:
+        """Refuse a one-leg send when either venue cannot fund the order."""
+        try:
+            order_usd = float(spec["order_notional_usd"])
+        except (KeyError, TypeError, ValueError):
+            order_usd = 10.0
+        detail = available_shortfall(self._accounts(force=force), order_usd)
+        if not detail:
+            return None
+        return "可用余额低于订单名义，拒绝确认：" + detail
+
+    def _confirm_block(self, spec: dict, *, force_accounts: bool = False
+                       ) -> Optional[str]:
+        parts = []
+        base = self._block_reason()
+        if base:
+            parts.append(base)
+        avail = self._available_block(spec, force=force_accounts)
+        if avail:
+            parts.append(avail)
+        if not parts:
+            return None
+        return "；".join(parts)
+
     def _clock(self) -> datetime:
         return datetime.fromtimestamp(float(self.now()), timezone.utc)
 
@@ -301,11 +329,48 @@ class ProbeSession:
             return info
         return self.ctl.start(symbol, hedge)
 
-    def start(self) -> dict:
+    def _outside_live_gate(self, spec: dict) -> bool:
+        """Live arm with the RTH window on, while the clock is outside it."""
+        return (spec.get("mode") == "live"
+                and bool(spec.get("rth_only", True))
+                and not self.rth_now())
+
+    def _hold_outside_start(self, spec: dict, force: bool) -> Optional[dict]:
+        """First 启动 outside RTH warns. The second call, after that ack, arms.
+
+        Inside RTH, or with the RTH window off, this returns None and drops
+        a stale ack. Record mode never reaches here.
+        """
+        if not self._outside_live_gate(spec):
+            if spec.get("force_start_ack"):
+                spec["force_start_ack"] = False
+                self._write_json(self.task_path, spec)
+            return None
+        if not force:
+            spec["force_start_ack"] = True
+            spec["live_armed"] = False
+            self._write_json(self.task_path, spec)
+            self._log("force-ack-start")
+            card = session_snapshot(self._clock(), float(spec["midline_bps"]))
+            return {
+                "ok": False,
+                "needs_force_start": True,
+                "running": False,
+                "live_armed": False,
+                "force_card": card,
+                "force_start_outside_rth": False,
+                "gap": "非 RTH：需要第二次点击强制启动才会武装",
+            }
+        if not spec.get("force_start_ack"):
+            raise ProbeError("强制启动需要先确认风险提示", status_code=409)
+        return None
+
+    def start(self, force_start_outside_rth: bool = False) -> dict:
         """启动. Record mode collects. Live mode arms the queue and still records.
 
-        A paused process is continued. Live arm is refused outside RTH when
-        the RTH window is on, and refused when manual confirm is off.
+        A paused process is continued. Live arm is refused when manual
+        confirm is off. Outside RTH, with the RTH window on, the first call
+        returns a force card and does not spawn; 「强制启动」 arms.
         """
         spec = self._load_task()
         proc = self.ctl.snapshot()
@@ -317,33 +382,40 @@ class ProbeSession:
             return {"resumed": True, "live_armed": bool(spec.get("live_armed"))}
         if proc.get("running"):
             raise ProbeError("probe is already running", status_code=409)
+        forced = False
         if spec.get("mode") == "live":
             if not spec.get("manual_confirm"):
                 raise ProbeError(
                     DECISION_WARNING + "；拒绝无人值守实盘（需要人工确认）",
-                    status_code=409)
-            if spec.get("rth_only", True) and not self.rth_now():
-                raise ProbeError(
-                    "非美股 RTH（America/New_York 09:30–16:00），禁止武装探针实盘",
                     status_code=409)
             missing = self._creds_missing()
             if missing:
                 raise ProbeError(
                     "实盘密钥不完整，拒绝 LIVE：" + ", ".join(missing),
                     status_code=409)
+            held = self._hold_outside_start(spec, bool(force_start_outside_rth))
+            if held is not None:
+                return held
+            forced = self._outside_live_gate(spec) and bool(force_start_outside_rth)
         try:
             info = self._spawn(spec)
         except RecorderError as exc:
             raise ProbeError(str(exc), status_code=exc.status_code)
+        spec.pop("force_start_ack", None)
         armed = spec.get("mode") == "live"
         self._mark_armed(spec, armed)
+        if forced:
+            self._log("force_start_outside_rth=true")
         return {
+            "ok": True,
+            "needs_force_start": False,
             "running": True,
             "live_armed": armed,
             "mode": spec.get("mode"),
             "pid": info.get("pid"),
             "argv": info.get("argv"),
             "record_only": True,
+            "force_start_outside_rth": forced,
         }
 
     def pause(self) -> dict:
@@ -457,8 +529,9 @@ class ProbeSession:
     def refresh_proposal(self, latest: Optional[dict]) -> Optional[dict]:
         """Open a confirm card when the live probe sees a qualifying net edge.
 
-        Record mode never proposes. Outside RTH the card can still be shown
-        with confirm disabled; ``admit_confirm`` refuses it.
+        Record mode never proposes. Outside RTH the card can still be shown.
+        ``admit_confirm`` refuses it until 「强制确认」, and also refuses when
+        either venue available is missing or below the order notional.
         """
         spec = self.task()
         queue = self.queue()
@@ -505,12 +578,22 @@ class ProbeSession:
         if not spec or not pending:
             return None
         rth = self.rth_now()
+        accounts = self._accounts()
+        order_usd = float(spec["order_notional_usd"])
+        pending["legs"] = leg_plan(pending["direction"], order_usd, accounts)
+        queue = self.queue()
+        stored = queue.get("pending")
+        if stored and stored.get("proposal_id") == pending.get("proposal_id"):
+            stored["legs"] = pending["legs"]
+            self._save_queue(queue)
         payload = build_confirm_payload(
             spec, pending, rth=rth, tail=pending.get("tail_vs_median"))
         snap = session_snapshot(self._clock(), float(spec["midline_bps"]))
-        block = self._block_reason()
-        # Outside RTH the card stays clickable. The first click only
-        # acknowledges the force card; the order waits for 「强制确认」.
+        block = self._confirm_block(spec)
+        # Outside RTH the card stays clickable unless a hard block is set
+        # (halt, creds, or a venue available below the order). The first
+        # click only acknowledges the force card; the order waits for
+        # 「强制确认」.
         payload["confirm_enabled"] = block is None and bool(spec.get("manual_confirm"))
         payload["block_reason"] = block
         payload["rth_only"] = bool(spec.get("rth_only", True))
@@ -576,7 +659,7 @@ class ProbeSession:
         proc = self.ctl.snapshot()
         if proc.get("paused"):
             raise ProbeError("confirm refused while paused", status_code=409)
-        block = self._block_reason()
+        block = self._confirm_block(spec, force_accounts=True)
         if block:
             self._log("confirm refused: " + block)
             raise ProbeError(block, status_code=409)
@@ -814,7 +897,8 @@ class ProbeSession:
         out["gaps"] = [
             "启动探针实盘仍只拉起 --record-only 记录进程。下单只发生在已承认的确认单上，并走 Engine.execute_confirmed。",
             "非美股 RTH 不禁用确认，但必须先看强制确认卡，再点「强制确认」才会发单。",
-            "默认仍建议仅美国 RTH 启动。中枢不会按时段自动切换。",
+            "默认仍建议仅美国 RTH 启动。非 RTH 武装需要先看风险提示，再点「强制启动」。中枢不会按时段自动切换。",
+            "任一侧可用余额为空或低于订单名义时，确认关闭，避免只发出一条腿。",
             "对账只记一条请求，不会做链上持仓同步。",
             "RTH 为美东周一至周五 09:30–16:00，不含交易所假日。",
             "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓。",

@@ -274,6 +274,9 @@
     .legs { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
     .legs th { text-align: left; color: var(--faint); font-weight: 500; padding: 6px 4px; }
     .legs td { padding: 6px 4px; border-top: 1px solid var(--line-2); }
+    .legs tr.short { background: var(--red-dim); }
+    .legs tr.short td { color: var(--red); }
+    .hint.bad { color: var(--red); }
     .accrual {
       margin-top: 8px;
       padding: 8px 10px;
@@ -373,6 +376,13 @@
         </div>
       </div>
       <div id="run-warn" class="banner" hidden></div>
+      <div class="warn-line" id="start-force" hidden>
+        <div id="start-force-session"></div>
+        <div>us_regular -1.7 / us_post_overnight +2.6 / asia -0.4</div>
+        <div id="start-force-task"></div>
+        <div id="start-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
+        <div id="start-force-gap"></div>
+      </div>
       <p class="hint" id="order-line">尚无确认订单</p>
       <div class="track-wrap">
         <div class="track-label">
@@ -538,7 +548,7 @@
       </div>
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
-        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
+        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 直接武装；非 RTH 需强制启动（America/New_York 09:30–16:00，周一至周五）</label>
       </div>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
@@ -583,7 +593,7 @@
       <div id="c-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
     </div>
     <p class="hint" id="c-block" hidden></p>
-    <p class="hint">确认会通过实盘引擎同时发送两腿。非 RTH 必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。</p>
+    <p class="hint">确认会通过实盘引擎同时发送两腿。任一侧可用余额为空或低于名义时，确认和强制确认都保持关闭，避免只发出一条腿。非 RTH 必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
@@ -597,6 +607,9 @@ let lastProposalId = null;
 let lastPayload = null;
 let formMode = "record";
 let seenConfirm = false;
+let startNeedsForce = false;
+let startForceCard = null;
+let startForceGap = "";
 
 function dash(v) {
   return v == null || v === "" ? "—" : String(v);
@@ -658,24 +671,73 @@ function openCreate(task) {
   $("f-mid").focus();
 }
 
+function moneyToken(v) {
+  if (v == null || v === "" || !Number.isFinite(Number(v))) return "missing";
+  const n = Number(v);
+  if (Math.abs(n - Math.round(n)) < 1e-6) return "$" + String(Math.round(n));
+  return "$" + n.toFixed(2);
+}
+function availableShort(leg) {
+  const need = Number(leg && leg.notional_usd);
+  const raw = leg ? leg.available : null;
+  if (raw == null || raw === "" || !Number.isFinite(Number(raw)) || !Number.isFinite(need)) {
+    return true;
+  }
+  return Number(raw) < need;
+}
+function shortfallText(legs) {
+  const bits = [];
+  for (const leg of legs || []) {
+    if (!availableShort(leg)) continue;
+    const name = String(leg.venue || "").toLowerCase();
+    bits.push(name + " available " + moneyToken(leg.available) + " < " + moneyToken(leg.notional_usd));
+  }
+  return bits.join("; ");
+}
 function renderLegs(legs) {
   const body = $("c-legs");
   body.replaceChildren();
   for (const leg of legs || []) {
     const tr = document.createElement("tr");
-    for (const text of [
+    const short = availableShort(leg);
+    if (short) tr.className = "short";
+    const cells = [
       leg.venue + (leg.dex ? " (" + leg.dex + ")" : ""),
       leg.direction,
       "$" + Number(leg.notional_usd).toFixed(0),
       usd(leg.available),
       iso(leg.isolated),
-    ]) {
+    ];
+    cells.forEach((text) => {
       const td = document.createElement("td");
       td.textContent = text;
       tr.appendChild(td);
-    }
+    });
     body.appendChild(tr);
   }
+}
+function forceCardText(card) {
+  const c = card || {};
+  return {
+    session: "当前时段 " + (c.name || "—") + " · 该时段实测中枢 " +
+      (c.midline_bps == null ? "—" : Number(c.midline_bps).toFixed(1)) + " bps",
+    task: "任务中枢 " + (c.task_midline_bps == null ? "—" : Number(c.task_midline_bps).toFixed(1)) +
+      " bps · " + (c.deviation_text || ""),
+    line: c.risk_line || "带宽 1 bps，错中枢风险大于费率缺口",
+  };
+}
+function paintStartForce() {
+  const node = $("start-force");
+  if (!startNeedsForce) {
+    node.hidden = true;
+    return;
+  }
+  const text = forceCardText(startForceCard);
+  $("start-force-session").textContent = text.session;
+  $("start-force-task").textContent = text.task;
+  $("start-force-line").textContent = text.line;
+  $("start-force-gap").textContent = startForceGap || "";
+  node.hidden = false;
 }
 
 function showConfirm(payload) {
@@ -700,19 +762,19 @@ function showConfirm(payload) {
   const card = payload.force_card || {};
   $("c-force").hidden = !force;
   if (force) {
-    $("c-force-session").textContent =
-      "当前时段 " + (card.name || "—") + " · 该时段实测中枢 " +
-      (card.midline_bps == null ? "—" : Number(card.midline_bps).toFixed(1)) + " bps";
-    $("c-force-task").textContent =
-      "任务中枢 " + (card.task_midline_bps == null ? "—" : Number(card.task_midline_bps).toFixed(1)) +
-      " bps · " + (card.deviation_text || "");
-    $("c-force-line").textContent = card.risk_line || "带宽 1 bps，错中枢风险大于费率缺口";
+    const text = forceCardText(card);
+    $("c-force-session").textContent = text.session;
+    $("c-force-task").textContent = text.task;
+    $("c-force-line").textContent = text.line;
   }
-  const enabled = !!payload.confirm_enabled;
+  const short = shortfallText(payload.legs);
+  const enabled = !!payload.confirm_enabled && !short;
   $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : "确认";
   $("c-ok").disabled = !enabled;
-  $("c-block").hidden = !payload.block_reason;
-  $("c-block").textContent = payload.block_reason || "";
+  const reason = payload.block_reason || (short ? ("可用余额低于订单名义，拒绝确认：" + short) : "");
+  $("c-block").hidden = !reason;
+  $("c-block").textContent = reason;
+  $("c-block").className = reason ? "hint bad" : "hint";
   if (payload.proposal_id !== lastProposalId) {
     lastProposalId = payload.proposal_id;
     $("confirm-modal").hidden = false;
@@ -823,7 +885,14 @@ function render(s) {
     ? ("最近确认 " + dash(last.confirm_id) + " · "
       + (last.sent ? "已发送" : "未发送") + " · " + dash(last.status || last.error))
     : "尚无确认订单";
+  if (s.running && !s.paused) {
+    startNeedsForce = false;
+    startForceCard = null;
+    startForceGap = "";
+  }
+  $("btn-start").textContent = startNeedsForce ? "强制启动" : "启动";
   $("btn-start").disabled = !!s.running && !s.paused;
+  paintStartForce();
   $("btn-pause").disabled = !s.running || !!s.paused;
   $("btn-stop").disabled = !s.running && !s.pid;
   showConfirm(s.proposal || null);
@@ -901,9 +970,22 @@ $("clear-task").addEventListener("click", async () => {
 });
 
 $("btn-start").addEventListener("click", async () => {
+  const forcing = startNeedsForce;
   $("btn-start").disabled = true;
   try {
-    await post("/api/session/start");
+    const result = await post("/api/session/start", {
+      force_start_outside_rth: !!forcing,
+    });
+    if (result && result.needs_force_start) {
+      startNeedsForce = true;
+      startForceCard = result.force_card || null;
+      startForceGap = result.gap || "";
+      await refresh();
+      return;
+    }
+    startNeedsForce = false;
+    startForceCard = null;
+    startForceGap = "";
   } catch (err) {
     alert(err.message);
   }
@@ -938,6 +1020,7 @@ $("c-cancel").addEventListener("click", async () => {
 $("confirm-x").addEventListener("click", () => { $("confirm-modal").hidden = true; });
 $("c-ok").addEventListener("click", async () => {
   if (!lastPayload || $("c-ok").disabled) return;
+  if (shortfallText(lastPayload.legs)) return;
   const body = Object.assign({}, lastPayload);
   if ($("c-ok").textContent === "强制确认") body.force_confirm = true;
   $("c-ok").disabled = true;
@@ -946,7 +1029,7 @@ $("c-ok").addEventListener("click", async () => {
     if (result.needs_force_confirm) {
       lastPayload.force_ack = true;
       $("c-ok").textContent = "强制确认";
-      $("c-ok").disabled = false;
+      $("c-ok").disabled = !!shortfallText(lastPayload.legs);
       $("confirm-modal").hidden = false;
       await refresh();
       $("confirm-modal").hidden = false;

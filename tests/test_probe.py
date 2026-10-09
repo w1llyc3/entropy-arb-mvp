@@ -18,9 +18,9 @@ from web.accounts import read_accounts, scrub  # noqa: E402
 from web.live_exec import execute_admitted  # noqa: E402
 from web.probe import (  # noqa: E402
     ACCRUAL_BPS, ACCRUAL_LABEL, CONFIRM_FIELDS, DECISION_WARNING,
-    FORCE_RISK_LINE, build_confirm_payload, confirm_field_errors,
-    decision_warnings, in_us_rth, leg_plan, normalize_task,
-    session_snapshot,
+    FORCE_RISK_LINE, available_shortfall, build_confirm_payload,
+    confirm_field_errors, decision_warnings, in_us_rth, leg_plan,
+    normalize_task, session_snapshot,
 )
 from web.recorder_ctl import RecorderControl  # noqa: E402
 from web.session import ProbeError, ProbeSession  # noqa: E402
@@ -129,7 +129,8 @@ def _flat_result(req, *, fee=0.9, buy=0.01, sell=0.01):
     }
 
 
-def _session(tmp_path, now, *, env=True, executor=None, calls=None):
+def _session(tmp_path, now, *, env=True, executor=None, calls=None,
+             accounts=None):
     if env:
         _write_env(tmp_path)
     box = calls if calls is not None else []
@@ -138,16 +139,45 @@ def _session(tmp_path, now, *, env=True, executor=None, calls=None):
         box.append(req)
         return _flat_result(req)
 
+    snap = accounts or {
+        "entropy": {"equity": None, "available": 25.0,
+                    "position": 0.0, "isolated": True},
+        "lighter": {"equity": None, "available": 40.0,
+                    "position": 0.0, "isolated": False},
+    }
     return ProbeSession(tmp_path, RecorderControl(tmp_path), now=lambda: now,
                         account_reader=lambda: {
                             "creds": {"entropy": False, "lighter": False},
-                            "entropy": {"equity": None, "available": 25.0,
-                                        "position": 0.0, "isolated": True},
-                            "lighter": {"equity": None, "available": 40.0,
-                                        "position": 0.0, "isolated": False},
+                            "entropy": dict(snap.get("entropy") or {}),
+                            "lighter": dict(snap.get("lighter") or {}),
                             "note": None,
                         },
                         executor=executor or _exec)
+
+
+def _qualifying_latest():
+    return {
+        "minute_ts": int(INSIDE),
+        "samples": 60,
+        "tob": {
+            "premium_close_bps": 1.0,
+            "sell_edge_mean_bps": 8,
+            "buy_edge_mean_bps": 1,
+        },
+        "fillable_100": {"sell_bps": "8", "buy_bps": "1"},
+    }
+
+
+def _no_spawn(sess, monkeypatch):
+    spawned = []
+
+    def wrapped(symbol, hedge):
+        spawned.append((symbol, hedge))
+        return {"pid": None, "argv": sess.record_argv(symbol, hedge),
+                "symbol": symbol, "hedge": hedge, "running": True}
+
+    monkeypatch.setattr(sess.ctl, "start", wrapped)
+    return spawned
 
 
 def _arm(sess, *, rth_only=True, manual_confirm=True, midline=-1.7):
@@ -285,20 +315,199 @@ def test_default_start_argv_is_record_only(tmp_path, monkeypatch):
     assert "LIVE" not in joined
 
 
-def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
-    sess = _session(tmp_path, OUTSIDE)
-    sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
-    with pytest.raises(ProbeError) as raised:
-        sess.start()
-    assert raised.value.status_code == 409
-    assert "RTH" in str(raised.value)
-
-    off = _session(tmp_path / "off", INSIDE)
+def test_live_arm_requires_manual_confirm(tmp_path):
+    off = _session(tmp_path / "off", OUTSIDE)
     off.save_task({"mode": "live", "manual_confirm": False, "rth_only": True})
     with pytest.raises(ProbeError) as raised:
-        off.start()
+        off.start(force_start_outside_rth=True)
     assert DECISION_WARNING in str(raised.value)
     assert raised.value.status_code == 409
+    assert off.task().get("force_start_ack") is not True
+    assert not (off.dir / "recorder.pid").exists()
+
+
+def test_available_shortfall_phrases():
+    assert available_shortfall(
+        {"entropy": {"available": 0}, "lighter": {"available": 100}}, 10,
+    ) == "entropy available $0 < $10"
+    assert available_shortfall(
+        {"entropy": {"available": None}, "lighter": {"available": 40}}, 10,
+    ) == "entropy available missing < $10"
+    assert available_shortfall(
+        {"entropy": {"available": 10}, "lighter": {"available": 9.5}}, 10,
+    ) == "lighter available $9.50 < $10"
+    assert available_shortfall(
+        {"entropy": {"available": 10}, "lighter": {"available": 10}}, 10,
+    ) is None
+    both = available_shortfall(
+        {"entropy": {"available": 0}, "lighter": {"available": None}}, 10)
+    assert both == ("entropy available $0 < $10; "
+                    "lighter available missing < $10")
+
+
+def test_thin_available_disables_confirm_and_refuses_admit(tmp_path):
+    calls = []
+    sess = _session(tmp_path, INSIDE, calls=calls, accounts={
+        "entropy": {"equity": 1, "available": 0, "position": 0, "isolated": True},
+        "lighter": {"equity": 120, "available": 100, "position": 0,
+                    "isolated": False},
+    })
+    _arm(sess)
+    payload = sess.pending_payload(_qualifying_latest())
+    assert payload["confirm_enabled"] is False
+    assert "entropy available $0 < $10" in payload["block_reason"]
+    assert "可用余额低于订单名义，拒绝确认" in payload["block_reason"]
+    assert payload["legs"][0]["available"] == 0
+    assert payload["legs"][1]["available"] == 100
+    echoed = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    with pytest.raises(ProbeError) as raised:
+        sess.admit_confirm(echoed)
+    assert raised.value.status_code == 409
+    assert "entropy available $0 < $10" in str(raised.value)
+    assert calls == []
+    assert sess.queue()["pending"] is not None
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "confirm refused" in log
+    assert "test-key" not in log
+    assert "0xabc" not in log
+    assert "PRIVATE" not in log
+    dumped = json.dumps(payload)
+    assert "test-key" not in dumped
+    assert "0xabc" not in dumped
+
+
+def test_missing_available_refuses_before_force_confirm(tmp_path):
+    calls = []
+    sess = _session(tmp_path, OUTSIDE, calls=calls, accounts={
+        "entropy": {"available": 50, "isolated": True, "position": 0},
+        "lighter": {"available": None, "isolated": False, "position": 0},
+    })
+    _arm(sess)
+    payload = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=False,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    payload["force_confirm"] = True
+    with pytest.raises(ProbeError) as raised:
+        sess.admit_confirm(payload)
+    assert raised.value.status_code == 409
+    assert "lighter available missing < $10" in str(raised.value)
+    assert calls == []
+    assert sess.queue()["pending"].get("force_ack") is not True
+
+
+def test_available_equal_to_notional_can_confirm(tmp_path):
+    calls = []
+    sess = _session(tmp_path, INSIDE, calls=calls, accounts={
+        "entropy": {"available": 10, "isolated": True, "position": 0},
+        "lighter": {"available": 10, "isolated": True, "position": 0},
+    })
+    _arm(sess)
+    view = sess.pending_payload(_qualifying_latest())
+    assert view["confirm_enabled"] is True
+    assert view["block_reason"] is None
+    body = sess.admit_confirm(view)
+    assert body["sent"] is True
+    assert len(calls) == 1
+
+
+def test_outside_rth_start_needs_force_then_arms(tmp_path, monkeypatch):
+    sess = _session(tmp_path, OUTSIDE)
+    sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    spawned = _no_spawn(sess, monkeypatch)
+    first = sess.start()
+    assert first["ok"] is False
+    assert first["needs_force_start"] is True
+    assert first["running"] is False
+    assert first["live_armed"] is False
+    assert first["force_start_outside_rth"] is False
+    assert spawned == []
+    assert sess.task()["live_armed"] is False
+    assert sess.task()["force_start_ack"] is True
+    assert "force_start_ack" not in sess._public_task(sess.task())
+    card = first["force_card"]
+    snap = session_snapshot(datetime.fromtimestamp(OUTSIDE, UTC), -1.7)
+    assert card == snap
+    assert card["name"] == "us_post_overnight"
+    assert card["midline_bps"] == 2.6
+    assert card["task_midline_bps"] == -1.7
+    assert card["risk_line"] == FORCE_RISK_LINE
+    assert first["gap"] == "非 RTH：需要第二次点击强制启动才会武装"
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force-ack-start" in log
+    assert "test-key" not in log
+    assert "0xabc" not in log
+
+    jumped = _session(tmp_path / "jump", OUTSIDE)
+    jumped.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    jump_spawn = _no_spawn(jumped, monkeypatch)
+    with pytest.raises(ProbeError) as raised:
+        jumped.start(force_start_outside_rth=True)
+    assert raised.value.status_code == 409
+    assert "强制启动需要先确认风险提示" in str(raised.value)
+    assert jump_spawn == []
+
+    second = sess.start(force_start_outside_rth=True)
+    assert second["ok"] is True
+    assert second["needs_force_start"] is False
+    assert second["live_armed"] is True
+    assert second["record_only"] is True
+    assert second["force_start_outside_rth"] is True
+    assert spawned == [("SNDK", "lighter")]
+    assert "--record-only" in second["argv"]
+    assert ".env" not in " ".join(second["argv"])
+    assert sess.task().get("force_start_ack") is None
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force_start_outside_rth=true" in log
+    assert "test-key" not in log
+    stopped = sess.stop()
+    assert stopped["live_armed"] is False
+    assert sess.task()["live_armed"] is False
+
+
+def test_inside_rth_start_arms_once_and_record_skips_force(tmp_path, monkeypatch):
+    inside = _session(tmp_path / "in", INSIDE)
+    inside.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    spec = inside.task()
+    spec["force_start_ack"] = True
+    inside._write_json(inside.task_path, spec)
+    spawned = _no_spawn(inside, monkeypatch)
+    info = inside.start()
+    assert info["live_armed"] is True
+    assert info["force_start_outside_rth"] is False
+    assert info["needs_force_start"] is False
+    assert spawned == [("SNDK", "lighter")]
+    if inside.log_path.is_file():
+        assert "force-ack-start" not in inside.log_path.read_text(encoding="utf-8")
+    assert inside.task().get("force_start_ack") is None
+
+    window_off = _session(tmp_path / "off", OUTSIDE)
+    window_off.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": False,
+    })
+    off_spawn = _no_spawn(window_off, monkeypatch)
+    opened = window_off.start()
+    assert opened["live_armed"] is True
+    assert opened["force_start_outside_rth"] is False
+    assert off_spawn == [("SNDK", "lighter")]
+
+    record = _session(tmp_path / "rec", OUTSIDE)
+    record.save_task({"mode": "record", "rth_only": True})
+    rec_spawn = _no_spawn(record, monkeypatch)
+    recorded = record.start(force_start_outside_rth=True)
+    assert recorded["live_armed"] is False
+    assert recorded["running"] is True
+    assert recorded["force_start_outside_rth"] is False
+    assert rec_spawn == [("SNDK", "lighter")]
+
+    bare = _session(tmp_path / "bare", OUTSIDE, env=False)
+    bare.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    with pytest.raises(ProbeError) as raised:
+        bare.start()
+    assert raised.value.status_code == 409
+    assert "密钥" in str(raised.value)
+    assert bare.task().get("force_start_ack") is not True
 
 
 def test_missing_env_refuses_live_and_confirm(tmp_path):
@@ -582,9 +791,9 @@ def test_http_confirm_gate(tmp_path):
                      executor=executor,
                      account_reader=lambda: {
                          "creds": {"entropy": True, "lighter": True},
-                         "entropy": {"equity": 10, "available": 8,
+                         "entropy": {"equity": 30, "available": 25,
                                      "position": 0, "isolated": True},
-                         "lighter": {"equity": 12, "available": 9,
+                         "lighter": {"equity": 40, "available": 40,
                                      "position": 0, "isolated": False},
                          "note": None,
                      })
@@ -700,3 +909,129 @@ def test_pause_resume_and_reconcile_do_not_route(tmp_path):
         status = client.get("/api/status").json()
         assert status["running"] is False
         assert status["status_label"] == "已停止"
+
+
+def test_http_short_available_blocks_confirm(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    def _sleep(symbol, hedge):
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    calls = []
+
+    def executor(req):
+        calls.append(req)
+        return _flat_result(req)
+
+    _write_env(tmp_path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    header = ("minute_ts,time_utc,entropy_bid,entropy_ask,hedge_bid,hedge_ask,"
+              "premium_close_bps,sell_edge_mean_bps,buy_edge_mean_bps,samples,"
+              "fill_sell_edge_100_bps,fill_buy_edge_100_bps\n")
+    row = f"{int(INSIDE)},2026-01-07T15:00:00Z,100,100.1,100,100.1,1.0,8,1,60,8,1\n"
+    (logs / "minutes.csv").write_text(header + row, encoding="utf-8")
+    app = create_app(
+        tmp_path, command_builder=_sleep, now=lambda: INSIDE, executor=executor,
+        account_reader=lambda: {
+            "creds": {"entropy": True, "lighter": True},
+            "entropy": {"equity": 1, "available": 0, "position": 0,
+                        "isolated": True},
+            "lighter": {"equity": 100, "available": 100, "position": 0,
+                        "isolated": False},
+            "note": None,
+        })
+    with TestClient(app) as client:
+        made = client.post("/api/task", json={
+            "mode": "live", "manual_confirm": True, "rth_only": True,
+            "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
+            "order_notional_usd": 10, "max_position_usd": 10,
+        })
+        assert made.status_code == 200, made.text
+        started = client.post("/api/session/start")
+        assert started.status_code == 200, started.text
+        status = client.get("/api/status").json()
+        blob = json.dumps(status)
+        assert "test-key" not in blob
+        assert "0xabc" not in blob
+        payload = status["proposal"]
+        assert payload["confirm_enabled"] is False
+        assert "entropy available $0 < $10" in payload["block_reason"]
+        assert payload["legs"][0]["available"] == 0
+        refused = client.post("/api/confirm", json=payload)
+        assert refused.status_code == 409
+        assert "entropy available $0 < $10" in refused.json()["detail"]
+        assert calls == []
+        client.post("/api/stop")
+
+
+def test_http_outside_rth_start_force_and_inside_single_start(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    clock = {"t": OUTSIDE}
+    spawned = {"n": 0}
+
+    def _sleep(symbol, hedge):
+        spawned["n"] += 1
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    _write_env(tmp_path)
+    app = create_app(tmp_path, command_builder=_sleep, now=lambda: clock["t"])
+    task = {
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
+        "order_notional_usd": 10, "max_position_usd": 10,
+    }
+    with TestClient(app) as client:
+        assert client.post("/api/task", json=task).status_code == 200
+        first = client.post("/api/session/start")
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert body["needs_force_start"] is True
+        assert body["live_armed"] is False
+        assert body["running"] is False
+        assert "强制启动" in body["gap"]
+        assert body["force_card"]["name"] == "us_post_overnight"
+        assert body["force_card"]["midline_bps"] == 2.6
+        assert spawned["n"] == 0
+        bare = client.post("/api/session/start", json={
+            "force_start_outside_rth": False,
+        })
+        assert bare.status_code == 200
+        assert bare.json()["needs_force_start"] is True
+        assert spawned["n"] == 0
+        second = client.post("/api/session/start", json={
+            "force_start_outside_rth": True,
+        })
+        assert second.status_code == 200, second.text
+        armed = second.json()
+        assert armed["live_armed"] is True
+        assert armed["force_start_outside_rth"] is True
+        assert armed["record_only"] is True
+        log = (tmp_path / ".web" / "probe.log").read_text(encoding="utf-8")
+        assert "force-ack-start" in log
+        assert "force_start_outside_rth=true" in log
+        assert "test-key" not in log
+        assert "0xabc" not in log
+        client.post("/api/stop")
+        clock["t"] = INSIDE
+        inside = client.post("/api/session/start")
+        assert inside.status_code == 200, inside.text
+        assert inside.json()["live_armed"] is True
+        assert inside.json()["force_start_outside_rth"] is False
+        client.post("/api/stop")
+
+    jump = tmp_path / "jump"
+    _write_env(jump)
+    jump_app = create_app(jump, command_builder=_sleep, now=lambda: OUTSIDE)
+    with TestClient(jump_app) as client:
+        assert client.post("/api/task", json=task).status_code == 200
+        refused = client.post("/api/session/start", json={
+            "force_start_outside_rth": True,
+        })
+        assert refused.status_code == 409
+        assert "强制启动需要先确认风险提示" in refused.json()["detail"]
