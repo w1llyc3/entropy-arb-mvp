@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.config import load_config  # noqa: E402
-from web.accounts import read_accounts, scrub  # noqa: E402
+from web.accounts import funding_block, read_accounts, scrub  # noqa: E402
 from web.live_exec import execute_admitted  # noqa: E402
 from web.probe import (  # noqa: E402
     ACCRUAL_BPS, ACCRUAL_LABEL, CONFIRM_FIELDS, DECISION_WARNING,
@@ -559,6 +559,220 @@ def test_accounts_do_not_leak_secrets(tmp_path):
     assert leaked["note"] == "[redacted]"
 
 
+def _hl_env(root: Path, address: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".env").write_text(
+        "HL_PRIVATE_KEY=test-key-not-a-hex-key\n"
+        "HL_ACCOUNT_ADDRESS=" + address + "\n",
+        encoding="utf-8")
+
+
+class _JsonResp:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_unified_spot_usdc_fills_balance_when_perp_margin_is_zero(tmp_path, caplog):
+    """dex=io clearinghouse stays the SNDK position source. Equity and
+    available come from spot USDC when that margin is 0."""
+    import logging
+    address = "0x" + "11" * 20
+    _hl_env(tmp_path, address)
+    seen = []
+
+    def opener(req, timeout=None):
+        body = json.loads(req.data.decode())
+        seen.append(body)
+        if body["type"] == "clearinghouseState":
+            assert body.get("dex") == "io"
+            return _JsonResp({
+                "marginSummary": {"accountValue": "0.0"},
+                "withdrawable": "0",
+                "assetPositions": [{
+                    "position": {
+                        "coin": "io:SNDK",
+                        "szi": "-0.4",
+                        "leverage": {"type": "isolated", "value": 3},
+                    }
+                }],
+            })
+        assert body["type"] == "spotClearinghouseState"
+        assert "dex" not in body
+        return _JsonResp({
+            "balances": [
+                {"coin": "HYPE", "token": 150, "total": "1.5", "hold": "0"},
+                {"coin": "USDC", "token": 0, "total": "120.5", "hold": "0",
+                 "available": "100.0"},
+            ],
+            "tokenToAvailableAfterMaintenance": [[0, "99.80"]],
+        })
+
+    caplog.set_level(logging.DEBUG)
+    snap = read_accounts(tmp_path, opener=opener)
+    blob = json.dumps(snap)
+    assert address not in blob
+    assert address not in caplog.text
+    assert "test-key" not in blob
+    assert "test-key" not in caplog.text
+    assert "[redacted]" not in blob
+    assert [item["type"] for item in seen] == [
+        "clearinghouseState", "spotClearinghouseState"]
+    assert snap["entropy"]["equity"] == pytest.approx(120.5)
+    assert snap["entropy"]["available"] == pytest.approx(99.80)
+    assert snap["entropy"]["position"] == pytest.approx(-0.4)
+    assert snap["entropy"]["isolated"] is True
+    assert funding_block(snap, 10) is None
+    assert funding_block(snap, 99.80) is None
+    assert "订单名义" in funding_block(snap, 100)
+
+
+def test_spot_usdc_uses_available_then_total_without_maintenance(tmp_path):
+    address = "0x" + "22" * 20
+    _hl_env(tmp_path, address)
+
+    def opener(req, timeout=None):
+        body = json.loads(req.data.decode())
+        if body["type"] == "clearinghouseState":
+            return _JsonResp({
+                "marginSummary": {"accountValue": None},
+                "withdrawable": None,
+            })
+        return _JsonResp({
+            "balances": [{
+                "coin": "USDC",
+                "token": 0,
+                "total": "40.0",
+                "available": "25.5",
+                "hold": "14.5",
+            }],
+        })
+
+    snap = read_accounts(tmp_path, opener=opener)
+    assert snap["entropy"]["equity"] == pytest.approx(40.0)
+    assert snap["entropy"]["available"] == pytest.approx(25.5)
+    assert funding_block(snap, 25.5) is None
+    short = funding_block(snap, 25.51)
+    assert short and "订单名义" in short
+
+    def opener_total(req, timeout=None):
+        body = json.loads(req.data.decode())
+        if body["type"] == "clearinghouseState":
+            return _JsonResp({"marginSummary": {}, "withdrawable": "0"})
+        return _JsonResp({
+            "balances": [{"coin": "USDC", "token": 0, "total": "99.8", "hold": "0"}],
+        })
+
+    filled = read_accounts(tmp_path, opener=opener_total)
+    assert filled["entropy"]["equity"] == pytest.approx(99.8)
+    assert filled["entropy"]["available"] == pytest.approx(99.8)
+    assert address not in json.dumps(filled)
+
+
+def test_spot_failure_keeps_position_and_hides_the_address(tmp_path, caplog):
+    import logging
+    import urllib.error
+    address = "0x" + "44" * 20
+    _hl_env(tmp_path, address)
+
+    def opener(req, timeout=None):
+        body = json.loads(req.data.decode())
+        if body["type"] == "spotClearinghouseState":
+            raise urllib.error.URLError("down")
+        return _JsonResp({
+            "marginSummary": {"accountValue": "0"},
+            "withdrawable": "0",
+            "assetPositions": [{
+                "position": {
+                    "coin": "io:SNDK",
+                    "szi": "1",
+                    "leverage": {"type": "isolated"},
+                }
+            }],
+        })
+
+    caplog.set_level(logging.DEBUG)
+    snap = read_accounts(tmp_path, opener=opener)
+    blob = json.dumps(snap)
+    assert address not in blob
+    assert address not in caplog.text
+    assert "test-key" not in blob
+    assert "[redacted]" not in blob
+    assert snap["entropy"]["equity"] is None
+    assert snap["entropy"]["available"] is None
+    assert snap["entropy"]["position"] == pytest.approx(1)
+    assert snap["entropy"]["isolated"] is True
+    assert snap["note"] == "已检测到密钥，余额尚未读到"
+
+
+def test_nonzero_perp_margin_does_not_read_spot(tmp_path):
+    address = "0x" + "33" * 20
+    _hl_env(tmp_path, address)
+    seen = []
+
+    def opener(req, timeout=None):
+        body = json.loads(req.data.decode())
+        seen.append(body["type"])
+        return _JsonResp({
+            "marginSummary": {"accountValue": "39.5"},
+            "withdrawable": "20.0",
+            "assetPositions": [],
+        })
+
+    snap = read_accounts(tmp_path, opener=opener)
+    assert seen == ["clearinghouseState"]
+    assert snap["entropy"]["equity"] == pytest.approx(39.5)
+    assert snap["entropy"]["available"] == pytest.approx(20.0)
+    assert address not in json.dumps(snap)
+
+
+def test_confirm_refused_when_unified_available_below_notional(tmp_path):
+    calls = []
+
+    def reader():
+        return {
+            "creds": {"entropy": True, "lighter": True},
+            "entropy": {"equity": 99.8, "available": 9.5,
+                        "position": 0.0, "isolated": True},
+            "lighter": {"equity": 40.0, "available": 40.0,
+                        "position": 0.0, "isolated": False},
+            "note": None,
+        }
+
+    sess = ProbeSession(tmp_path, RecorderControl(tmp_path), now=lambda: INSIDE,
+                        account_reader=reader,
+                        executor=lambda req: calls.append(req) or _flat_result(req))
+    _write_env(tmp_path)
+    _arm(sess)
+    payload = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    with pytest.raises(ProbeError) as raised:
+        sess.admit_confirm(payload)
+    assert raised.value.status_code == 409
+    assert "资金不足" in str(raised.value)
+    assert "0x" not in str(raised.value)
+    assert calls == []
+    assert sess.queue()["pending"] is not None
+    status = sess.overlay({"running": True, "paused": False, "latest": {
+        "minute_ts": INSIDE, "samples": 60,
+        "tob": {"sell_edge_mean_bps": 8, "buy_edge_mean_bps": 1,
+                "premium_close_bps": 1},
+        "fillable_100": {"sell_bps": 8, "buy_bps": 1},
+    }, "warnings": []})
+    assert status["proposal"]["confirm_enabled"] is False
+    assert "资金不足" in status["proposal"]["block_reason"]
+    assert status["proposal"]["legs"][0]["available"] == pytest.approx(9.5)
+
+
 def test_http_confirm_gate(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -582,7 +796,7 @@ def test_http_confirm_gate(tmp_path):
                      executor=executor,
                      account_reader=lambda: {
                          "creds": {"entropy": True, "lighter": True},
-                         "entropy": {"equity": 10, "available": 8,
+                         "entropy": {"equity": 99.8, "available": 99.8,
                                      "position": 0, "isolated": True},
                          "lighter": {"equity": 12, "available": 9,
                                      "position": 0, "isolated": False},

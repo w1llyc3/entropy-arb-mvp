@@ -4,6 +4,14 @@ The panel parses ``.env`` only to decide whether a public account query is
 possible. Private keys are never returned, logged, or sent to the browser.
 Position and margin mode are filled when the public payload names SNDK;
 otherwise those cells stay null and the UI shows a gap.
+
+Hyperliquid Unified accounts hold USDC in the spot clearinghouse. The
+``dex=io`` perp clearinghouse still names an isolated SNDK position, but
+its account value and withdrawable are 0 and are not the balance. Equity
+and available then come from spot USDC. Available prefers
+``tokenToAvailableAfterMaintenance``; otherwise the USDC coin's
+``available`` and ``total`` fields. That available number is the confirm
+funding gate and must cover the order notional.
 """
 from __future__ import annotations
 
@@ -104,12 +112,45 @@ def _opener_json(opener, url: str, payload: Optional[dict], timeout: float):
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
-def _apply_hl(out: dict, payload: dict) -> None:
+def _optional_float(value):
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _hl_margin_blank(payload: dict) -> bool:
+    """True when perp equity and withdrawable are both missing or zero.
+
+    That is the Unified shape: the dex clearinghouse does not hold the USDC.
+    """
     margin = payload.get("marginSummary") or {}
-    if margin.get("accountValue") is not None:
-        out["entropy"]["equity"] = float(margin["accountValue"])
-    if payload.get("withdrawable") is not None:
-        out["entropy"]["available"] = float(payload["withdrawable"])
+    equity = _optional_float(margin.get("accountValue"))
+    available = _optional_float(payload.get("withdrawable"))
+    equity_blank = equity is None or equity == 0.0
+    available_blank = available is None or available == 0.0
+    return equity_blank and available_blank
+
+
+def _apply_hl(out: dict, payload: dict) -> None:
+    """SNDK position from the dex clearinghouse.
+
+    Non-zero perp margin is kept. A 0/null margin is left unset so the
+    caller can fill equity and available from spot USDC.
+    """
+    if not _hl_margin_blank(payload):
+        margin = payload.get("marginSummary") or {}
+        equity = _optional_float(margin.get("accountValue"))
+        available = _optional_float(payload.get("withdrawable"))
+        if equity is not None:
+            out["entropy"]["equity"] = equity
+        if available is not None:
+            out["entropy"]["available"] = available
     for item in payload.get("assetPositions") or []:
         pos = (item or {}).get("position") or {}
         coin = str(pos.get("coin") or "")
@@ -120,6 +161,116 @@ def _apply_hl(out: dict, payload: dict) -> None:
         if isinstance(lev, dict) and lev.get("type"):
             out["entropy"]["isolated"] = str(lev["type"]).lower() == "isolated"
         break
+
+
+def _usdc_entry(balances) -> Optional[dict]:
+    for item in balances or []:
+        if not isinstance(item, dict):
+            continue
+        coin = str(item.get("coin") or "").upper()
+        token = item.get("token")
+        if coin == "USDC" or token == 0 or str(token) == "0":
+            return item
+    return None
+
+
+def _same_token(left, right) -> bool:
+    if left is None or right is None:
+        return False
+    if isinstance(left, str) and left.strip().upper() == "USDC":
+        return isinstance(right, str) and right.strip().upper() == "USDC"
+    try:
+        return float(left) == float(right)
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+def _maintenance_pairs(raw):
+    if isinstance(raw, dict):
+        return list(raw.items())
+    if not isinstance(raw, list):
+        return []
+    pairs = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            pairs.append((item[0], item[1]))
+        elif isinstance(item, dict):
+            token = item.get("token", item.get("coin"))
+            amount = item.get("amount", item.get("available"))
+            pairs.append((token, amount))
+    return pairs
+
+
+def _maintenance_usdc(payload: dict, token_id) -> Optional[float]:
+    raw = payload.get("tokenToAvailableAfterMaintenance")
+    if raw is None:
+        return None
+    named = None
+    indexed = None
+    for token, amount in _maintenance_pairs(raw):
+        if isinstance(token, str) and token.strip().upper() == "USDC":
+            named = _optional_float(amount)
+            break
+        if token_id is not None and _same_token(token, token_id):
+            indexed = _optional_float(amount)
+            break
+    if named is not None:
+        return named
+    return indexed
+
+
+def _apply_spot_usdc(out: dict, payload: dict) -> None:
+    """Equity and available from the USDC spot balance.
+
+    ``tokenToAvailableAfterMaintenance`` wins for available when it names
+    USDC. Otherwise the coin entry's ``available``, then ``total``. Equity
+    uses ``total`` when that field is present, and the available figure
+    when it is not.
+    """
+    if not isinstance(payload, dict):
+        return
+    entry = _usdc_entry(payload.get("balances"))
+    token_id = 0
+    if entry is not None and entry.get("token") is not None:
+        token_id = entry.get("token")
+    maintained = _maintenance_usdc(payload, token_id)
+    coin_available = None
+    coin_total = None
+    if entry is not None:
+        coin_available = _optional_float(entry.get("available"))
+        coin_total = _optional_float(entry.get("total"))
+    if maintained is not None:
+        available = maintained
+    elif coin_available is not None:
+        available = coin_available
+    else:
+        available = coin_total
+    if coin_total is not None:
+        equity = coin_total
+    else:
+        equity = available
+    if equity is not None:
+        out["entropy"]["equity"] = equity
+    if available is not None:
+        out["entropy"]["available"] = available
+
+
+def funding_block(accounts: Optional[dict], order_notional) -> Optional[str]:
+    """Confirm gate: Unified spot USDC available must cover the order.
+
+    ``entropy.available`` is that number. A missing reading does not invent
+    a shortfall. The message names no address.
+    """
+    order = _optional_float(order_notional)
+    if order is None:
+        return None
+    entropy = (accounts or {}).get("entropy") or {}
+    available = _optional_float(entropy.get("available"))
+    if available is None:
+        return None
+    if available + 1e-9 < order:
+        return "资金不足：Unified 可用 USDC 低于订单名义"
+    return None
 
 
 def _apply_lighter(out: dict, payload: dict) -> None:
@@ -157,15 +308,22 @@ def read_accounts(root: Path, opener=None, timeout: float = 2.5) -> dict:
     fetch = opener or urllib.request.urlopen
     errors = False
     if flags["entropy"] and vals.get("HL_ACCOUNT_ADDRESS"):
+        # Address stays in the public query body. It is not logged or returned.
+        user = vals["HL_ACCOUNT_ADDRESS"]
         try:
             payload = _opener_json(
                 fetch, HL_INFO,
-                {"type": "clearinghouseState",
-                 "user": vals["HL_ACCOUNT_ADDRESS"],
-                 "dex": "io"},
+                {"type": "clearinghouseState", "user": user, "dex": "io"},
                 timeout)
             if isinstance(payload, dict):
                 _apply_hl(out, payload)
+                if _hl_margin_blank(payload):
+                    spot = _opener_json(
+                        fetch, HL_INFO,
+                        {"type": "spotClearinghouseState", "user": user},
+                        timeout)
+                    if isinstance(spot, dict):
+                        _apply_spot_usdc(out, spot)
         except (OSError, urllib.error.URLError, ValueError, TypeError, KeyError):
             errors = True
     if flags["lighter"] and vals.get("LIGHTER_ACCOUNT_INDEX"):

@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 import yaml
 
-from web.accounts import missing_live_env, read_accounts, scrub
+from web.accounts import funding_block, missing_live_env, read_accounts, scrub
 from web.live_exec import execute_admitted
 from web.probe import (
     ACCRUAL_BPS,
@@ -171,6 +171,11 @@ class ProbeSession:
         acct_net = self._account_net()
         if acct_net is not None and abs(acct_net) > NET_TOL_BASE:
             return "HALT：账户净敞口不为 0，拒绝新开仓"
+        spec = self.task()
+        if spec:
+            short = funding_block(self._accounts(), spec.get("order_notional_usd"))
+            if short:
+                return short
         return None
 
     def _clock(self) -> datetime:
@@ -481,6 +486,8 @@ class ProbeSession:
             pending["tail_vs_median"] = tail_vs_median(
                 self._history_nets(qual["direction"]), qual["net_edge_bps"])
             pending["rth"] = self.rth_now()
+            pending["legs"] = leg_plan(
+                qual["direction"], spec["order_notional_usd"], self._accounts())
             self._save_queue(queue)
             return pending
         proposal = {
