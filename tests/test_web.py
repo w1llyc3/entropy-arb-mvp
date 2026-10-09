@@ -453,6 +453,27 @@ def test_http_analyze_shows_labeled_gates(tmp_path):
     assert body["depth_ok_frac_text"] == "0.7500"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock path")
+def test_panel_lock_flocks_on_posix(tmp_path, monkeypatch):
+    import web.recorder_ctl as rc
+    calls = []
+    real = rc.fcntl.flock
+
+    def spy(fd, op):
+        calls.append(op)
+        return real(fd, op)
+
+    monkeypatch.setattr(rc.fcntl, "flock", spy)
+    RecorderControl(tmp_path).snapshot()
+    assert calls == [rc.fcntl.LOCK_EX]
+    source = open(os.path.join(ROOT, "web", "recorder_ctl.py"),
+                  encoding="utf-8").read()
+    assert 'if sys.platform == "win32":' in source
+    assert "import msvcrt" in source
+    assert "msvcrt.locking" in source
+    assert "fcntl.flock" in source
+
+
 def test_main_binds_loopback_only(monkeypatch):
     pytest.importorskip("fastapi")
     pytest.importorskip("uvicorn")

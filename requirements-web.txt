@@ -5,3 +5,7 @@
 fastapi>=0.110
 uvicorn>=0.27
 httpx>=0.27
+# Windows stdlib zoneinfo ships no IANA database. The probe's
+# America/New_York RTH window needs this package there. Linux keeps
+# using the system zoneinfo when the key is already installed.
+tzdata>=2024.1

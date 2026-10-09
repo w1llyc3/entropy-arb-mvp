@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
@@ -47,6 +47,18 @@ def test_rth_window_bounds_and_weekend():
     assert in_us_rth(datetime(2026, 7, 8, 13, 30, tzinfo=UTC)) is True
     assert in_us_rth(datetime(2026, 7, 8, 19, 59, tzinfo=UTC)) is True
     assert in_us_rth(datetime(2026, 7, 8, 20, 0, tzinfo=UTC)) is False
+
+
+def test_missing_new_york_zone_names_tzdata(monkeypatch):
+    import web.probe as probe
+    monkeypatch.setattr(probe, "_NY", None)
+
+    def missing(key):
+        raise ZoneInfoNotFoundError(f"No time zone found with key {key}")
+
+    monkeypatch.setattr(probe, "ZoneInfo", missing)
+    with pytest.raises(ZoneInfoNotFoundError, match="pip install tzdata"):
+        in_us_rth(datetime(2026, 1, 7, 15, 0, tzinfo=UTC))
 
 
 def test_decision_card_defaults_and_warning():

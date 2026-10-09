@@ -7,7 +7,6 @@ can see a recorder it did not spawn itself.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -17,6 +16,11 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 _SECRET = re.compile(
     r"(0x[0-9a-fA-F]{16,}|PRIVATE|api_private|secret|BEGIN )",
@@ -43,6 +47,29 @@ class RecorderError(Exception):
         self.status_code = status_code
 
 
+class _WindowsLock:
+    """Release a ``msvcrt`` byte lock before the file is closed.
+
+    Closing a still-locked fd on Windows raises ``PermissionError``.
+    ``with`` on a plain file object only closes, so the Windows path
+    cannot return the file the way ``fcntl.flock`` can.
+    """
+
+    def __init__(self, fh) -> None:
+        self._fh = fh
+
+    def __enter__(self):
+        return self._fh
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            self._fh.seek(0)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._fh.close()
+        return False
+
+
 class RecorderControl:
     def __init__(self, root: Path,
                  command_builder: Optional[Callable[[str, str], list]] = None
@@ -63,7 +90,19 @@ class RecorderControl:
     def _locked(self):
         self._ensure_dir()
         fh = open(self._lock_path, "a+")
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            if sys.platform == "win32":
+                # msvcrt locks a byte range from the current position.
+                # The file is only a token, so every caller contends on byte 0.
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            fh.close()
+            raise
+        if sys.platform == "win32":
+            return _WindowsLock(fh)
         return fh
 
     def _read_meta(self) -> Optional[dict]:
