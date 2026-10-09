@@ -2,8 +2,9 @@
 
 Binds nowhere by itself. ``python3 -m web`` listens on 127.0.0.1 only.
 Secrets stay in the server ``.env`` and are scrubbed from every response.
-Starting the panel does not arm live trading. The confirm route queues an
-intent; it does not send a venue order.
+Starting the panel does not arm live trading. Confirm admits an id and then
+calls ``Engine.execute_confirmed``. Outside US RTH that send waits for a
+second 「强制确认」.
 """
 from __future__ import annotations
 
@@ -80,10 +81,11 @@ def _recorder(exc: RecorderError) -> None:
 
 
 def create_app(root: Optional[Path] = None, command_builder=None,
-               now=None, account_reader=None) -> FastAPI:
+               now=None, account_reader=None, executor=None) -> FastAPI:
     root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
     ctl = RecorderControl(root, command_builder=command_builder)
-    session = ProbeSession(root, ctl, now=now, account_reader=account_reader)
+    session = ProbeSession(root, ctl, now=now, account_reader=account_reader,
+                           executor=executor)
     app = FastAPI(
         title="SNDK Entropy Lighter probe",
         docs_url=None,

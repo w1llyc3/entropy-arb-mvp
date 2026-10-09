@@ -156,38 +156,67 @@ sends real orders once feeds are fresh:
 python3 main.py --symbol SNDK --hedge lighter
 ```
 
-### Click path
+### Click path (Dexter)
 
-1. **创建套利任务** (eyebrow NEW STRATEGY). The form opens on the Decision
-   Card: pair SNDK, Entropy dex `io` ↔ Lighter, midline **-1.7**, upper/lower
-   **1.0 / 1.0**, order **$10**, position cap **$10** per side, fees **0.9 / 0**
-   (read-only), referral **self_t2** accrual **≈ 0.54 bps** labeled **未到账**,
-   manual confirm **on**, US RTH window **on**. Mode is **只记录** or
-   **探针实盘**.
-2. If midline is moved off -1.7, or manual confirm is turned off, the form
-   shows **会偏离 Decision Card**. Confirm-off refuses to arm 探针实盘.
-3. **启动** in 只记录 runs record-only collection. **启动** in 探针实盘 arms
-   the confirm queue and still launches only:
+The Decision Card is **NO EDGE**. This probe is a user-chosen $10 minimum,
+not a signal that the gate passed. The form does not switch the midline
+when the session changes.
+
+1. Fill `.env` on the server before any live click. Required names:
+   `HL_PRIVATE_KEY`, `HL_ACCOUNT_ADDRESS`, `LIGHTER_ACCOUNT_INDEX`,
+   `LIGHTER_API_KEY_INDEX`, `LIGHTER_API_PRIVATE_KEY`. The page never
+   receives those values. Incomplete `.env` refuses both **启动** of
+   探针实盘 and **确认**.
+2. Open <http://127.0.0.1:8765>. **创建套利任务** (eyebrow NEW STRATEGY).
+   The form opens on the Decision Card: pair SNDK, Entropy dex `io` ↔
+   Lighter, midline **-1.7**, upper/lower **1.0 / 1.0**, order **$10**,
+   position cap **$10** per side, fees **0.9 / 0** (read-only), referral
+   **self_t2** accrual **≈ 0.54 bps** labeled **未到账**, manual confirm
+   **on**, US RTH window **on** (recommended). Mode defaults to **只记录**.
+   Creating the task does not arm live and does not send an order.
+3. If midline is moved off -1.7, or manual confirm is turned off, the form
+   shows **会偏离 Decision Card**. Confirm-off refuses to arm 探针实盘 and
+   cannot silently auto-fire. Order and position inputs stay capped at $10.
+4. Choose **探针实盘**, then **启动**. That is the explicit second action.
+   It still launches only the recorder:
 
 ```bash
 python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter --config .web/probe.yaml
 ```
 
-   Arming 探针实盘 is refused outside US RTH when the RTH toggle is on
-   (America/New_York, Monday–Friday 09:30 inclusive to 16:00 exclusive).
-4. Task-card statuses are **记录中 / 暖机 / LIVE / 暂停 / 已停止**. **暂停**
-   freezes the recorder. **停止** ends it. **对账** writes a local request
-   and does not call a venue.
-5. When 探针实盘 is armed and the latest minute clears the band, a confirm
-   card opens. It shows net edge **after 0.9 bps** (rebate not included) and,
-   on a separate line, Tier2 Self accrual **≈ 0.54 bps** marked **未到账**.
-   It also shows midline, the RTH flag, each leg's direction / notional /
-   available / isolated, and a tail-vs-median warning when the live net is
-   outside the recent central 80%. **确认** is disabled outside RTH. Cancel
-   skips. Confirm queues the intent and does not send an order.
+   With the RTH toggle on (the default), **启动** of 探针实盘 is refused
+   outside US RTH (America/New_York, Monday–Friday 09:30 inclusive to
+   16:00 exclusive). **只记录** does not need credentials.
+5. Task-card statuses are **记录中 / 暖机 / LIVE / 暂停 / HALT / 已停止**.
+   **暂停** freezes the recorder and refuses confirm. **停止** ends it.
+   **对账** writes a local request and does not call a venue. **HALT** is
+   red: a single-leg fill, or any net exposure that is not zero, blocks
+   new opens.
+6. When 探针实盘 is armed and the latest minute clears the band, a confirm
+   card opens. It shows net edge **after 0.9 bps** (rebate not included)
+   and, on a separate line, Tier2 Self accrual **≈ 0.54 bps** marked
+   **未到账**. It also shows the task midline, the RTH flag, each leg's
+   direction / notional / available / isolated, and a tail-vs-median
+   warning when the live net is outside the recent central 80%.
+7. **Inside RTH:** one click on **确认** admits a confirm id and calls
+   `Engine.execute_confirmed` (the same `send_taker` path as
+   `python3 main.py` without `--record-only`). Both legs are sized at
+   most $10. The result is written to the status line and `.web/probe.log`.
+8. **Outside RTH:** Confirm stays enabled. The card must show the current
+   session and that session's measured midline
+   (`us_regular` **-1.7**, `us_post_overnight` **+2.6**, `asia` **-0.4**),
+   the task's active midline (still **-1.7** during the post session is
+   **偏离约 4 bps**), and the line **带宽 1 bps，错中枢风险大于费率缺口**.
+   The first click does not send. The button becomes **强制确认**. The
+   second click sends, and the log contains `force_confirm_outside_rth=true`.
+   A request that sets the force flag without that first click is refused.
+9. After the first fill the panel shows actual Entropy fee versus the
+   assumed **0.90 bps**. A mismatch stops further confirms.
+10. **取消** skips the card and does not send. No order is placed without
+    an admitted confirm id.
 
-The recorder pid file is `.web/recorder.pid`. The task and the confirm queue
-live in `.web/` and are not committed.
+The recorder pid file is `.web/recorder.pid`. The task, the confirm queue,
+the risk file, and `probe.log` live in `.web/` and are not committed.
 
 The Analyze button runs exactly:
 
@@ -206,23 +235,31 @@ latest top-of-book and fillable@$100 cells, and deviation versus the task
 midline. It warns when the pid file's process is gone or when recent minutes
 are thin or stale.
 
-### Probe gaps
+### Probe limits
 
-The panel is a confirm queue in front of record-only collection. It is not
-an order router.
+Confirm sends a real dual-leg order through `Engine.execute_confirmed`.
+The process **启动** starts is still record-only, so the strategy loop
+does not auto-fire.
 
-- **No venue orders from the browser.** `POST /api/confirm` returns
-  `queued: true`, `routed: false`, `sent: false` after the gates pass.
-  Wiring that queue into `Engine._execute` is not done. The process the
-  panel starts always includes `--record-only`.
-- **对账 is a log line** in `.web/reconcile.json`. It does not read or
-  flatten on-chain positions.
-- **RTH is weekdays 09:30–16:00 America/New_York.** NYSE holidays are not
-  on the calendar. Confirm stays disabled outside that window even if the
-  “仅美国 RTH” toggle is off. The toggle only blocks **启动** of 探针实盘.
+- **Credentials.** Live arm and confirm both refuse when any of the five
+  `.env` keys above is blank. Values are not returned to the browser.
+- **$10 caps.** Per-order and per-side position are the Decision Card
+  defaults and are rejected above $10.
+- **Single-leg HALT.** If the two fills leave a net beyond the engine
+  tolerance, status goes red **HALT** and later confirms are refused
+  while that net is not zero. The probe does not send an unconfirmed hedge.
+- **Fee check.** The first fill that reports an Entropy fee is shown
+  against 0.9 bps. A mismatch stops further confirms.
+- **Outside RTH.** Confirm is not hard-disabled. It takes the two-click
+  **强制确认** path and logs `force_confirm_outside_rth=true`. The default
+  is still “仅美国 RTH” for **启动**. The task midline changes only when
+  the form is edited. NYSE holidays are not on the calendar.
+- **对账** is a log line in `.web/reconcile.json`. It does not flatten
+  on-chain positions.
 - **self_t2 display accrual is 0.54 bps** (`0.9 × 0.50 × 1.20`), gross, not
   cash. `recognized_rebate_bps` still applies the 0.90 growth haircut
-  (0.054 bps) inside the analyzer. Neither number enters G1–G4.
+  (0.054 bps) inside the analyzer. Neither number enters G1–G4 or the
+  net edge on the confirm card.
 - **Balances** are a public read when `.env` has an account address or
   Lighter index. Private keys are not returned. Position / isolated stay
   empty when the payload does not name SNDK.

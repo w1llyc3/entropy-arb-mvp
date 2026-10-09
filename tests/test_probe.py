@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
@@ -14,10 +15,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.config import load_config  # noqa: E402
 from web.accounts import read_accounts, scrub  # noqa: E402
+from web.live_exec import execute_admitted  # noqa: E402
 from web.probe import (  # noqa: E402
     ACCRUAL_BPS, ACCRUAL_LABEL, CONFIRM_FIELDS, DECISION_WARNING,
-    build_confirm_payload, confirm_field_errors, decision_warnings,
-    in_us_rth, leg_plan, normalize_task,
+    FORCE_RISK_LINE, build_confirm_payload, confirm_field_errors,
+    decision_warnings, in_us_rth, leg_plan, normalize_task,
+    session_snapshot,
 )
 from web.recorder_ctl import RecorderControl  # noqa: E402
 from web.session import ProbeError, ProbeSession  # noqa: E402
@@ -85,9 +88,56 @@ def test_decision_card_defaults_and_warning():
         normalize_task({"symbol": "BTC"})
     with pytest.raises(ValueError):
         normalize_task({"hedge": "lighter-rh"})
+    with pytest.raises(ValueError, match="cap is \\$10"):
+        normalize_task({"order_notional_usd": 11})
+    with pytest.raises(ValueError, match="cap is \\$10"):
+        normalize_task({"max_position_usd": 25})
 
 
-def _session(tmp_path, now):
+def _write_env(root, *, complete=True):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if complete:
+        text = (
+            "HL_PRIVATE_KEY=test-key\n"
+            "HL_ACCOUNT_ADDRESS=0xabc\n"
+            "LIGHTER_ACCOUNT_INDEX=1\n"
+            "LIGHTER_API_KEY_INDEX=2\n"
+            "LIGHTER_API_PRIVATE_KEY=test-lighter\n"
+        )
+    else:
+        text = "HL_PRIVATE_KEY=test-key\n"
+    (root / ".env").write_text(text, encoding="utf-8")
+
+
+def _flat_result(req, *, fee=0.9, buy=0.01, sell=0.01):
+    assert req.get("confirm_id")
+    net = buy - sell
+    return {
+        "ok": abs(net) < 1e-9 and abs(fee - 0.9) <= 0.05,
+        "routed": True,
+        "sent": True,
+        "halted": abs(net) > 1e-9,
+        "halt_reason": "single-leg fill" if abs(net) > 1e-9 else None,
+        "confirm_id": req["confirm_id"],
+        "buy_fill": buy,
+        "sell_fill": sell,
+        "net_base": net,
+        "entropy_fee_bps": fee,
+        "status": "filled/filled" if sell else "filled/canceled",
+        "error": None,
+    }
+
+
+def _session(tmp_path, now, *, env=True, executor=None, calls=None):
+    if env:
+        _write_env(tmp_path)
+    box = calls if calls is not None else []
+
+    def _exec(req):
+        box.append(req)
+        return _flat_result(req)
+
     return ProbeSession(tmp_path, RecorderControl(tmp_path), now=lambda: now,
                         account_reader=lambda: {
                             "creds": {"entropy": False, "lighter": False},
@@ -96,7 +146,8 @@ def _session(tmp_path, now):
                             "lighter": {"equity": None, "available": 40.0,
                                         "position": 0.0, "isolated": False},
                             "note": None,
-                        })
+                        },
+                        executor=executor or _exec)
 
 
 def _arm(sess, *, rth_only=True, manual_confirm=True, midline=-1.7):
@@ -176,18 +227,7 @@ def test_confirm_payload_fields_and_separate_accrual():
     assert any("confirm" in err for err in confirm_field_errors(broken))
 
 
-def test_confirm_refused_outside_rth_and_when_not_armed(tmp_path):
-    outside = _session(tmp_path, OUTSIDE)
-    _arm(outside)
-    payload = build_confirm_payload(
-        outside.task(), outside.queue()["pending"], rth=False,
-        tail=outside.queue()["pending"]["tail_vs_median"])
-    with pytest.raises(ProbeError) as raised:
-        outside.admit_confirm(payload)
-    assert raised.value.status_code == 403
-    assert "RTH" in str(raised.value)
-    assert outside.queue()["pending"] is not None
-
+def test_confirm_refused_when_not_armed_and_routes_when_admitted(tmp_path):
     inside = _session(tmp_path / "in", INSIDE)
     _arm(inside)
     spec = inside.task()
@@ -201,22 +241,26 @@ def test_confirm_refused_outside_rth_and_when_not_armed(tmp_path):
     assert raised.value.status_code == 409
     assert "live-armed" in str(raised.value)
 
-    paused = _session(tmp_path / "pause", INSIDE)
-    _arm(paused)
+    routed = _session(tmp_path / "go", INSIDE)
+    _arm(routed)
     good = build_confirm_payload(
-        paused.task(), paused.queue()["pending"], rth=True,
-        tail=paused.queue()["pending"]["tail_vs_median"])
-    admitted = paused.admit_confirm(good)
-    assert admitted["queued"] is True
-    assert admitted["routed"] is False
-    assert admitted["sent"] is False
-    assert "no venue order" in admitted["gap"]
-    assert paused.queue()["pending"] is None
-    assert paused.queue()["history"][-1]["action"] == "confirmed"
+        routed.task(), routed.queue()["pending"], rth=True,
+        tail=routed.queue()["pending"]["tail_vs_median"])
+    admitted = routed.admit_confirm(good)
+    assert admitted["sent"] is True
+    assert admitted["routed"] is True
+    assert admitted["confirm_id"]
+    assert admitted["force_confirm_outside_rth"] is False
+    assert routed.queue()["pending"] is None
+    assert routed.queue()["history"][-1]["action"] == "confirmed"
+    assert routed.queue()["history"][-1]["sent"] is True
+    log = (routed.log_path).read_text(encoding="utf-8")
+    assert "force_confirm_outside_rth=false" in log
+    assert "test-key" not in log
 
 
 def test_default_start_argv_is_record_only(tmp_path, monkeypatch):
-    sess = _session(tmp_path, INSIDE)
+    sess = _session(tmp_path, INSIDE, env=True)
     sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
     captured = {}
 
@@ -255,6 +299,180 @@ def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
         off.start()
     assert DECISION_WARNING in str(raised.value)
     assert raised.value.status_code == 409
+
+
+def test_missing_env_refuses_live_and_confirm(tmp_path):
+    calls = []
+    sess = _session(tmp_path, INSIDE, env=False, calls=calls)
+    sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    with pytest.raises(ProbeError) as raised:
+        sess.start()
+    assert raised.value.status_code == 409
+    assert "HL_ACCOUNT_ADDRESS" in str(raised.value)
+    assert "LIGHTER_API_PRIVATE_KEY" in str(raised.value)
+    assert calls == []
+
+    _write_env(tmp_path, complete=False)
+    _arm(sess)
+    payload = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    with pytest.raises(ProbeError) as raised:
+        sess.admit_confirm(payload)
+    assert raised.value.status_code == 409
+    assert "密钥" in str(raised.value)
+    assert calls == []
+    assert sess.queue()["pending"] is not None
+
+
+def test_outside_rth_requires_second_force_confirm(tmp_path):
+    calls = []
+    sess = _session(tmp_path, OUTSIDE, calls=calls)
+    _arm(sess)
+    snap = session_snapshot(datetime.fromtimestamp(OUTSIDE, UTC), -1.7)
+    assert snap["name"] == "us_post_overnight"
+    assert snap["midline_bps"] == 2.6
+    assert snap["task_midline_bps"] == -1.7
+    assert snap["deviation_text"] == "偏离约 4 bps"
+    assert snap["risk_line"] == FORCE_RISK_LINE
+    # The task midline stays the user's number. The session does not rewrite it.
+    assert sess.task()["midline_bps"] == -1.7
+    text = sess.config_path.read_text(encoding="utf-8")
+    assert "midline_bps: -1.7" in text
+
+    payload = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=False,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    first = sess.admit_confirm(payload)
+    assert first["needs_force_confirm"] is True
+    assert first["routed"] is False
+    assert first["sent"] is False
+    assert calls == []
+    card = first["force_card"]
+    assert card["name"] == "us_post_overnight"
+    assert card["midline_bps"] == 2.6
+    assert card["task_midline_bps"] == -1.7
+    assert card["deviation_text"] == "偏离约 4 bps"
+    assert card["risk_line"] == "带宽 1 bps，错中枢风险大于费率缺口"
+    assert sess.queue()["pending"]["force_ack"] is True
+
+    jumped = dict(payload)
+    jumped["force_confirm"] = True
+    # A fresh session without the ack must refuse even with the flag set.
+    other_calls = []
+    other = _session(tmp_path / "jump", OUTSIDE, calls=other_calls)
+    _arm(other)
+    jumped_other = build_confirm_payload(
+        other.task(), other.queue()["pending"], rth=False,
+        tail=other.queue()["pending"]["tail_vs_median"])
+    jumped_other["force_confirm"] = True
+    with pytest.raises(ProbeError) as raised:
+        other.admit_confirm(jumped_other)
+    assert raised.value.status_code == 409
+    assert other_calls == []
+
+    second = sess.admit_confirm(dict(payload, force_confirm=True))
+    assert second["sent"] is True
+    assert second["routed"] is True
+    assert second["force_confirm_outside_rth"] is True
+    assert len(calls) == 1
+    assert calls[0]["confirm_id"]
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force_confirm_outside_rth=true" in log
+    assert "test-key" not in log
+
+
+def test_single_leg_halts_and_blocks_new_opens(tmp_path):
+    calls = []
+
+    def one_leg(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.05, sell=0.0, fee=0.9)
+
+    sess = _session(tmp_path, INSIDE, executor=one_leg)
+    _arm(sess)
+    payload = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    body = sess.admit_confirm(payload)
+    assert body["sent"] is True
+    assert body["halted"] is True
+    status = sess.overlay({"running": True, "paused": False, "latest": None,
+                            "warnings": []})
+    assert status["status_label"] == "HALT"
+    assert status["halted"] is True
+    assert abs(status["net_base"]) > 0
+    _arm(sess)
+    again = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    with pytest.raises(ProbeError) as raised:
+        sess.admit_confirm(again)
+    assert raised.value.status_code == 409
+    assert "HALT" in str(raised.value)
+    assert len(calls) == 1
+
+
+def test_manual_confirm_required_and_no_silent_fire(tmp_path):
+    calls = []
+    off = _session(tmp_path, INSIDE, calls=calls)
+    off.save_task({"mode": "live", "manual_confirm": False, "rth_only": True})
+    assert off.task()["warnings"] == [DECISION_WARNING]
+    assert off.task()["live_armed"] is False
+    with pytest.raises(ProbeError) as raised:
+        off.start()
+    assert DECISION_WARNING in str(raised.value)
+    assert calls == []
+
+    shifted = _session(tmp_path / "mid", INSIDE, calls=calls)
+    saved = shifted.save_task({
+        "mode": "live", "manual_confirm": True, "midline_bps": 0,
+    })
+    assert saved["warnings"] == [DECISION_WARNING]
+    assert saved["live_armed"] is False
+    assert calls == []
+    # Creating a task never arms live and never sends.
+    plain = _session(tmp_path / "rec", INSIDE, calls=calls)
+    created = plain.save_task({})
+    assert created["mode"] == "record"
+    assert created["live_armed"] is False
+    assert calls == []
+
+
+def test_fee_mismatch_stops_further_confirms(tmp_path):
+    calls = []
+
+    def pricey(req):
+        calls.append(req)
+        return _flat_result(req, fee=1.5)
+
+    sess = _session(tmp_path, INSIDE, executor=pricey)
+    _arm(sess)
+    payload = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    body = sess.admit_confirm(payload)
+    assert body["sent"] is True
+    assert body["fee_mismatch"] is True
+    status = sess.overlay({"running": True, "paused": False, "latest": {
+        "minute_ts": INSIDE, "samples": 60,
+    }, "warnings": []})
+    assert status["fee_check"]["assumed_bps"] == 0.9
+    assert status["fee_check"]["actual_bps"] == pytest.approx(1.5)
+    assert status["fee_check"]["mismatch"] is True
+    _arm(sess)
+    again = build_confirm_payload(
+        sess.task(), sess.queue()["pending"], rth=True,
+        tail=sess.queue()["pending"]["tail_vs_median"])
+    with pytest.raises(ProbeError) as raised:
+        sess.admit_confirm(again)
+    assert "0.9" in str(raised.value)
+    assert len(calls) == 1
+
+
+def test_route_refuses_without_confirm_id():
+    with pytest.raises(RuntimeError, match="confirm id"):
+        execute_admitted({})
 
 
 def test_record_argv_stays_record_only_and_probe_yaml_loads(tmp_path):
@@ -351,8 +569,17 @@ def test_http_confirm_gate(tmp_path):
     def _sleep(symbol, hedge):
         return [sys.executable, "-c", "import time; time.sleep(30)"]
 
+    calls = []
+
+    def executor(req):
+        calls.append(req)
+        assert req.get("confirm_id")
+        return _flat_result(req)
+
+    _write_env(tmp_path)
     app = create_app(tmp_path, command_builder=_sleep,
                      now=lambda: clock["t"],
+                     executor=executor,
                      account_reader=lambda: {
                          "creds": {"entropy": True, "lighter": True},
                          "entropy": {"equity": 10, "available": 8,
@@ -410,24 +637,28 @@ def test_http_confirm_gate(tmp_path):
         bad = client.post("/api/confirm", json=missing)
         assert bad.status_code == 400
         clock["t"] = OUTSIDE
-        # Server clock is now outside RTH; the client flag must match, then the gate refuses.
         payload["rth"] = False
-        payload["confirm_enabled"] = False
-        refused = client.post("/api/confirm", json=payload)
-        assert refused.status_code == 403
-        assert "RTH" in refused.json()["detail"]
+        held = client.post("/api/confirm", json=payload)
+        assert held.status_code == 200, held.text
+        assert held.json()["needs_force_confirm"] is True
+        assert held.json()["sent"] is False
+        assert calls == []
+        card = held.json()["force_card"]
+        assert card["risk_line"] == "带宽 1 bps，错中枢风险大于费率缺口"
+        assert card["name"] == "us_post_overnight"
+        assert card["deviation_text"] == "偏离约 4 bps"
         clock["t"] = INSIDE
-        payload["rth"] = True
-        payload["confirm_enabled"] = True
         # The pending net may have been refreshed; re-read so the echo matches.
         payload = client.get("/api/status").json()["proposal"]
         assert payload["confirm_enabled"] is True
+        assert payload["rth"] is True
         ok = client.post("/api/confirm", json=payload)
         assert ok.status_code == 200, ok.text
         body = ok.json()
-        assert body["queued"] is True
-        assert body["routed"] is False
-        assert body["sent"] is False
+        assert body["routed"] is True
+        assert body["sent"] is True
+        assert body["confirm_id"]
+        assert len(calls) == 1
         again = client.get("/api/status").json()["proposal"]
         assert again is not None
         skipped = client.post("/api/confirm/cancel")

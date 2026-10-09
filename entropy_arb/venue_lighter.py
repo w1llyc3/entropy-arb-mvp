@@ -34,6 +34,19 @@ from .funding import parse_lighter_funding
 
 log = logging.getLogger("lighter")
 
+
+def _order_fee_quote(order: dict):
+    """Quote fee if the account-orders payload names one. Otherwise None."""
+    for key in ("fee", "taker_fee", "filled_quote_fee", "fee_amount"):
+        raw = order.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return abs(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return None
+
 OPEN_STATUSES = {"in-progress", "pending", "open"}
 AUTH_REFRESH_SEC = 8 * 60
 REST_TIMEOUT = 10.0
@@ -86,9 +99,13 @@ class AccountOrdersFeed:
                     continue
                 fb = float(o.get("filled_base_amount") or 0.0)
                 fq = float(o.get("filled_quote_amount") or 0.0)
-                self._resolve(coi, {"status": status, "filled_base": fb,
-                                    "filled_quote": fq,
-                                    "avg_px": (fq / fb) if fb > 0 else None})
+                info = {"status": status, "filled_base": fb,
+                        "filled_quote": fq,
+                        "avg_px": (fq / fb) if fb > 0 else None}
+                fee = _order_fee_quote(o)
+                if fee is not None:
+                    info["fee_quote"] = fee
+                self._resolve(coi, info)
 
     async def run(self, stop: asyncio.Event) -> None:
         backoff = 1.0
@@ -329,8 +346,13 @@ class LighterVenue:
                     "avg_px": None, "err": None, "unresolved": True}
         try:
             info = await asyncio.wait_for(fut, timeout=self.settle_timeout)
-            return {"status": info["status"], "filled_base": info["filled_base"],
-                    "avg_px": info.get("avg_px"), "err": None, "unresolved": False}
+            out = {"status": info["status"], "filled_base": info["filled_base"],
+                   "avg_px": info.get("avg_px"), "err": None, "unresolved": False}
+            if info.get("fee_quote") is not None:
+                out["fee_quote"] = info["fee_quote"]
+            if info.get("fee_bps") is not None:
+                out["fee_bps"] = info["fee_bps"]
+            return out
         except asyncio.TimeoutError:
             self.orders_feed.unwatch(coi)
             log.warning("[%s] no settle confirmation for coi %d in %.1fs",
