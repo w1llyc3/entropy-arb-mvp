@@ -104,7 +104,18 @@ def create_app(root: Optional[Path] = None, command_builder=None,
         )
 
     def _status() -> dict:
-        proc = ctl.snapshot()
+        try:
+            proc = ctl.snapshot()
+        except Exception as exc:
+            proc = {
+                "running": False,
+                "paused": False,
+                "warnings": [
+                    "recorder status unavailable "
+                    f"({type(exc).__name__})"
+                ],
+                "log_tail": [],
+            }
         base = assemble_status(root, proc)
         base["paused"] = bool(proc.get("paused"))
         return session.overlay(base)

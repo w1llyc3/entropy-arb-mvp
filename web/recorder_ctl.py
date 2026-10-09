@@ -133,6 +133,9 @@ class RecorderControl:
 
     @staticmethod
     def _reap(pid: int) -> None:
+        # Windows has no WNOHANG / waitpid reap. Liveness is os.kill(pid, 0).
+        if sys.platform == "win32":
+            return
         try:
             os.waitpid(pid, os.WNOHANG)
         except (ChildProcessError, OSError):
