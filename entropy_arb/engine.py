@@ -20,11 +20,13 @@ import logging
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import aiohttp
 
-from .book import ArbPlan, floor_step, plan_arb
+from .book import (ArbPlan, floor_step, plan_arb, size_above_min_notional,
+                   sync_size_grid, truncate_size)
 from .config import Config
 from .funding import FundingPoller
 from .recorder import MinuteRecorder
@@ -195,12 +197,8 @@ class Engine:
                 and self.entropy._query_address() == self.hedge._query_address()):
             self.hedge.include_core_equity = False  # shared account: count once
 
-        self._step = 10 ** -min(self.entropy.size_decimals,
-                                self.hedge.size_decimals)
-        self._min_base = max(self.entropy.min_base, self.hedge.min_base,
-                             self._step)
-        self._min_notional = max(cfg.min_order_notional,
-                                 self.entropy.min_quote, self.hedge.min_quote)
+        self._step, self._min_base, self._min_notional = sync_size_grid(
+            self.entropy, self.hedge, cfg.min_order_notional)
         log.info("pair ENTROPY(%s)-%s(%s): midline=%+.2fbps band=[-%.2f, +%.2f] "
                  "fees=%.2f+%.2f step=%g min_ntl=$%g",
                  self.entropy.conf.symbol, self.hedge.name,
@@ -376,8 +374,12 @@ class Engine:
         outcomes escalate to reconcile, everything else gets a net-delta
         check."""
         unresolved = False
+        skipped = False
         try:
             unresolved = await self._execute(buy, sell, plan)
+            if unresolved is None:
+                skipped = True
+                unresolved = False
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -385,7 +387,9 @@ class Engine:
         finally:
             self._vlock(buy.key).release()
             self._vlock(sell.key).release()
-        if unresolved:
+        if skipped:
+            pass
+        elif unresolved:
             self._reconcile_evt.set()
         else:
             await self._maybe_hedge()
@@ -447,24 +451,86 @@ class Engine:
 
     # ------------------------------------------------------------- execution
 
-    async def _execute(self, buy, sell, plan: ArbPlan) -> bool:
+    def _order_bounds(self, buy, sell, plan: ArbPlan):
+        """IOC limits actually sent. Sells are slipped down, so that price
+        is the one Hyperliquid checks against the $10 minimum."""
+        slip = self.cfg.leg_slippage_bps / 1e4
+        buy_bound = buy.px_round(plan.buy_limit * (1 + slip), round_up=False)
+        sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
+        return buy_bound, sell_bound
+
+    def _size_legs(self, buy, sell, plan: ArbPlan, *,
+                   target_notional: Optional[float]) -> Optional[ArbPlan]:
+        """Ceil the shared size. Entropy is checked first.
+
+        Returns None when Entropy's truncated quote would miss the venue
+        minimum. The caller must not send Lighter in that case.
+        """
+        buy_bound, sell_bound = self._order_bounds(buy, sell, plan)
+        if buy_bound <= 0 or sell_bound <= 0:
+            return None
+        if buy.key == "entropy":
+            legs = [(buy_bound, int(buy.size_decimals)),
+                    (sell_bound, int(sell.size_decimals))]
+        else:
+            legs = [(sell_bound, int(sell.size_decimals)),
+                    (buy_bound, int(buy.size_decimals))]
+        qty, reason = size_above_min_notional(
+            plan.qty, legs,
+            min_notional=self._min_notional,
+            size_step=self._step,
+            target_notional=target_notional,
+        )
+        if qty is None:
+            log.warning("[ARB] not sending — %s; Entropy quote would miss "
+                        "the minimum, Lighter not sent", reason)
+            return None
+        buy_sz = truncate_size(qty, int(buy.size_decimals))
+        sell_sz = truncate_size(qty, int(sell.size_decimals))
+        ent_quote = (buy_sz * buy_bound if buy.key == "entropy"
+                     else sell_sz * sell_bound)
+        ent_floor = max(float(getattr(self.entropy, "min_quote", 10.0) or 0.0),
+                        10.0)
+        if ent_quote + 1e-6 < ent_floor:
+            log.warning("[ARB] Entropy quote $%.4f < $%.2f — Lighter not sent",
+                        ent_quote, ent_floor)
+            return None
+        return replace(plan, qty=qty,
+                       buy_notional=buy_sz * buy_bound,
+                       sell_notional=sell_sz * sell_bound)
+
+    async def _execute(self, buy, sell, plan: ArbPlan, *,
+                       target_notional: Optional[float] = None
+                       ) -> Optional[bool]:
         """Send both legs and settle the fills. Both venue locks are held by
         the caller. Returns True when an outcome is unresolved and the caller
-        must escalate to reconcile."""
+        must escalate to reconcile. Returns None when nothing was sent
+        because Entropy's size would miss the minimum."""
         if self.halted:
             return False
+        sized = self._size_legs(buy, sell, plan,
+                                target_notional=target_notional)
+        if sized is None:
+            return None
+        plan = sized
         cfg = self.cfg
         inv_bps = self._inv_add_bps(buy, sell)
         direction = "sell_entropy" if sell.key == "entropy" else "buy_entropy"
+        buy_bound, sell_bound = self._order_bounds(buy, sell, plan)
+        ent_quote = (plan.buy_notional if buy.key == "entropy"
+                     else plan.sell_notional)
+        ent_floor = max(float(getattr(self.entropy, "min_quote", 10.0) or 0.0),
+                        10.0)
+        if ent_quote + 1e-6 < ent_floor:
+            log.warning("[ARB] Entropy quote $%.4f < $%.2f after sizing — "
+                        "Lighter not sent", ent_quote, ent_floor)
+            return None
         self.last_trade_ts = time.time()
         log.info("[ARB] %s: BUY %s %.6g @<=%.6g | SELL %s @>=%.6g | "
-                 "take $%.0f of $%.0f | prem %.2fbps | exp $%.4f",
-                 direction, buy.name, plan.qty, plan.buy_limit, sell.name,
-                 plan.sell_limit, plan.buy_notional, plan.q_max_notional,
+                 "take $%.2f of $%.0f | prem %.2fbps | exp $%.4f",
+                 direction, buy.name, plan.qty, buy_bound, sell.name,
+                 sell_bound, plan.buy_notional, plan.q_max_notional,
                  plan.marginal_premium_bps, plan.exp_edge_usd)
-        slip = cfg.leg_slippage_bps / 1e4
-        buy_bound = buy.px_round(plan.buy_limit * (1 + slip), round_up=False)
-        sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
         self._record_send(buy)
         self._record_send(sell)
         res = await asyncio.gather(
@@ -584,35 +650,26 @@ class Engine:
             return _not_sent(confirm_id, "stale_book")
         if not (buy.ready_to_trade() and sell.ready_to_trade()):
             return _not_sent(confirm_id, "not_ready")
-        cap = min(float(cap_notional), float(cfg.max_order_notional),
-                  float(buy.cap_usd), float(sell.cap_usd), 10.0)
-        if cap <= 0:
+        requested = min(float(cap_notional), float(cfg.max_order_notional),
+                        float(buy.cap_usd), float(sell.cap_usd))
+        if requested <= 0:
             return _not_sent(confirm_id, "cap")
         ref = buy.book.best_ask() or sell.book.best_bid() or 0.0
-        if ref > 0:
-            cap = min(cap, max(self._headroom(buy, sell, ref), 0.0))
-        if cap + 1e-9 < min(self._min_notional, 10.0) * 0.98:
+        if ref > 0 and self._headroom(buy, sell, ref) + 1e-9 < requested:
             return _not_sent(confirm_id, "position_cap")
-        # A $10 cap floored to the size step can land a hair under the
-        # configured minimum. Keep the slice, but never above the cap.
-        saved_min = self._min_notional
-        self._min_notional = min(saved_min, cap * 0.98)
-        try:
-            plan, reason = self._plan(buy, sell, cap)
-        finally:
-            self._min_notional = saved_min
+        plan, reason = self._plan(buy, sell, requested)
         if plan is None:
             return _not_sent(confirm_id, reason or "no_plan")
-        if (plan.buy_notional > cap * 1.02 + 1e-6
-                or plan.sell_notional > cap * 1.02 + 1e-6):
-            return _not_sent(confirm_id, "notional_above_cap")
         await self._vlock(buy.key).acquire()
         await self._vlock(sell.key).acquire()
         try:
-            unresolved = await self._execute(buy, sell, plan)
+            unresolved = await self._execute(
+                buy, sell, plan, target_notional=requested)
         finally:
             self._vlock(buy.key).release()
             self._vlock(sell.key).release()
+        if unresolved is None:
+            return _not_sent(confirm_id, "below_min_notional")
         last = dict(self.last_execution or {})
         bfill = float(last.get("buy_fill") or 0.0)
         sfill = float(last.get("sell_fill") or 0.0)

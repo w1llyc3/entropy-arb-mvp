@@ -71,8 +71,8 @@ def test_decision_card_defaults_and_warning():
     assert spec["hedge"] == "lighter"
     assert spec["midline_bps"] == -1.7
     assert spec["upper_bps"] == 1.0 and spec["lower_bps"] == 1.0
-    assert spec["order_notional_usd"] == 10
-    assert spec["max_position_usd"] == 10
+    assert spec["order_notional_usd"] == 11
+    assert spec["max_position_usd"] == 11
     assert spec["entropy_fee_bps"] == 0.9
     assert spec["lighter_fee_bps"] == 0.0
     assert spec["referral_mode"] == "self_t2"
@@ -88,10 +88,20 @@ def test_decision_card_defaults_and_warning():
         normalize_task({"symbol": "BTC"})
     with pytest.raises(ValueError):
         normalize_task({"hedge": "lighter-rh"})
-    with pytest.raises(ValueError, match="cap is \\$10"):
-        normalize_task({"order_notional_usd": 11})
-    with pytest.raises(ValueError, match="cap is \\$10"):
-        normalize_task({"max_position_usd": 25})
+    assert spec["auto_confirm"] is False
+    assert spec["auto_confirm_sec"] == 3
+    assert normalize_task({
+        "order_notional_usd": 10.5, "max_position_usd": 10.5,
+    })["order_notional_usd"] == 10.5
+    assert normalize_task({
+        "order_notional_usd": 50, "max_position_usd": 50,
+    })["max_position_usd"] == 50
+    with pytest.raises(ValueError, match=">= 10.5"):
+        normalize_task({"order_notional_usd": 10})
+    with pytest.raises(ValueError, match="between 2 and 5"):
+        normalize_task({"auto_confirm_sec": 9})
+    with pytest.raises(ValueError, match="cover one order"):
+        normalize_task({"order_notional_usd": 15, "max_position_usd": 12})
 
 
 def _write_env(root, *, complete=True):
@@ -129,24 +139,29 @@ def _flat_result(req, *, fee=0.9, buy=0.01, sell=0.01):
     }
 
 
-def _session(tmp_path, now, *, env=True, executor=None, calls=None):
+def _session(tmp_path, now, *, env=True, executor=None, calls=None,
+             positions=None):
     if env:
         _write_env(tmp_path)
     box = calls if calls is not None else []
+    book = positions if positions is not None else {"entropy": 0.0, "lighter": 0.0}
 
     def _exec(req):
         box.append(req)
         return _flat_result(req)
 
+    def _reader():
+        return {
+            "creds": {"entropy": False, "lighter": False},
+            "entropy": {"equity": None, "available": 25.0,
+                        "position": book["entropy"], "isolated": True},
+            "lighter": {"equity": None, "available": 40.0,
+                        "position": book["lighter"], "isolated": False},
+            "note": None,
+        }
+
     return ProbeSession(tmp_path, RecorderControl(tmp_path), now=lambda: now,
-                        account_reader=lambda: {
-                            "creds": {"entropy": False, "lighter": False},
-                            "entropy": {"equity": None, "available": 25.0,
-                                        "position": 0.0, "isolated": True},
-                            "lighter": {"equity": None, "available": 40.0,
-                                        "position": 0.0, "isolated": False},
-                            "note": None,
-                        },
+                        account_reader=_reader,
                         executor=executor or _exec)
 
 
@@ -158,8 +173,8 @@ def _arm(sess, *, rth_only=True, manual_confirm=True, midline=-1.7):
         "midline_bps": midline,
         "upper_bps": 1.0,
         "lower_bps": 1.0,
-        "order_notional_usd": 10,
-        "max_position_usd": 10,
+        "order_notional_usd": 11,
+        "max_position_usd": 11,
     })
     spec = sess.task()
     spec["live_armed"] = True
@@ -382,14 +397,28 @@ def test_outside_rth_requires_second_force_confirm(tmp_path):
     assert "test-key" not in log
 
 
+def _qualifying_latest():
+    return {
+        "minute_ts": INSIDE,
+        "samples": 60,
+        "tob": {"sell_edge_mean_bps": 8, "buy_edge_mean_bps": 1,
+                "premium_close_bps": 1},
+        "fillable_100": {"sell_bps": 8, "buy_bps": 1},
+    }
+
+
 def test_single_leg_halts_and_blocks_new_opens(tmp_path):
     calls = []
+    # Flat before the send. The fill leaves Lighter long so HALT cannot
+    # auto-clear on the next account read.
+    positions = {"entropy": 0.0, "lighter": 0.0}
 
     def one_leg(req):
         calls.append(req)
+        positions["lighter"] = 0.05
         return _flat_result(req, buy=0.05, sell=0.0, fee=0.9)
 
-    sess = _session(tmp_path, INSIDE, executor=one_leg)
+    sess = _session(tmp_path, INSIDE, executor=one_leg, positions=positions)
     _arm(sess)
     payload = build_confirm_payload(
         sess.task(), sess.queue()["pending"], rth=True,
@@ -411,6 +440,50 @@ def test_single_leg_halts_and_blocks_new_opens(tmp_path):
     assert raised.value.status_code == 409
     assert "HALT" in str(raised.value)
     assert len(calls) == 1
+
+
+def test_halt_suppresses_proposals_until_flat(tmp_path):
+    positions = {"entropy": 0.0, "lighter": 0.0061}
+    sess = _session(tmp_path, INSIDE, positions=positions)
+    _arm(sess)
+    sess.cancel_confirm()
+    assert sess.queue()["pending"] is None
+    risk = sess.risk()
+    risk["halted"] = True
+    risk["halt_reason"] = "single-leg fill"
+    risk["net_base"] = 0.0061
+    risk["halted_at"] = sess.now()
+    sess._save_risk(risk)
+    sess._account_cache = None
+    sess._accounts_at = 0.0
+    latest = _qualifying_latest()
+    assert sess.refresh_proposal(latest) is None
+    assert sess.queue()["pending"] is None
+    # Cancel sticks: a second refresh must not open a new card.
+    assert sess.refresh_proposal(latest) is None
+    assert sess.queue()["pending"] is None
+    status = sess.overlay({"running": True, "paused": False, "latest": latest,
+                            "warnings": []})
+    assert status["status_label"] == "HALT"
+    assert status["proposal"] is None
+
+    positions["entropy"] = 0.0
+    positions["lighter"] = 0.0
+    sess._account_cache = None
+    sess._accounts_at = 0.0
+    assert sess.risk()["halted"] is False
+    assert sess.risk()["net_base"] == 0.0
+    opened = sess.refresh_proposal(latest)
+    assert opened is not None
+    assert opened["proposal_id"]
+    assert sess.queue()["pending"]["proposal_id"] == opened["proposal_id"]
+
+
+def test_friday_2137_cst_is_us_rth():
+    # 21:37 China Standard Time on this Friday is 13:37 UTC, 09:37
+    # America/New_York (EDT). That is inside 09:30–16:00.
+    moment = datetime(2026, 10, 9, 13, 37, tzinfo=UTC)
+    assert in_us_rth(moment) is True
 
 
 def test_manual_confirm_required_and_no_silent_fire(tmp_path):
@@ -489,8 +562,8 @@ def test_record_argv_stays_record_only_and_probe_yaml_loads(tmp_path):
                       symbol="SNDK", hedge_venue="lighter")
     assert cfg.midline_bps == -1.7
     assert cfg.upper_bps == 1.0 and cfg.lower_bps == 1.0
-    assert cfg.max_order_notional == 10
-    assert cfg.entropy.cap_usd == 10 and cfg.hedge.cap_usd == 10
+    assert cfg.max_order_notional == 11
+    assert cfg.entropy.cap_usd == 11 and cfg.hedge.cap_usd == 11
     assert cfg.entropy.fee_bps == 0.9 and cfg.hedge.fee_bps == 0.0
     assert cfg.referral_mode == "self_t2"
     assert cfg.premium_persist_sec == 3.0
@@ -582,9 +655,9 @@ def test_http_confirm_gate(tmp_path):
                      executor=executor,
                      account_reader=lambda: {
                          "creds": {"entropy": True, "lighter": True},
-                         "entropy": {"equity": 10, "available": 8,
+                         "entropy": {"equity": 80, "available": 40,
                                      "position": 0, "isolated": True},
-                         "lighter": {"equity": 12, "available": 9,
+                         "lighter": {"equity": 90, "available": 50,
                                      "position": 0, "isolated": False},
                          "note": None,
                      })
@@ -601,14 +674,14 @@ def test_http_confirm_gate(tmp_path):
         made = client.post("/api/task", json={
             "mode": "live", "manual_confirm": True, "rth_only": True,
             "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert made.status_code == 200, made.text
         assert made.json()["warnings"] == []
         drifted = client.post("/api/task", json={
             "mode": "live", "manual_confirm": False, "rth_only": True,
             "midline_bps": 0, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert drifted.status_code == 200
         assert drifted.json()["warnings"] == ["会偏离 Decision Card"]
@@ -616,7 +689,7 @@ def test_http_confirm_gate(tmp_path):
         made = client.post("/api/task", json={
             "mode": "live", "manual_confirm": True, "rth_only": True,
             "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert made.status_code == 200
         started = client.post("/api/session/start")
@@ -636,7 +709,9 @@ def test_http_confirm_gate(tmp_path):
         del missing["accrual_label"]
         bad = client.post("/api/confirm", json=missing)
         assert bad.status_code == 400
-        clock["t"] = OUTSIDE
+        # Saturday during cash hours is outside RTH but still us_regular,
+        # so this click does not cross a session boundary.
+        clock["t"] = _ts(datetime(2026, 1, 10, 10, 0, tzinfo=NY))
         payload["rth"] = False
         held = client.post("/api/confirm", json=payload)
         assert held.status_code == 200, held.text
@@ -645,8 +720,8 @@ def test_http_confirm_gate(tmp_path):
         assert calls == []
         card = held.json()["force_card"]
         assert card["risk_line"] == "带宽 1 bps，错中枢风险大于费率缺口"
-        assert card["name"] == "us_post_overnight"
-        assert card["deviation_text"] == "偏离约 4 bps"
+        assert card["name"] == "us_regular"
+        assert card["deviation_text"] == "偏离约 0 bps"
         clock["t"] = INSIDE
         # The pending net may have been refreshed; re-read so the echo matches.
         payload = client.get("/api/status").json()["proposal"]

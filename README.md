@@ -128,7 +128,11 @@ The Dexter click path is in [MVP.md](MVP.md). The page does not arm live
 trading by itself and does not receive API keys. **启动** always passes
 `--record-only`. **确认** is a separate action: inside US RTH it sends one
 dual-leg order through `Engine.execute_confirmed`; outside RTH it requires
-a second click, **强制确认**. The CLI live command above is unchanged.
+a second click, **强制确认**. Order size floors at $10.50 and is capped by
+the smaller available balance × 0.9 (no hard $20 ceiling). Auto-confirm
+stays off until the form checkbox is checked. A live task adopts the
+session midline only on a boundary when both venues are flat. The CLI
+live command above is unchanged.
 
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
