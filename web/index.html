@@ -851,12 +851,19 @@ async function post(url, body) {
 }
 
 $("open-create").addEventListener("click", async () => {
-  const status = await fetch("/api/status").then((r) => r.json());
-  if (status.running) {
-    alert("先停止，再修改任务。");
-    return;
+  let task = null;
+  try {
+    const res = await fetch("/api/status");
+    const status = await res.json();
+    if (res.ok && status.running) {
+      alert("先停止，再修改任务。");
+      return;
+    }
+    if (res.ok) task = status.task;
+  } catch (err) {
+    task = null;
   }
-  openCreate(status.task);
+  openCreate(task);
 });
 $("create-close").addEventListener("click", () => { $("create-modal").hidden = true; });
 $("create-cancel").addEventListener("click", () => { $("create-modal").hidden = true; });

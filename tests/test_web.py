@@ -453,6 +453,43 @@ def test_http_analyze_shows_labeled_gates(tmp_path):
     assert body["depth_ok_frac_text"] == "0.7500"
 
 
+def test_reap_is_noop_on_windows(monkeypatch):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    monkeypatch.delattr(rc.os, "WNOHANG", raising=False)
+    calls = []
+
+    def waitpid(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(rc.os, "waitpid", waitpid, raising=False)
+    RecorderControl._reap(4242)
+    assert calls == []
+
+
+def test_status_survives_recorder_snapshot_failure(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    app = create_app(tmp_path)
+
+    def boom():
+        raise AttributeError("module 'os' has no attribute 'WNOHANG'")
+
+    monkeypatch.setattr(app.state.ctl, "snapshot", boom)
+    with TestClient(app) as client:
+        res = client.get("/api/status")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["running"] is False
+    assert body["paused"] is False
+    assert any("recorder status unavailable" in w for w in body["warnings"])
+    assert "status_label" in body
+    assert body["csv_path"] == "logs/minutes.csv"
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock path")
 def test_panel_lock_flocks_on_posix(tmp_path, monkeypatch):
     import web.recorder_ctl as rc
