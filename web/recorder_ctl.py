@@ -133,6 +133,10 @@ class RecorderControl:
 
     @staticmethod
     def _reap(pid: int) -> None:
+        # Windows has no POSIX zombies to collect, and os.WNOHANG is not
+        # the wait flag to use there.
+        if sys.platform == "win32":
+            return
         try:
             os.waitpid(pid, os.WNOHANG)
         except (ChildProcessError, OSError):
@@ -186,6 +190,13 @@ class RecorderControl:
         return True
 
     def _signal(self, pid: int, sig: int) -> None:
+        if sys.platform == "win32":
+            # os.killpg is Unix-only. Signal the pid directly.
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, OSError):
+                return
+            return
         try:
             os.killpg(pid, sig)
         except ProcessLookupError:
@@ -196,7 +207,42 @@ class RecorderControl:
             except ProcessLookupError:
                 return
 
+    def _taskkill(self, pid: int, *, force: bool) -> None:
+        cmd = ["taskkill", "/PID", str(int(pid)), "/T"]
+        if force:
+            cmd.append("/F")
+        try:
+            subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     def _terminate(self, pid: int) -> None:
+        if sys.platform == "win32":
+            # taskkill /T ends the tree. Do not send SIGKILL: that name is
+            # Unix-only, and Windows os.kill treats most signals as
+            # TerminateProcess.
+            if not self._pid_exists(pid):
+                return
+            self._taskkill(pid, force=False)
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                if not self._pid_exists(pid):
+                    return
+                time.sleep(0.05)
+            self._taskkill(pid, force=True)
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if not self._pid_exists(pid):
+                    return
+                time.sleep(0.05)
+            return
         if not self._pid_exists(pid):
             self._reap(pid)
             return
