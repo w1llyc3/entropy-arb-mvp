@@ -9,7 +9,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.config import (  # noqa: E402
-    ConfigError, load_config, recognized_rebate_bps)
+    ConfigError, display_accrual_bps, load_config, recognized_rebate_bps)
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 EXAMPLE = os.path.join(ROOT, "config.example.yaml")
@@ -171,6 +171,11 @@ def test_fees_ledger_validation():
                "  rebate_accrual_only: true\n  growth_haircut: 1.0\n")
     assert cfg.referral_mode == "self_t4" and cfg.growth_haircut == 1.0
     assert recognized_rebate_bps(0.9, 1.0, "self_t4") == 0.0
+    cfg = load(MINIMAL + "\nfees_ledger:\n  referral_mode: self_t2\n"
+               "  rebate_accrual_only: true\n  growth_haircut: 0.90\n")
+    assert cfg.referral_mode == "self_t2"
+    assert abs(display_accrual_bps(0.9, "self_t2") - 0.54) < 1e-12
+    assert abs(recognized_rebate_bps(0.9, 0.90, "self_t2") - 0.054) < 1e-12
 
 
 if __name__ == "__main__":

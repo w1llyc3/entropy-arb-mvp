@@ -221,8 +221,10 @@ class RecorderControl:
             label = f"pid {pid}" if pid else "the recorded pid"
             warnings.append(
                 f"recorder process is dead ({label} is not running)")
+        paused = bool(running and meta and meta.get("paused"))
         return {
             "running": running,
+            "paused": paused,
             "pid": pid if meta else None,
             "uptime_sec": uptime,
             "started_at": started_at if meta else None,
@@ -299,4 +301,30 @@ class RecorderControl:
             if pid:
                 self._terminate(pid)
             self._clear_meta()
-        return {"running": False, "stopped": True, "pid": pid}
+        return {"running": False, "stopped": True, "paused": False, "pid": pid}
+
+    def pause(self) -> dict:
+        """Freeze the record-only process. Does not send an order."""
+        with self._locked():
+            meta = self._read_meta()
+            if not self._alive(meta):
+                raise RecorderError("nothing is running to pause", status_code=409)
+            pid = int(meta["pid"])
+            self._signal(pid, signal.SIGSTOP)
+            meta["paused"] = True
+            self._write_meta(meta)
+        return {"running": True, "paused": True, "pid": pid}
+
+    def resume(self) -> dict:
+        """Continue a paused record-only process."""
+        with self._locked():
+            meta = self._read_meta()
+            if not self._alive(meta):
+                raise RecorderError("nothing is paused to resume", status_code=409)
+            if not meta.get("paused"):
+                raise RecorderError("recorder is not paused", status_code=409)
+            pid = int(meta["pid"])
+            self._signal(pid, signal.SIGCONT)
+            meta["paused"] = False
+            self._write_meta(meta)
+        return {"running": True, "paused": False, "pid": pid}

@@ -37,11 +37,16 @@ HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz")
 # percentages of Entropy's share of the HIP-3 fee, not of the full taker
 # fee (https://docs.entropy.io/about-entropy/referrals):
 #   referred_t4 — referred-user benefit at tier 4 = 100%
+#   self_t2     — self rebate at tier 2 = 120%
 #   self_t3     — self rebate at tier 3 = 160%
 #   self_t4     — self rebate at tier 4 = 200%
-REFERRAL_MODES = ("referred_t4", "self_t3", "self_t4")
+# self_t2 on the 0.9 bps SNDK fee is 0.9 * 0.50 * 1.20 = 0.54 bps of
+# gross accrual (display only, not cash). The growth haircut still applies
+# inside recognized_rebate_bps.
+REFERRAL_MODES = ("referred_t4", "self_t2", "self_t3", "self_t4")
 REFERRAL_RATES = {
     "referred_t4": 1.00,
+    "self_t2": 1.20,
     "self_t3": 1.60,
     "self_t4": 2.00,
 }
@@ -73,6 +78,21 @@ def recognized_rebate_bps(entropy_fee_bps: float, growth_haircut: float,
     entropy_share = float(entropy_fee_bps) * ENTROPY_FEE_SHARE
     kept = 1.0 - float(growth_haircut)
     return entropy_share * kept * REFERRAL_RATES[referral_mode]
+
+
+def display_accrual_bps(entropy_fee_bps: float, referral_mode: str) -> float:
+    """Gross referral accrual in bps, before the growth haircut.
+
+    Display only. Never add this to cash PnL or to a gate. For self_t2 and
+    the SNDK 0.9 bps taker fee the figure is 0.54 bps. The confirm card
+    labels it 未到账 so it cannot be read as money already received.
+    """
+    if referral_mode not in REFERRAL_RATES:
+        raise ConfigError(
+            f"referral_mode must be one of {list(REFERRAL_MODES)}, "
+            f"got {referral_mode!r}")
+    return (float(entropy_fee_bps) * ENTROPY_FEE_SHARE
+            * REFERRAL_RATES[referral_mode])
 
 
 @dataclass(frozen=True)

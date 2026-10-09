@@ -1,1 +1,1 @@
-"""Localhost record-only panel. Does not trade and does not load secrets."""
+"""Localhost SNDK probe panel. Does not auto-start live trading or send secrets."""
