@@ -158,9 +158,11 @@ python3 main.py --symbol SNDK --hedge lighter
 
 ### Click path (Dexter)
 
-The Decision Card is **NO EDGE**. This probe is a user-chosen $10 minimum,
-not a signal that the gate passed. The form does not switch the midline
-when the session changes.
+The Decision Card is **NO EDGE**. This probe is a user-chosen order of
+about $11 (allowed $10.50–$20), not a signal that the gate passed. The
+form does not switch the midline when the session changes. A $10.00
+order is rejected: szDecimals truncation was sending Hyperliquid a
+sub-$10 leg.
 
 1. Fill `.env` on the server before any live click. Required names:
    `HL_PRIVATE_KEY`, `HL_ACCOUNT_ADDRESS`, `LIGHTER_ACCOUNT_INDEX`,
@@ -169,14 +171,16 @@ when the session changes.
    探针实盘 and **确认**.
 2. Open <http://127.0.0.1:8765>. **创建套利任务** (eyebrow NEW STRATEGY).
    The form opens on the Decision Card: pair SNDK, Entropy dex `io` ↔
-   Lighter, midline **-1.7**, upper/lower **1.0 / 1.0**, order **$10**,
-   position cap **$10** per side, fees **0.9 / 0** (read-only), referral
+   Lighter, midline **-1.7**, upper/lower **1.0 / 1.0**, order **$11**
+   (allowed **$10.50–$20**), position cap **$11** per side (must cover
+   the order, max **$20**), fees **0.9 / 0** (read-only), referral
    **self_t2** accrual **≈ 0.54 bps** labeled **未到账**, manual confirm
    **on**, US RTH window **on** (recommended). Mode defaults to **只记录**.
    Creating the task does not arm live and does not send an order.
 3. If midline is moved off -1.7, or manual confirm is turned off, the form
    shows **会偏离 Decision Card**. Confirm-off refuses to arm 探针实盘 and
-   cannot silently auto-fire. Order and position inputs stay capped at $10.
+   cannot silently auto-fire. Order size is **$10.50–$20** (default $11).
+   Position cap must cover that order and cannot exceed $20.
 4. Choose **探针实盘**, then **启动**. That is the explicit second action.
    It still launches only the recorder:
 
@@ -200,8 +204,11 @@ python3 main.py --record-only --no-dashboard --symbol SNDK --hedge lighter --con
    warning when the live net is outside the recent central 80%.
 7. **Inside RTH:** one click on **确认** admits a confirm id and calls
    `Engine.execute_confirmed` (the same `send_taker` path as
-   `python3 main.py` without `--record-only`). Both legs are sized at
-   most $10. The result is written to the status line and `.web/probe.log`.
+   `python3 main.py` without `--record-only`). Both legs are ceiled so
+   each venue's quote, after szDecimals, is at least the requested
+   notional (about $10.50–$20) and clearly above Hyperliquid's $10
+   minimum. Entropy is checked before Lighter is sent. The result is
+   written to the status line and `.web/probe.log`.
 8. **Outside RTH:** Confirm stays enabled. The card must show the current
    session and that session's measured midline
    (`us_regular` **-1.7**, `us_post_overnight` **+2.6**, `asia` **-0.4**),
@@ -243,11 +250,12 @@ does not auto-fire.
 
 - **Credentials.** Live arm and confirm both refuse when any of the five
   `.env` keys above is blank. Values are not returned to the browser.
-- **$10 caps.** Per-order and per-side position are the Decision Card
-  defaults and are rejected above $10.
+- **Order size.** Default **$11**, minimum **$10.50**, maximum **$20**.
+  Position cap must cover one order and is rejected above **$20**.
 - **Single-leg HALT.** If the two fills leave a net beyond the engine
-  tolerance, status goes red **HALT** and later confirms are refused
-  while that net is not zero. The probe does not send an unconfirmed hedge.
+  tolerance, status goes red **HALT**. While halted, refresh does not
+  open a new confirm card. HALT clears when both venue positions are
+  flat. The probe does not send an unconfirmed hedge.
 - **Fee check.** The first fill that reports an Entropy fee is shown
   against 0.9 bps. A mismatch stops further confirms.
 - **Outside RTH.** Confirm is not hard-disabled. It takes the two-click
