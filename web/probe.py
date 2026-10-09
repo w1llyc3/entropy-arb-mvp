@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, time as dtime
 from typing import Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from entropy_arb.config import display_accrual_bps
 
@@ -33,10 +33,13 @@ ACCRUAL_BPS = round(display_accrual_bps(ENTROPY_FEE_BPS, REFERRAL_MODE), 4)
 ACCRUAL_LABEL = "未到账"
 DECISION_WARNING = "会偏离 Decision Card"
 
-NY = ZoneInfo("America/New_York")
 RTH_OPEN = dtime(9, 30)
 RTH_CLOSE = dtime(16, 0)
 RTH_WINDOW = "America/New_York 09:30–16:00"
+
+# Loaded on first RTH check. Constructing this at import crashes
+# ``python -m web`` on Windows when the tzdata package is absent.
+_NY: Optional[ZoneInfo] = None
 
 # Weekday session only. Exchange holidays are not on this calendar.
 CONFIRM_FIELDS = (
@@ -157,6 +160,20 @@ def decision_warnings(spec: dict) -> list:
     return []
 
 
+def _new_york() -> ZoneInfo:
+    """America/New_York. Windows stdlib zoneinfo needs the tzdata package."""
+    global _NY
+    if _NY is None:
+        try:
+            _NY = ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError as exc:
+            raise ZoneInfoNotFoundError(
+                "No time zone found with key America/New_York. "
+                "On Windows install the IANA database: pip install tzdata"
+            ) from exc
+    return _NY
+
+
 def in_us_rth(now: datetime) -> bool:
     """US cash session, America/New_York, weekdays 09:30 inclusive to 16:00 exclusive.
 
@@ -165,7 +182,7 @@ def in_us_rth(now: datetime) -> bool:
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=ZoneInfo("UTC"))
-    local = now.astimezone(NY)
+    local = now.astimezone(_new_york())
     if local.weekday() >= 5:
         return False
     clock = local.timetz().replace(tzinfo=None)

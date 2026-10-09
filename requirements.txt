@@ -6,3 +6,7 @@ websockets>=12.0
 python-dotenv>=1.0
 PyYAML>=6.0
 rich>=13.0
+# Windows stdlib zoneinfo has no IANA database. The web probe loads
+# America/New_York for the cash-session window; Linux uses system
+# zoneinfo when that key is already present.
+tzdata>=2024.1
