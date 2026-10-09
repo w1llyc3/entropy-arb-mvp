@@ -13,23 +13,28 @@ from pathlib import Path
 
 import aiohttp
 
+from entropy_arb.book import sync_size_grid
 from entropy_arb.config import load_config
 from entropy_arb.engine import Engine
 from web.accounts import missing_live_env
+from web.probe import MAX_ORDER_USD, MAX_POSITION_USD, MIN_ORDER_USD
 
 _BOOK_WAIT_SEC = 12.0
 
 
 def execute_admitted(req: dict) -> dict:
     """Synchronous entry used by the panel. Refuses before any network if
-    the confirm id or the $10 cap is missing."""
+    the confirm id is missing or the notional is outside $10.50–$20."""
     confirm_id = str((req or {}).get("confirm_id") or "").strip()
     if not confirm_id:
         raise RuntimeError("refusing order without an admitted confirm id")
     order = float(req.get("order_notional_usd") or 0.0)
     position = float(req.get("max_position_usd") or 0.0)
-    if order - 10.0 > 1e-9 or position - 10.0 > 1e-9:
-        raise RuntimeError("probe caps are $10")
+    if order < MIN_ORDER_USD - 1e-9 or order - MAX_ORDER_USD > 1e-9:
+        raise RuntimeError("probe order notional must be $10.50–$20")
+    if position + 1e-9 < order or position - MAX_POSITION_USD > 1e-9:
+        raise RuntimeError(
+            "probe position cap must cover the order and be <= $20")
     return asyncio.run(_route(req, confirm_id))
 
 
@@ -41,9 +46,9 @@ async def _route(req: dict, confirm_id: str) -> dict:
     env_path = root / ".env"
     cfg = load_config(str(cfg_path), str(env_path),
                       symbol="SNDK", hedge_venue="lighter")
-    cfg.max_order_notional = min(float(cfg.max_order_notional), 10.0)
-    cfg.entropy.cap_usd = min(float(cfg.entropy.cap_usd), 10.0)
-    cfg.hedge.cap_usd = min(float(cfg.hedge.cap_usd), 10.0)
+    cfg.max_order_notional = min(float(cfg.max_order_notional), MAX_ORDER_USD)
+    cfg.entropy.cap_usd = min(float(cfg.entropy.cap_usd), MAX_POSITION_USD)
+    cfg.hedge.cap_usd = min(float(cfg.hedge.cap_usd), MAX_POSITION_USD)
     eng = Engine(cfg, record_only=False)
     eng.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(
         keepalive_timeout=75.0, ttl_dns_cache=300))
@@ -57,10 +62,8 @@ async def _route(req: dict, confirm_id: str) -> dict:
             return _idle(confirm_id, "credentials incomplete")
         eng.entropy.init_signer()
         eng.hedge.init_signer()
-        eng._step = 10 ** -min(eng.entropy.size_decimals, eng.hedge.size_decimals)
-        eng._min_base = max(eng.entropy.min_base, eng.hedge.min_base, eng._step)
-        eng._min_notional = max(cfg.min_order_notional,
-                                eng.entropy.min_quote, eng.hedge.min_quote)
+        eng._step, eng._min_base, eng._min_notional = sync_size_grid(
+            eng.entropy, eng.hedge, cfg.min_order_notional)
         for venue in eng.venues.values():
             tasks += venue.start_tasks(eng.stop, eng._update_evt.set, True)
         fresh = await _wait_books(eng)
@@ -69,7 +72,7 @@ async def _route(req: dict, confirm_id: str) -> dict:
         result = await eng.execute_confirmed(
             direction=str(req.get("direction") or ""),
             confirm_id=confirm_id,
-            cap_notional=min(10.0, float(req.get("order_notional_usd") or 10.0)),
+            cap_notional=float(req.get("order_notional_usd") or 0.0),
         )
         if result.get("sent") and result.get("entropy_fee_bps") is None:
             fee = await _entropy_fee(eng, result)
