@@ -5,6 +5,7 @@ Web routes need requirements-web.txt; they skip when fastapi is absent.
 """
 import csv
 import os
+import signal
 import sys
 import time
 
@@ -315,6 +316,10 @@ def test_panel_pages_and_routes(tmp_path):
         assert "只记录" in html
         assert "探针实盘" in html
         assert "会偏离 Decision Card" in html
+        assert "强制启动" in html
+        assert "force_start_outside_rth" in html
+        assert "availableShort" in html
+        assert "确认和强制确认都保持关闭" in html
         assert "未到账" in html
         assert "logs/minutes.csv" in html
         for label in ("G1", "G2", "G3", "G4", "depth_ok_frac",
@@ -472,6 +477,193 @@ def test_panel_lock_flocks_on_posix(tmp_path, monkeypatch):
     assert "import msvcrt" in source
     assert "msvcrt.locking" in source
     assert "fcntl.flock" in source
+
+
+def _advance_clock(monkeypatch, module, start=0.0):
+    clock = {"now": start}
+
+    def now():
+        return clock["now"]
+
+    def sleep(seconds):
+        clock["now"] += seconds
+
+    monkeypatch.setattr(module.time, "time", now)
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    return clock
+
+
+def test_reap_is_noop_on_windows(monkeypatch, tmp_path):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    monkeypatch.delattr(rc.os, "WNOHANG", raising=False)
+    calls = []
+
+    def waitpid(*args, **kwargs):
+        calls.append(args)
+
+    monkeypatch.setattr(rc.os, "waitpid", waitpid)
+    RecorderControl(tmp_path)._reap(123)
+    assert calls == []
+
+
+def test_signal_on_windows_uses_os_kill(monkeypatch, tmp_path):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    monkeypatch.delattr(rc.signal, "SIGKILL", raising=False)
+    calls = {"kill": [], "killpg": []}
+
+    def kill(pid, sig):
+        calls["kill"].append((pid, sig))
+
+    def killpg(pid, sig):
+        calls["killpg"].append((pid, sig))
+
+    monkeypatch.setattr(rc.os, "kill", kill)
+    monkeypatch.setattr(rc.os, "killpg", killpg, raising=False)
+    RecorderControl(tmp_path)._signal(77, signal.SIGTERM)
+    assert calls["kill"] == [(77, signal.SIGTERM)]
+    assert calls["killpg"] == []
+
+
+def test_signal_permission_error_falls_back_to_os_kill(monkeypatch, tmp_path):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "linux")
+    calls = []
+
+    def kill(pid, sig):
+        calls.append((pid, sig))
+
+    def killpg(pid, sig):
+        raise PermissionError("not the session leader")
+
+    monkeypatch.setattr(rc.os, "kill", kill)
+    monkeypatch.setattr(rc.os, "killpg", killpg)
+    RecorderControl(tmp_path)._signal(77, signal.SIGTERM)
+    assert calls == [(77, signal.SIGTERM)]
+
+
+def test_signal_attribute_error_falls_back_to_os_kill(monkeypatch, tmp_path):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "linux")
+    calls = []
+
+    def kill(pid, sig):
+        calls.append((pid, sig))
+
+    monkeypatch.setattr(rc.os, "kill", kill)
+    monkeypatch.delattr(rc.os, "killpg", raising=False)
+    RecorderControl(tmp_path)._signal(77, signal.SIGTERM)
+    assert calls == [(77, signal.SIGTERM)]
+
+
+def test_terminate_on_windows_uses_taskkill_not_sigkill(monkeypatch, tmp_path):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    monkeypatch.delattr(rc.os, "killpg", raising=False)
+    monkeypatch.delattr(rc.signal, "SIGKILL", raising=False)
+    _advance_clock(monkeypatch, rc)
+
+    signals = []
+    commands = []
+    alive = {"value": True}
+
+    def kill(pid, sig):
+        signals.append((pid, sig))
+
+    def exists(pid):
+        return alive["value"]
+
+    def run(*args, **kwargs):
+        commands.append((args, kwargs))
+        alive["value"] = False
+
+    monkeypatch.setattr(rc.os, "kill", kill)
+    monkeypatch.setattr(RecorderControl, "_pid_exists", staticmethod(exists))
+    monkeypatch.setattr(rc.subprocess, "run", run)
+    RecorderControl(tmp_path)._terminate(4321)
+
+    assert signals == [(4321, signal.SIGTERM)]
+    assert len(commands) == 1
+    args, kwargs = commands[0]
+    assert args[0] == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert kwargs.get("check") is False
+
+
+def test_terminate_on_windows_skips_taskkill_after_sigterm(monkeypatch, tmp_path):
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    monkeypatch.delattr(rc.signal, "SIGKILL", raising=False)
+    _advance_clock(monkeypatch, rc)
+
+    signals = []
+    commands = []
+    checks = {"n": 0}
+
+    def kill(pid, sig):
+        signals.append((pid, sig))
+
+    def exists(pid):
+        checks["n"] += 1
+        return checks["n"] == 1
+
+    def run(*args, **kwargs):
+        commands.append(args)
+
+    monkeypatch.setattr(rc.os, "kill", kill)
+    monkeypatch.setattr(RecorderControl, "_pid_exists", staticmethod(exists))
+    monkeypatch.setattr(rc.subprocess, "run", run)
+    RecorderControl(tmp_path)._terminate(4321)
+    assert signals == [(4321, signal.SIGTERM)]
+    assert commands == []
+
+
+def test_stop_on_windows_clears_meta_without_killpg(monkeypatch, tmp_path):
+    from contextlib import nullcontext
+
+    import web.recorder_ctl as rc
+
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    monkeypatch.delattr(rc.os, "killpg", raising=False)
+    monkeypatch.delattr(rc.signal, "SIGKILL", raising=False)
+    _advance_clock(monkeypatch, rc)
+
+    alive = {"value": True}
+    commands = []
+
+    def kill(pid, sig):
+        return None
+
+    def exists(pid):
+        return alive["value"]
+
+    def run(*args, **kwargs):
+        commands.append(args[0])
+        alive["value"] = False
+
+    monkeypatch.setattr(rc.os, "kill", kill)
+    monkeypatch.setattr(RecorderControl, "_pid_exists", staticmethod(exists))
+    monkeypatch.setattr(rc.subprocess, "run", run)
+
+    ctl = RecorderControl(tmp_path)
+    monkeypatch.setattr(ctl, "_locked", lambda: nullcontext())
+    ctl.dir.mkdir(parents=True)
+    ctl.pid_path.write_text("4321\n")
+    ctl.meta_path.write_text(
+        '{"pid": 4321, "started_at": 1, "symbol": "SNDK",'
+        ' "hedge": "lighter", "argv": ["python3", "main.py"]}\n')
+    stopped = ctl.stop()
+    assert stopped["stopped"] is True
+    assert stopped["pid"] == 4321
+    assert commands == [["taskkill", "/PID", "4321", "/T", "/F"]]
+    assert not ctl.pid_path.exists()
+    assert not ctl.meta_path.exists()
 
 
 def test_main_binds_loopback_only(monkeypatch):
