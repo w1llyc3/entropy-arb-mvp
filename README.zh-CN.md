@@ -70,9 +70,17 @@ python3 -m web
 只监听 <http://127.0.0.1:8765>。打开页面不会自动武装实盘，密钥也不会发到浏览器。
 Dexter 的点击路径、Decision Card 默认值（中枢 -1.7、带宽 ±1.0、单笔与单边上限 $10、
 self_t2 应计约 0.54 bps 标记未到账）见 [MVP.md](MVP.md)。**启动**仍然只跑
-`--record-only`。**确认**才下单：美股 RTH 内一次确认走 `Engine.execute_confirmed`；
+`--record-only`。美股 RTH 内一次启动即武装；RTH 外第一次只显示 **强制启动**，
+第二次才武装。**确认**才下单：美股 RTH 内一次确认走 `Engine.execute_confirmed`；
 RTH 外必须再点一次 **强制确认**。命令行实盘不变：
 `python3 main.py --symbol SNDK --hedge lighter`。
+
+页面上的基差图读 `logs/minutes.csv`（Entropy / Lighter 分钟收盘价和
+`premium_close_bps`，加上任务中枢与带宽），大约每 45 秒重读一次。
+`python3 tools/plot_basis.py` 把同一张图写到 `.web/basis.png`。
+
+Windows 上用 `tools/run_web_watchdog.bat` 守一个面板。再开一份会直接退出。
+8765 已经在听，或者 `/api/status` 有响应时，不会再起一个 `python -m web`。
 
 对称持仓（Entropy 空 / Lighter 多，或相反）时，溢价回到任务带宽内（含边界，
 `中枢 − 下沿 ≤ 溢价 ≤ 中枢 + 上沿`）并持续 3 秒，才提出只减仓平仓。不是碰到中枢才平。

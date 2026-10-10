@@ -289,13 +289,16 @@ def test_default_start_argv_is_record_only(tmp_path, monkeypatch):
     assert "LIVE" not in joined
 
 
-def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
+def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path, monkeypatch):
     sess = _session(tmp_path, OUTSIDE)
     sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
-    with pytest.raises(ProbeError) as raised:
-        sess.start()
-    assert raised.value.status_code == 409
-    assert "RTH" in str(raised.value)
+    spawned = _fake_spawn(sess, monkeypatch)
+    first = sess.start()
+    assert first["needs_force_start"] is True
+    assert first["running"] is False
+    assert first["live_armed"] is False
+    assert "RTH" in first["gap"]
+    assert spawned == []
 
     off = _session(tmp_path / "off", INSIDE)
     off.save_task({"mode": "live", "manual_confirm": False, "rth_only": True})
@@ -303,6 +306,113 @@ def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
         off.start()
     assert DECISION_WARNING in str(raised.value)
     assert raised.value.status_code == 409
+
+
+def _fake_spawn(sess, monkeypatch):
+    spawned = []
+
+    def fake_start(symbol, hedge):
+        argv = list(sess.record_argv(symbol, hedge))
+        spawned.append(argv)
+        return {"pid": 4242, "argv": argv, "symbol": symbol, "hedge": hedge,
+                "running": True}
+
+    monkeypatch.setattr(sess.ctl, "start", fake_start)
+    return spawned
+
+
+def test_outside_rth_start_needs_force_then_arms(tmp_path, monkeypatch):
+    sess = _session(tmp_path, OUTSIDE)
+    sess.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7,
+    })
+    spawned = _fake_spawn(sess, monkeypatch)
+    first = sess.start()
+    assert first["ok"] is False
+    assert first["needs_force_start"] is True
+    assert first["gap"] == "非 RTH：需要第二次点击强制启动才会武装"
+    card = first["force_card"]
+    snap = session_snapshot(datetime.fromtimestamp(OUTSIDE, UTC), -1.7)
+    assert card == snap
+    assert sess.task()["force_start_ack"] is True
+    assert spawned == []
+
+    jumped = _session(tmp_path / "jump", OUTSIDE)
+    jumped.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    jumped_spawned = _fake_spawn(jumped, monkeypatch)
+    with pytest.raises(ProbeError) as raised:
+        jumped.start(force_start_outside_rth=True)
+    assert raised.value.status_code == 409
+    assert jumped_spawned == []
+
+    second = sess.start(force_start_outside_rth=True)
+    assert second["needs_force_start"] is False
+    assert second["live_armed"] is True
+    assert second["force_start_outside_rth"] is True
+    assert "--record-only" in second["argv"]
+    assert sess.task().get("force_start_ack") is None
+    assert len(spawned) == 1
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force_start_outside_rth=true" in log
+
+
+def test_inside_rth_and_record_skip_force_start(tmp_path, monkeypatch):
+    inside = _session(tmp_path / "in", INSIDE)
+    inside.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7,
+    })
+    spawned = _fake_spawn(inside, monkeypatch)
+    info = inside.start()
+    assert info["needs_force_start"] is False
+    assert info["live_armed"] is True
+    assert info["force_start_outside_rth"] is False
+    assert len(spawned) == 1
+
+    record = _session(tmp_path / "rec", OUTSIDE)
+    record.save_task({"mode": "record", "rth_only": True})
+    record_spawned = _fake_spawn(record, monkeypatch)
+    recorded = record.start()
+    assert recorded["live_armed"] is False
+    assert recorded["needs_force_start"] is False
+    assert record.task().get("force_start_ack") is None
+    assert len(record_spawned) == 1
+
+
+def test_http_force_start_outside_rth(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    _write_env(tmp_path)
+
+    def _quiet(symbol, hedge):
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    app = create_app(tmp_path, command_builder=_quiet, now=lambda: OUTSIDE)
+    with TestClient(app) as client:
+        made = client.post("/api/task", json={
+            "mode": "live", "manual_confirm": True, "rth_only": True,
+            "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
+            "order_notional_usd": 10, "max_position_usd": 10,
+        })
+        assert made.status_code == 200, made.text
+        first = client.post("/api/session/start", json={})
+        assert first.status_code == 200, first.text
+        assert first.json()["needs_force_start"] is True
+        assert first.json()["running"] is False
+        jumped = client.post("/api/session/start", json={
+            "force_start_outside_rth": False,
+        })
+        assert jumped.json()["needs_force_start"] is True
+        second = client.post("/api/session/start", json={
+            "force_start_outside_rth": True,
+        })
+        assert second.status_code == 200, second.text
+        assert second.json()["live_armed"] is True
+        assert second.json()["force_start_outside_rth"] is True
+        client.post("/api/stop")
 
 
 def test_missing_env_refuses_live_and_confirm(tmp_path):

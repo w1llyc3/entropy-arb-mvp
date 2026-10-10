@@ -233,7 +233,11 @@ Minute bars stay at `logs/minutes.csv` (one row per completed minute). The
 status view reads that file for minutes collected, samples coverage, the
 latest top-of-book and fillable@$100 cells, and deviation versus the task
 midline. It warns when the pid file's process is gone or when recent minutes
-are thin or stale.
+are thin or stale. The basis chart on the same page reads that CSV
+(Entropy and Lighter closes, `premium_close_bps`, task midline and ± bands)
+and refreshes about every 45 seconds. `python3 tools/plot_basis.py` writes
+the same picture to `.web/basis.png`. Open/close markers are drawn only
+when `logs/trades.csv` already has fill timestamps.
 
 ### Probe limits
 

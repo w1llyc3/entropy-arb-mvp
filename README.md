@@ -126,9 +126,20 @@ feeds are fresh and the band is crossed.
 **Localhost panel.** `python3 -m web` serves http://127.0.0.1:8765 only.
 The Dexter click path is in [MVP.md](MVP.md). The page does not arm live
 trading by itself and does not receive API keys. **启动** always passes
-`--record-only`. **确认** is a separate action: inside US RTH it sends one
-dual-leg order through `Engine.execute_confirmed`; outside RTH it requires
-a second click, **强制确认**. The CLI live command above is unchanged.
+`--record-only`. Inside US RTH one click arms a live probe. Outside RTH
+the first click shows **强制启动** and does not spawn; the second click
+arms. **确认** is a separate action: inside US RTH it sends one dual-leg
+order through `Engine.execute_confirmed`; outside RTH it requires a second
+click, **强制确认**. The CLI live command above is unchanged.
+
+The page draws a historical basis chart from `logs/minutes.csv` (Entropy
+and Lighter minute closes, `premium_close_bps`, task midline and ± bands)
+and reloads it about every 45 seconds. `python3 tools/plot_basis.py` writes
+the same picture to `.web/basis.png`.
+
+On Windows, `tools/run_web_watchdog.bat` keeps a single panel. A second
+copy exits. If 127.0.0.1:8765 is already listening or `/api/status` answers,
+it does not start another `python -m web`.
 
 **Close-on-revert.** While both venues hold a symmetric arb (Entropy short
 and Lighter long, or the reverse), the panel watches premium against the

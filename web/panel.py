@@ -4,9 +4,9 @@ Binds nowhere by itself. ``python3 -m web`` listens on 127.0.0.1 only.
 Secrets stay in the server ``.env`` and are scrubbed from every response.
 Starting the panel does not arm live trading. Confirm admits an id and then
 calls ``Engine.execute_confirmed``. Outside US RTH that send waits for a
-second 「强制确认」. Manual flatten (``POST /api/flatten``) is reduce-only
-and is allowed outside RTH without that second click; a person still
-confirms the modal.
+second 「强制确认」. Arming outside US RTH waits for a second 「强制启动」.
+Manual flatten (``POST /api/flatten``) is reduce-only and is allowed
+outside RTH without that second click; a person still confirms the modal.
 """
 from __future__ import annotations
 
@@ -19,12 +19,13 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from entropy_arb.config import HEDGE_VENUES
 
+from web.basis import build_basis
 from web.recorder_ctl import RecorderControl, RecorderError
 from web.report import assemble_status, run_analyze
 from web.session import ProbeError, ProbeSession
@@ -37,6 +38,7 @@ class StartIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     symbol: str = "SNDK"
     hedge: str = "lighter"
+    force_start_outside_rth: bool = False
 
 
 def normalize_symbol(value: str) -> str:
@@ -112,7 +114,18 @@ def create_app(root: Optional[Path] = None, command_builder=None,
         )
 
     def _status() -> dict:
-        proc = ctl.snapshot()
+        try:
+            proc = ctl.snapshot()
+        except Exception as exc:
+            proc = {
+                "running": False,
+                "paused": False,
+                "warnings": [
+                    "recorder status unavailable "
+                    f"({type(exc).__name__})"
+                ],
+                "log_tail": [],
+            }
         base = assemble_status(root, proc)
         base["paused"] = bool(proc.get("paused"))
         return session.overlay(base)
@@ -154,9 +167,15 @@ def create_app(root: Optional[Path] = None, command_builder=None,
         return info
 
     @app.post("/api/session/start")
-    def session_start() -> dict:
+    def session_start(body: Optional[StartIn] = Body(default=None)) -> dict:
+        """Start the saved task. An empty body is a normal start.
+
+        ``force_start_outside_rth`` is the only field this route reads.
+        Symbol and hedge stay on the saved task. Record mode ignores the flag.
+        """
+        force = bool(body.force_start_outside_rth) if body is not None else False
         try:
-            return session.start()
+            return session.start(force_start_outside_rth=force)
         except ProbeError as exc:
             _probe(exc)
 
@@ -206,6 +225,16 @@ def create_app(root: Optional[Path] = None, command_builder=None,
     @app.post("/api/analyze")
     def analyze() -> dict:
         return run_analyze(root)
+
+    @app.get("/api/basis")
+    def basis(hours: float = 0.0) -> JSONResponse:
+        """Historical minute chart. Polled by the page; not a push feed."""
+        if hours != hours or hours < 0 or hours > 24 * 366:
+            hours = 0.0
+        return JSONResponse(
+            build_basis(root, hours=hours),
+            headers={"Cache-Control": "no-store"},
+        )
 
     return app
 

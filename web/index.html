@@ -207,6 +207,31 @@
     .bad { color: var(--red); }
     .books { grid-template-columns: 1fr 1fr; }
     .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+    .basis-frame {
+      position: relative;
+      margin-top: 12px;
+      height: 380px;
+      background: #f4f1ea;
+      border: 1px solid #e4dfd4;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .basis-frame canvas { width: 100%; height: 100%; display: block; }
+    .basis-tip {
+      position: absolute;
+      z-index: 2;
+      pointer-events: none;
+      background: rgba(255, 252, 247, .94);
+      color: #1f2a33;
+      border: 1px solid #ddd6c8;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      box-shadow: 0 8px 18px rgba(40, 32, 16, .12);
+      max-width: 240px;
+    }
+    .basis-tip[hidden] { display: none; }
     .legend { color: var(--faint); font-size: 12px; margin-top: 8px; }
     pre {
       white-space: pre-wrap;
@@ -374,6 +399,13 @@
         </div>
       </div>
       <div id="run-warn" class="banner" hidden></div>
+      <div class="warn-line" id="start-force" hidden>
+        <div id="start-force-gap"></div>
+        <div id="start-force-session"></div>
+        <div id="start-force-map">us_regular -1.7 / us_post_overnight +2.6 / asia -0.4</div>
+        <div id="start-force-task"></div>
+        <div id="start-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
+      </div>
       <p class="hint" id="order-line">尚无确认订单</p>
       <div class="track-wrap">
         <div class="track-label">
@@ -382,6 +414,21 @@
         </div>
         <div class="track" aria-hidden="true"><i id="dev-mark" style="left:50%"></i></div>
       </div>
+    </div>
+
+    <div class="panel" id="basis-panel">
+      <div class="head">
+        <div>
+          <div class="eyebrow">BASIS</div>
+          <h2 style="margin:6px 0 0;font-size:15px">Price (USD) &amp; Basis (bps)</h2>
+          <div class="idline" id="basis-sub">正在读取 logs/minutes.csv</div>
+        </div>
+      </div>
+      <div class="basis-frame">
+        <canvas id="basis-chart" role="img" aria-label="Entropy and Lighter prices with basis in basis points"></canvas>
+        <div class="basis-tip" id="basis-tip" hidden></div>
+      </div>
+      <p class="hint" id="basis-hint">历史分钟只读 <span class="mono">logs/minutes.csv</span>，大约每 45 秒重读一次，不是逐笔推送。左轴是 Entropy 与 Lighter 的分钟收盘价（bid/ask 都有时取中间价），右轴是 <span class="mono">premium_close_bps</span>（相对 0 绿正红负）。横线是任务中枢和上下沿，没有任务时用 -1.7 和 ±1。开仓/平仓竖线只在 <span class="mono">logs/trades.csv</span> 已有成交时间时出现。需要的列：minute_ts、entropy_bid、entropy_ask、hedge_bid、hedge_ask、premium_close_bps。静态图：<span class="mono">python3 tools/plot_basis.py</span> 写到 <span class="mono">.web/basis.png</span>。</p>
     </div>
 
     <div class="panel">
@@ -543,7 +590,7 @@
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
         <label><input id="f-auto" type="checkbox"> 自动确认（默认关）</label>
-        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
+        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 直接武装；非 RTH 需强制启动（America/New_York 09:30–16:00，周一至周五）</label>
       </div>
       <p class="hint">自动确认按往返费率：Entropy 开仓 + 平仓约 1.8 bps，不是单边 0.9。非 RTH 不会自动走强制确认。名义不超过自动上限（默认等于单笔硬顶）。日名义 / 日次数留空表示不设上限。</p>
       <div class="grid">
@@ -660,6 +707,9 @@ const $ = (id) => document.getElementById(id);
 let lastProposalId = null;
 let lastPayload = null;
 let lastFlatten = null;
+let startNeedsForce = false;
+let startForceCard = null;
+let startForceGap = "";
 let formMode = "record";
 let seenConfirm = false;
 
@@ -695,6 +745,33 @@ function optNum(id) {
   if (raw === "" || raw == null) return null;
   const n = Number(raw);
   return Number.isFinite(n) ? n : null;
+}
+
+
+function forceCardText(card) {
+  const c = card || {};
+  return {
+    session: "当前时段 " + (c.name || "—") + " · 该时段实测中枢 " +
+      (c.midline_bps == null ? "—" : Number(c.midline_bps).toFixed(1)) + " bps",
+    task: "任务中枢 " + (c.task_midline_bps == null ? "—" : Number(c.task_midline_bps).toFixed(1)) +
+      " bps · " + (c.deviation_text || ""),
+    line: c.risk_line || "带宽 1 bps，错中枢风险大于费率缺口",
+  };
+}
+
+function paintStartForce() {
+  const node = $("start-force");
+  if (!node || !startNeedsForce) {
+    if (node) node.hidden = true;
+    return;
+  }
+  const text = forceCardText(startForceCard);
+  node.hidden = false;
+  $("start-force-gap").textContent = startForceGap
+    || "非 RTH：需要第二次点击强制启动才会武装";
+  $("start-force-session").textContent = text.session;
+  $("start-force-task").textContent = text.task;
+  $("start-force-line").textContent = text.line;
 }
 
 function setStatus(el, label) {
@@ -936,7 +1013,10 @@ function render(s) {
   if (s.sizing_note) {
     $("sizing-line").textContent = s.sizing_note;
   }
+  if (s.running && !s.paused) startNeedsForce = false;
+  $("btn-start").textContent = startNeedsForce ? "强制启动" : "启动";
   $("btn-start").disabled = !!s.running && !s.paused;
+  paintStartForce();
   $("btn-pause").disabled = !s.running || !!s.paused;
   $("btn-stop").disabled = !s.running && !s.pid;
   showConfirm(s.proposal || null);
@@ -980,10 +1060,15 @@ function renderFlatten(offer) {
 
 async function refresh() {
   try {
-    const res = await fetch("/api/status");
+    const res = await fetch("/api/status", {cache: "no-store"});
+    if (!res.ok) throw new Error("status " + res.status);
     render(await res.json());
   } catch (err) {
     $("stat-status").textContent = "状态不可用";
+    $("stat-status").className = "v bad";
+    $("stat-status-d").textContent = "状态请求失败";
+    const taskLabel = $("task-status");
+    if (taskLabel) setStatus(taskLabel, "已停止");
   }
 }
 
@@ -999,12 +1084,19 @@ async function post(url, body) {
 }
 
 $("open-create").addEventListener("click", async () => {
-  const status = await fetch("/api/status").then((r) => r.json());
-  if (status.running) {
-    alert("先停止，再修改任务。");
-    return;
+  let task = null;
+  try {
+    const res = await fetch("/api/status", {cache: "no-store"});
+    const status = await res.json();
+    if (res.ok && status.running) {
+      alert("先停止，再修改任务。");
+      return;
+    }
+    if (res.ok) task = status.task;
+  } catch (err) {
+    task = null;
   }
-  openCreate(status.task);
+  openCreate(task);
 });
 $("create-close").addEventListener("click", () => { $("create-modal").hidden = true; });
 $("create-cancel").addEventListener("click", () => { $("create-modal").hidden = true; });
@@ -1038,6 +1130,7 @@ $("create-form").addEventListener("submit", async (ev) => {
     });
     $("create-modal").hidden = true;
     await refresh();
+    refreshBasis();
   } catch (err) {
     alert(err.message);
   } finally {
@@ -1049,17 +1142,36 @@ $("clear-task").addEventListener("click", async () => {
   try {
     await post("/api/task/clear");
     await refresh();
+    refreshBasis();
   } catch (err) {
     alert(err.message);
   }
 });
 
 $("btn-start").addEventListener("click", async () => {
+  const forcing = startNeedsForce;
   $("btn-start").disabled = true;
   try {
-    await post("/api/session/start");
+    const result = await post("/api/session/start", {
+      force_start_outside_rth: forcing,
+    });
+    if (result && result.needs_force_start) {
+      startNeedsForce = true;
+      startForceCard = result.force_card || null;
+      startForceGap = result.gap || "";
+      await refresh();
+      return;
+    }
+    startNeedsForce = false;
+    startForceCard = null;
+    startForceGap = "";
   } catch (err) {
     alert(err.message);
+    if (forcing) {
+      $("btn-start").textContent = "强制启动";
+      $("btn-start").disabled = false;
+      paintStartForce();
+    }
   }
   await refresh();
 });
@@ -1207,8 +1319,405 @@ $("analyze").addEventListener("click", async () => {
   }
 });
 
+const BASIS_POLL_MS = 45000;
+let basisPayload = null;
+let basisLayout = null;
+
+function describeBasis(data) {
+  if (!data) return "分钟数据未就绪";
+  if (data.error) return data.error;
+  const n = (data.points || []).length;
+  const bands = data.bands || {};
+  const marks = (data.markers || []).length;
+  if (!n) return "还没有可画的分钟 · " + (data.csv_path || "logs/minutes.csv");
+  const mid = Number(bands.midline_bps);
+  const up = Number(bands.upper_bps);
+  const lo = Number(bands.lower_bps);
+  const midTxt = Number.isFinite(mid) ? mid.toFixed(1) : "—";
+  const upTxt = Number.isFinite(up) ? up.toFixed(1) : "—";
+  const loTxt = Number.isFinite(lo) ? lo.toFixed(1) : "—";
+  return n + " 根分钟 · 中枢 " + midTxt + " · 带宽 +" + upTxt + " / -" + loTxt
+    + (marks ? (" · 开平仓 " + marks) : " · 无开平仓标记");
+}
+
+function niceStep(span, count) {
+  if (!(span > 0) || !Number.isFinite(span)) return 1;
+  const raw = span / Math.max(count, 1);
+  const exp = Math.floor(Math.log10(raw));
+  const pow = Math.pow(10, exp);
+  const err = raw / pow;
+  const factor = err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1;
+  return factor * pow;
+}
+
+function axisTicks(lo, hi, count) {
+  const step = niceStep(hi - lo, count);
+  const out = [];
+  if (!(step > 0)) return out;
+  let v = Math.ceil(lo / step - 1e-9) * step;
+  for (let n = 0; n < 24 && v <= hi + step * 1e-6; n += 1, v += step) {
+    if (v >= lo - step * 0.2 && v <= hi + step * 0.2) out.push(v);
+  }
+  return out;
+}
+
+function fmtUsd(v) {
+  return Number(v).toLocaleString("en-US", {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+}
+
+function fmtBps(v) {
+  const n = Number(v);
+  const digits = Math.abs(n) >= 10 ? 1 : 2;
+  const sign = n > 0 ? "+" : "";
+  return sign + n.toFixed(digits);
+}
+
+const BASIS_WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  let h = d.getUTCHours();
+  const am = h < 12 ? "AM" : "PM";
+  h = h % 12 || 12;
+  const m = String(d.getUTCMinutes()).padStart(2, "0");
+  return BASIS_WD[d.getUTCDay()] + " " + h + ":" + m + " " + am;
+}
+
+function wrapFill(ctx, text, x, y, maxW, lineH) {
+  const words = String(text).split(/\s+/);
+  let line = "";
+  let yy = y;
+  for (const word of words) {
+    const trial = line ? (line + " " + word) : word;
+    if (ctx.measureText(trial).width > maxW && line) {
+      ctx.fillText(line, x, yy);
+      line = word;
+      yy += lineH;
+    } else {
+      line = trial;
+    }
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+function drawBasis() {
+  const canvas = $("basis-chart");
+  if (!canvas || !basisPayload) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w < 20 || h < 20) return;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#f4f1ea";
+  ctx.fillRect(0, 0, w, h);
+
+  const data = basisPayload || {points: []};
+  const points = (data.points || []).filter((p) =>
+    Number.isFinite(Number(p.entropy_usd)) &&
+    Number.isFinite(Number(p.hedge_usd)) &&
+    Number.isFinite(Number(p.basis_bps)) &&
+    Number.isFinite(Number(p.minute_ts)));
+  const bands = data.bands || {};
+  const mid = Number(bands.midline_bps);
+  const upLine = Number.isFinite(Number(bands.upper_line_bps))
+    ? Number(bands.upper_line_bps) : (Number.isFinite(mid) ? mid + 1 :  -0.7);
+  const loLine = Number.isFinite(Number(bands.lower_line_bps))
+    ? Number(bands.lower_line_bps) : (Number.isFinite(mid) ? mid - 1 : -2.7);
+  let legendX = 16;
+  ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+  function legendItem(color, label) {
+    if (legendX > w - 70) return;
+    ctx.beginPath();
+    ctx.fillStyle = color;
+    ctx.arc(legendX + 4, 16, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.fillText(label, legendX + 12, 20);
+    legendX += 12 + ctx.measureText(label).width + 14;
+  }
+  legendItem("#2f6fe0", "Entropy");
+  legendItem("#1f9a4a", "Lighter");
+  legendItem("#3d9a62", "basis > 0");
+  legendItem("#c45c5c", "basis < 0");
+  if (Number.isFinite(mid)) legendItem("#475569", "mid " + fmtBps(mid));
+
+  if (!points.length) {
+    ctx.fillStyle = "#1f2a33";
+    ctx.font = "14px ui-sans-serif, system-ui, sans-serif";
+    const msg = data.error
+      ? String(data.error)
+      : "还没有可画的分钟。记录器写入 logs/minutes.csv 之后，这里会画出两条价格和溢价。需要列：minute_ts, entropy_bid, entropy_ask, hedge_bid, hedge_ask, premium_close_bps。";
+    wrapFill(ctx, msg, 24, 80, w - 48, 20);
+    basisLayout = null;
+    return;
+  }
+
+  const plotL = 64;
+  const plotR = w - 58;
+  const plotT = 34;
+  const plotB = h - 28;
+  const prices = [];
+  const basisVals = [0];
+  if (Number.isFinite(mid)) basisVals.push(mid, upLine, loLine);
+  for (const p of points) {
+    prices.push(Number(p.entropy_usd), Number(p.hedge_usd));
+    basisVals.push(Number(p.basis_bps));
+  }
+  let pLo = Math.min.apply(null, prices);
+  let pHi = Math.max.apply(null, prices);
+  const pPad = (pHi - pLo) * 0.08 || Math.max(Math.abs(pHi) * 0.002, 0.01);
+  pLo -= pPad;
+  pHi += pPad;
+  let bLo = Math.min.apply(null, basisVals);
+  let bHi = Math.max.apply(null, basisVals);
+  const bPad = (bHi - bLo) * 0.12 || 1;
+  bLo -= bPad;
+  bHi += bPad;
+  if (!(pHi > pLo)) { pLo -= 1; pHi += 1; }
+  if (!(bHi > bLo)) { bLo -= 1; bHi += 1; }
+
+  let t0 = Number(points[0].minute_ts);
+  let t1 = Number(points[points.length - 1].minute_ts);
+  if (!(t1 > t0)) { t0 -= 60; t1 += 60; }
+  else {
+    const span = (t1 - t0) * 0.02;
+    t0 -= span;
+    t1 += span;
+  }
+  const xOf = (ts) => plotL + ((ts - t0) / (t1 - t0)) * (plotR - plotL);
+  const yPx = (v) => plotT + ((pHi - v) / (pHi - pLo)) * (plotB - plotT);
+  const yBps = (v) => plotT + ((bHi - v) / (bHi - bLo)) * (plotB - plotT);
+  const yZero = yBps(0);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(plotL, plotT, plotR - plotL, plotB - plotT);
+  ctx.clip();
+  for (let i = 1; i < points.length; i += 1) {
+    const v0 = Number(points[i - 1].basis_bps);
+    const v1 = Number(points[i].basis_bps);
+    const x0 = xOf(Number(points[i - 1].minute_ts));
+    const x1 = xOf(Number(points[i].minute_ts));
+    const segs = [];
+    if ((v0 >= 0 && v1 >= 0) || (v0 <= 0 && v1 <= 0)) {
+      if (!(v0 === 0 && v1 === 0)) segs.push([v0, v1, x0, x1]);
+    } else {
+      const t = v0 / (v0 - v1);
+      const xc = x0 + (x1 - x0) * t;
+      segs.push([v0, 0, x0, xc], [0, v1, xc, x1]);
+    }
+    for (const seg of segs) {
+      const color = (seg[0] + seg[1]) >= 0 ? "rgba(126, 196, 150, 0.72)" : "rgba(224, 150, 150, 0.78)";
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(seg[2], yBps(seg[0]));
+      ctx.lineTo(seg[3], yBps(seg[1]));
+      ctx.lineTo(seg[3], yZero);
+      ctx.lineTo(seg[2], yZero);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  if (points.length === 1) {
+    const v = Number(points[0].basis_bps);
+    ctx.fillStyle = v >= 0 ? "rgba(126, 196, 150, 0.72)" : "rgba(224, 150, 150, 0.78)";
+    const x = xOf(Number(points[0].minute_ts));
+    ctx.fillRect(x - 2, Math.min(yBps(v), yZero), 4, Math.abs(yBps(v) - yZero));
+  }
+
+  function hline(y, color, dash) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(plotL, y);
+    ctx.lineTo(plotR, y);
+    ctx.stroke();
+    ctx.restore();
+  }
+  for (const v of axisTicks(bLo, bHi, 4)) {
+    const y = yBps(v);
+    if (y > plotT + 2 && y < plotB - 2) hline(y, "rgba(190, 184, 172, 0.45)", []);
+  }
+  hline(yZero, "#a8a298", [4, 4]);
+  if (Number.isFinite(mid)) {
+    hline(yBps(mid), "#475569", [6, 4]);
+    hline(yBps(upLine), "#b49454", [2, 3]);
+    hline(yBps(loLine), "#b49454", [2, 3]);
+  }
+
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 1.7;
+  function stroke(key, color) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    points.forEach((p, i) => {
+      const x = xOf(Number(p.minute_ts));
+      const y = yPx(Number(p[key]));
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  stroke("entropy_usd", "#2f6fe0");
+  stroke("hedge_usd", "#1f9a4a");
+  if (points.length === 1) {
+    ctx.fillStyle = "#2f6fe0";
+    ctx.beginPath();
+    ctx.arc(xOf(Number(points[0].minute_ts)), yPx(Number(points[0].entropy_usd)), 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#1f9a4a";
+    ctx.beginPath();
+    ctx.arc(xOf(Number(points[0].minute_ts)), yPx(Number(points[0].hedge_usd)), 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  let labelX = -1000;
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  for (const marker of data.markers || []) {
+    const ts = Number(marker.ts);
+    if (!Number.isFinite(ts) || ts < t0 || ts > t1) continue;
+    const x = xOf(ts);
+    ctx.save();
+    ctx.strokeStyle = marker.kind === "open" ? "#1d4ed8" : "#9a3412";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, plotT);
+    ctx.lineTo(x, plotB);
+    ctx.stroke();
+    ctx.restore();
+    if (x - labelX > 36) {
+      ctx.fillStyle = marker.kind === "open" ? "#1d4ed8" : "#9a3412";
+      ctx.fillText(marker.kind === "open" ? "open" : "close", x + 3, plotT + 12);
+      labelX = x;
+    }
+  }
+  ctx.restore();
+
+  ctx.strokeStyle = "#1f2a33";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(plotL, plotT);
+  ctx.lineTo(plotL, plotB);
+  ctx.lineTo(plotR, plotB);
+  ctx.lineTo(plotR, plotT);
+  ctx.stroke();
+
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.fillStyle = "#6b7280";
+  ctx.fillText("USD", 8, plotT - 6);
+  for (const v of axisTicks(pLo, pHi, 4)) {
+    const y = yPx(v);
+    if (y < plotT || y > plotB) continue;
+    const label = fmtUsd(v);
+    ctx.fillText(label, Math.max(2, plotL - ctx.measureText(label).width - 6), y + 3);
+  }
+  ctx.fillText("bps", plotR + 6, plotT - 6);
+  for (const v of axisTicks(bLo, bHi, 4)) {
+    const y = yBps(v);
+    if (y < plotT || y > plotB) continue;
+    ctx.fillText(fmtBps(v), plotR + 6, y + 3);
+  }
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  const stamps = [];
+  const nLab = (points[points.length - 1].minute_ts > points[0].minute_ts) ? 4 : 1;
+  for (let i = 0; i < nLab; i += 1) {
+    const ts = nLab === 1
+      ? Number(points[0].minute_ts)
+      : Number(points[0].minute_ts) + (Number(points[points.length - 1].minute_ts) - Number(points[0].minute_ts)) * i / (nLab - 1);
+    stamps.push(ts);
+  }
+  let lastLab = -1000;
+  for (const ts of stamps) {
+    const label = fmtClock(ts);
+    const width = ctx.measureText(label).width;
+    let x = xOf(ts) - width / 2;
+    x = Math.max(plotL, Math.min(x, plotR - width));
+    if (x < lastLab + 8) continue;
+    ctx.fillText(label, x, h - 10);
+    lastLab = x + width;
+  }
+
+  basisLayout = {plotL, plotR, plotT, plotB, t0, t1, xOf, points, yPx, yBps};
+}
+
+function basisTip(ev) {
+  const tip = $("basis-tip");
+  const canvas = $("basis-chart");
+  if (!tip || !canvas || !basisLayout || !basisLayout.points.length) {
+    if (tip) tip.hidden = true;
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  const box = basisLayout;
+  if (x < box.plotL || x > box.plotR || y < box.plotT || y > box.plotB) {
+    tip.hidden = true;
+    return;
+  }
+  let best = box.points[0];
+  let bestD = Infinity;
+  for (const p of box.points) {
+    const d = Math.abs(box.xOf(Number(p.minute_ts)) - x);
+    if (d < bestD) { best = p; bestD = d; }
+  }
+  const kind = best.basis_bps >= 0 ? "basis ≥ 0" : "basis < 0";
+  tip.replaceChildren();
+  const lines = [
+    fmtClock(Number(best.minute_ts)) + " UTC",
+    "Entropy " + fmtUsd(best.entropy_usd),
+    "Lighter " + fmtUsd(best.hedge_usd),
+    "basis " + fmtBps(best.basis_bps) + " · " + kind,
+  ];
+  for (const line of lines) {
+    const div = document.createElement("div");
+    div.textContent = line;
+    tip.appendChild(div);
+  }
+  const frame = canvas.parentElement.getBoundingClientRect();
+  let left = ev.clientX - frame.left + 12;
+  let top = ev.clientY - frame.top + 12;
+  tip.hidden = false;
+  if (left + tip.offsetWidth > frame.width - 8) left = Math.max(8, left - tip.offsetWidth - 24);
+  if (top + tip.offsetHeight > frame.height - 8) top = Math.max(8, top - tip.offsetHeight - 24);
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+}
+
+async function refreshBasis() {
+  try {
+    const res = await fetch("/api/basis", {cache: "no-store"});
+    if (!res.ok) throw new Error("basis " + res.status);
+    basisPayload = await res.json();
+    $("basis-sub").textContent = describeBasis(basisPayload);
+  } catch (err) {
+    basisPayload = {points: [], error: "basis 图暂时不可用"};
+    $("basis-sub").textContent = "basis 图暂时不可用";
+  }
+  drawBasis();
+}
+
+const basisCanvas = $("basis-chart");
+if (basisCanvas) {
+  basisCanvas.addEventListener("mousemove", basisTip);
+  basisCanvas.addEventListener("mouseleave", () => { $("basis-tip").hidden = true; });
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => drawBasis()).observe(basisCanvas.parentElement);
+  } else {
+    window.addEventListener("resize", drawBasis);
+  }
+}
+
 refresh();
+refreshBasis();
 setInterval(refresh, 2000);
+setInterval(refreshBasis, BASIS_POLL_MS);
 </script>
 </body>
 </html>
