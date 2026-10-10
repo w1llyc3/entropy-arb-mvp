@@ -126,9 +126,61 @@ feeds are fresh and the band is crossed.
 **Localhost panel.** `python3 -m web` serves http://127.0.0.1:8765 only.
 The Dexter click path is in [MVP.md](MVP.md). The page does not arm live
 trading by itself and does not receive API keys. **启动** always passes
-`--record-only`. **确认** is a separate action: inside US RTH it sends one
-dual-leg order through `Engine.execute_confirmed`; outside RTH it requires
-a second click, **强制确认**. The CLI live command above is unchanged.
+`--record-only`. Inside US RTH one click arms a live probe. Outside RTH
+the first click shows **强制启动** and does not spawn; the second click
+arms. **确认** is a separate action: inside US RTH it sends one dual-leg
+order through `Engine.execute_confirmed`; outside RTH it requires a second
+click, **强制确认**. The CLI live command above is unchanged.
+
+The page draws a historical basis chart from `logs/minutes.csv` (Entropy
+and Lighter minute closes, `premium_close_bps`, task midline and ± bands)
+and reloads it about every 45 seconds. `python3 tools/plot_basis.py` writes
+the same picture to `.web/basis.png`.
+
+On Windows, `tools/run_web_watchdog.bat` keeps a single panel. A second
+copy exits. If 127.0.0.1:8765 is already listening or `/api/status` answers,
+it does not start another `python -m web`.
+
+**Close-on-revert.** While both venues hold a symmetric arb (Entropy short
+and Lighter long, or the reverse), the panel watches premium against the
+task band. A close card (reduce-only, both legs) appears when premium is
+back **inside** the band, edges included —
+`midline − lower ≤ premium ≤ midline + upper` — and stays there for
+`persist_sec` (3s, the same order as the open persist). It does not wait
+for a midline touch. One leg failing still **HALT**s. The card is labeled
+close, not open.
+
+**Manual flatten (手动清仓).** The danger button shows when either venue
+has a non-flat SNDK position, including when weekend premium sits outside
+the band and close-on-revert never fires. The click opens a confirm
+modal; nothing is sent until that confirm. The order is reduce-only
+through `Engine.execute_confirmed` for the overlapping size (or each
+side's absolute position toward flat when the book is not one pair). One
+leg failing **HALT**s. A flatten that comes back flat clears that halt.
+Flatten is allowed **anytime** — outside RTH, while paused, and while
+halted — and does **not** use the open-order second click **强制确认**.
+Auto-confirm never fires it. Fills written to `probe.log` and `trades.csv`
+are the venue results, not invented quantities.
+
+**Auto-confirm stays off** until the form enables it. Before an auto open
+or an auto close, the expected edge must cover the **round trip** (Entropy
+open + close ≈ **1.8 bps**, or twice a measured Entropy fee; Lighter
+Standard ≈ 0). The one-way 0.9 bps open fee is not the gate. An auto close
+uses the entry edge stored when the open filled — the revert is inside the
+band, so it is not required to show a fresh 1.8 bps. Notional must
+sit at or under `auto_confirm_max_usd` (default = the order hard max).
+Optional daily notional and count caps live in `.web/auto_daily.json`.
+Books must be fresh, the probe must not be halted, and funding plus
+available must be readable. **Outside RTH, auto-confirm never takes the
+force path** — a person still has to click **强制确认**.
+
+**Sizing.** Cash mode keeps the order hard max. Margin mode sizes from
+free margin × leverage × a safety factor (default 0.80), then clips to
+that hard max. Missing margin or leverage refuses the order. On Entropy,
+free cash is **spot USDC**; an isolated `io` position can show
+`withdrawable` 0. A 10× isolated fill of about **$11** notional locks
+about **$1.11** of margin (notional / leverage, plus a small buffer).
+That locked amount is not headroom.
 
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the

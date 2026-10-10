@@ -1,9 +1,10 @@
 """Place one admitted dual-leg probe through the CLI engine.
 
 The panel recorder stays ``--record-only``. This module is the only order
-path the confirm button uses, and it calls ``Engine.execute_confirmed``,
-which sends both legs with ``send_taker``. A blank confirm id never reaches
-a venue.
+path the confirm button and the manual flatten button use. Both call
+``Engine.execute_confirmed`` (or ``execute_reduce_legs`` when the book is
+not one symmetric overlap) with ``reduce_only`` on a flatten. A blank
+confirm id never reaches a venue.
 """
 from __future__ import annotations
 
@@ -28,8 +29,30 @@ def execute_admitted(req: dict) -> dict:
         raise RuntimeError("refusing order without an admitted confirm id")
     order = float(req.get("order_notional_usd") or 0.0)
     position = float(req.get("max_position_usd") or 0.0)
+    reduce_only = bool(req.get("reduce_only"))
     if order - 10.0 > 1e-9 or position - 10.0 > 1e-9:
         raise RuntimeError("probe caps are $10")
+    kind = str(req.get("flatten_kind") or "")
+    if reduce_only and kind == "legs":
+        legs = req.get("flatten_legs")
+        if not isinstance(legs, list) or not legs:
+            raise RuntimeError("flatten requires a position qty")
+        for leg in legs:
+            if not isinstance(leg, dict):
+                raise RuntimeError("flatten requires a position qty")
+            try:
+                qty = float(leg.get("qty"))
+            except (TypeError, ValueError):
+                raise RuntimeError("flatten requires a position qty")
+            if qty <= 0 or leg.get("venue") not in ("entropy", "lighter"):
+                raise RuntimeError("flatten requires a position qty")
+    elif reduce_only:
+        try:
+            close_qty = float(req.get("close_qty"))
+        except (TypeError, ValueError):
+            raise RuntimeError("close requires a position qty")
+        if close_qty <= 0:
+            raise RuntimeError("close requires a position qty")
     return asyncio.run(_route(req, confirm_id))
 
 
@@ -66,11 +89,20 @@ async def _route(req: dict, confirm_id: str) -> dict:
         fresh = await _wait_books(eng)
         if not fresh:
             return _idle(confirm_id, "books not fresh")
-        result = await eng.execute_confirmed(
-            direction=str(req.get("direction") or ""),
-            confirm_id=confirm_id,
-            cap_notional=min(10.0, float(req.get("order_notional_usd") or 10.0)),
-        )
+        if str(req.get("flatten_kind") or "") == "legs":
+            result = await eng.execute_reduce_legs(
+                confirm_id=confirm_id,
+                legs=list(req.get("flatten_legs") or []),
+            )
+        else:
+            result = await eng.execute_confirmed(
+                direction=str(req.get("direction") or ""),
+                confirm_id=confirm_id,
+                cap_notional=min(10.0, float(req.get("order_notional_usd") or 10.0)),
+                reduce_only=bool(req.get("reduce_only")),
+                close_qty=(float(req["close_qty"])
+                           if req.get("reduce_only") else None),
+            )
         if result.get("sent") and result.get("entropy_fee_bps") is None:
             fee = await _entropy_fee(eng, result)
             if fee is not None:

@@ -207,6 +207,31 @@
     .bad { color: var(--red); }
     .books { grid-template-columns: 1fr 1fr; }
     .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+    .basis-frame {
+      position: relative;
+      margin-top: 12px;
+      height: 380px;
+      background: #f4f1ea;
+      border: 1px solid #e4dfd4;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .basis-frame canvas { width: 100%; height: 100%; display: block; }
+    .basis-tip {
+      position: absolute;
+      z-index: 2;
+      pointer-events: none;
+      background: rgba(255, 252, 247, .94);
+      color: #1f2a33;
+      border: 1px solid #ddd6c8;
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      box-shadow: 0 8px 18px rgba(40, 32, 16, .12);
+      max-width: 240px;
+    }
+    .basis-tip[hidden] { display: none; }
     .legend { color: var(--faint); font-size: 12px; margin-top: 8px; }
     pre {
       white-space: pre-wrap;
@@ -256,7 +281,7 @@
     .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
     .grid.two { grid-template-columns: 1fr 1fr; }
     label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-    input[type="text"], input[type="number"] {
+    input[type="text"], input[type="number"], select {
       width: 100%;
       background: #0b1117;
       border: 1px solid var(--line);
@@ -369,10 +394,18 @@
           <button class="amber" id="btn-pause" type="button">暂停</button>
           <button class="ghost" id="btn-recon" type="button">对账</button>
           <button class="danger" id="btn-stop" type="button">停止</button>
+          <button class="danger" id="btn-flatten" type="button" hidden>手动清仓</button>
           <button class="ghost" id="btn-card" type="button" disabled>确认单</button>
         </div>
       </div>
       <div id="run-warn" class="banner" hidden></div>
+      <div class="warn-line" id="start-force" hidden>
+        <div id="start-force-gap"></div>
+        <div id="start-force-session"></div>
+        <div id="start-force-map">us_regular -1.7 / us_post_overnight +2.6 / asia -0.4</div>
+        <div id="start-force-task"></div>
+        <div id="start-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
+      </div>
       <p class="hint" id="order-line">尚无确认订单</p>
       <div class="track-wrap">
         <div class="track-label">
@@ -381,6 +414,21 @@
         </div>
         <div class="track" aria-hidden="true"><i id="dev-mark" style="left:50%"></i></div>
       </div>
+    </div>
+
+    <div class="panel" id="basis-panel">
+      <div class="head">
+        <div>
+          <div class="eyebrow">BASIS</div>
+          <h2 style="margin:6px 0 0;font-size:15px">Price (USD) &amp; Basis (bps)</h2>
+          <div class="idline" id="basis-sub">正在读取 logs/minutes.csv</div>
+        </div>
+      </div>
+      <div class="basis-frame">
+        <canvas id="basis-chart" role="img" aria-label="Entropy and Lighter prices with basis in basis points"></canvas>
+        <div class="basis-tip" id="basis-tip" hidden></div>
+      </div>
+      <p class="hint" id="basis-hint">历史分钟只读 <span class="mono">logs/minutes.csv</span>，大约每 45 秒重读一次，不是逐笔推送。左轴是 Entropy 与 Lighter 的分钟收盘价（bid/ask 都有时取中间价），右轴是 <span class="mono">premium_close_bps</span>（相对 0 绿正红负）。横线是任务中枢和上下沿，没有任务时用 -1.7 和 ±1。开仓/平仓竖线只在 <span class="mono">logs/trades.csv</span> 已有成交时间时出现。需要的列：minute_ts、entropy_bid、entropy_ask、hedge_bid、hedge_ask、premium_close_bps。静态图：<span class="mono">python3 tools/plot_basis.py</span> 写到 <span class="mono">.web/basis.png</span>。</p>
     </div>
 
     <div class="panel">
@@ -427,6 +475,9 @@
         </article>
       </div>
       <p class="hint" id="acct-note">密钥只留在服务器。页面不接收私钥。</p>
+      <p class="hint" id="flatten-note" hidden></p>
+      <p class="hint" id="sizing-line">缩放默认是现金硬顶。保证金模式：可用 × 杠杆 × 安全系数，再被硬顶截断。10× 逐仓约 $11 名义锁约 $1.11 保证金。Entropy 可用是现货 USDC；逐仓时 dex withdrawable 可以是 0。</p>
+      <p class="hint" id="revert-line" hidden></p>
     </div>
 
     <div class="panel">
@@ -459,7 +510,7 @@
       </div>
       <p class="hint" id="contrast-line">Contrast (not Gate ids): SELL entropy net p50 — · BUY entropy net p50 —</p>
       <pre id="analyze-out" hidden></pre>
-      <p class="hint">确认入队不会向交易所发单。对账只记请求。RTH 为美东周一至周五 09:30–16:00，不含假日。CLI 实盘仍是 <span class="mono">python main.py --symbol SNDK --hedge lighter</span>。</p>
+      <p class="hint">确认入队不会向交易所发单。自动确认默认关闭；打开后门槛是往返约 1.8 bps，不是单边 0.9，且非 RTH 不会自动强制发单。对账只记请求。RTH 为美东周一至周五 09:30–16:00，不含假日。CLI 实盘仍是 <span class="mono">python main.py --symbol SNDK --hedge lighter</span>。</p>
     </div>
   </section>
 </main>
@@ -524,7 +575,7 @@
       </div>
       <div class="grid two">
         <div>
-          <label for="f-ord">单笔名义 (USD)</label>
+          <label for="f-ord">单笔硬顶 (USD)</label>
           <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" max="10" required>
         </div>
         <div>
@@ -538,8 +589,38 @@
       </div>
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
-        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
+        <label><input id="f-auto" type="checkbox"> 自动确认（默认关）</label>
+        <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 直接武装；非 RTH 需强制启动（America/New_York 09:30–16:00，周一至周五）</label>
       </div>
+      <p class="hint">自动确认按往返费率：Entropy 开仓 + 平仓约 1.8 bps，不是单边 0.9。非 RTH 不会自动走强制确认。名义不超过自动上限（默认等于单笔硬顶）。日名义 / 日次数留空表示不设上限。</p>
+      <div class="grid">
+        <div>
+          <label for="f-auto-max">自动确认名义上限 (USD)</label>
+          <input id="f-auto-max" type="number" step="1" min="1" max="10" placeholder="默认同单笔硬顶">
+        </div>
+        <div>
+          <label for="f-day-ntl">日名义上限 (USD，可选)</label>
+          <input id="f-day-ntl" type="number" step="1" min="0" placeholder="不设">
+        </div>
+        <div>
+          <label for="f-day-n">日次数上限（可选）</label>
+          <input id="f-day-n" type="number" step="1" min="0" placeholder="不设">
+        </div>
+      </div>
+      <div class="grid two">
+        <div>
+          <label for="f-size">缩放</label>
+          <select id="f-size">
+            <option value="cash" selected>现金名义（硬顶）</option>
+            <option value="margin">保证金 × 杠杆</option>
+          </select>
+        </div>
+        <div>
+          <label for="f-safety">保证金安全系数</label>
+          <input id="f-safety" type="number" step="0.05" min="0.05" max="1" value="0.8">
+        </div>
+      </div>
+      <p class="hint">保证金模式用可用保证金 × 杠杆 × 安全系数，再被单笔硬顶截断。10× 逐仓时，约 $11 名义锁约 $1.11 保证金。杠杆或保证金读不到就拒绝，不会改用现金名义。Entropy 可用取现货 USDC。</p>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
     <div class="foot">
@@ -553,13 +634,13 @@
   <div class="modal" role="dialog" aria-labelledby="confirm-title">
     <header>
       <div>
-        <div class="eyebrow">CONFIRM</div>
-        <h2 id="confirm-title">确认探针订单</h2>
+        <div class="eyebrow" id="confirm-eyebrow">OPEN</div>
+        <h2 id="confirm-title">确认开仓</h2>
       </div>
       <button class="x" type="button" id="confirm-x" aria-label="关闭">×</button>
     </header>
-    <p class="hint">净边际已扣除 0.9 bps。Tier2 Self 应计单独一行，未到账，不加进净边际。</p>
-    <div class="k" style="color:var(--faint);margin-top:12px">扣费后净边际</div>
+    <p class="hint" id="c-lead">净边际已扣除单边 0.9 bps。自动确认另计往返约 1.8 bps（开+平），不是单边 0.9。Tier2 Self 应计单独一行，未到账，不加进净边际。</p>
+    <div class="k" style="color:var(--faint);margin-top:12px" id="c-net-label">扣费后净边际</div>
     <div class="netline" id="c-net">—</div>
     <div class="accrual">
       <div>Tier2 Self 应计 <span class="mono" id="c-accrual">≈ 0.54 bps</span></div>
@@ -582,11 +663,41 @@
       <div id="c-force-task"></div>
       <div id="c-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
     </div>
+    <div class="warn-line" id="c-auto" hidden></div>
     <p class="hint" id="c-block" hidden></p>
-    <p class="hint">确认会通过实盘引擎同时发送两腿。非 RTH 必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。</p>
+    <p class="hint" id="c-foot">确认会通过实盘引擎同时发送两腿。平仓为两边只减仓。非 RTH 必须再点一次「强制确认」，自动确认不会代点。取消则不下单。中枢不会随时段自动改变。平仓规则：溢价回到带宽内（含边界）并持续 3 秒，不是碰到中枢才平。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-back" id="flatten-modal" hidden>
+  <div class="modal" role="dialog" aria-labelledby="flatten-title">
+    <header>
+      <div>
+        <div class="eyebrow">FLATTEN</div>
+        <h2 id="flatten-title">确认手动清仓</h2>
+      </div>
+      <button class="x" type="button" id="flatten-x" aria-label="关闭">×</button>
+    </header>
+    <p class="hint" id="flatten-lead">两边只减仓，按当前 SNDK 持仓打回平。周末溢价停在带宽外时，回归平仓不会出现；这里不看带宽。非 RTH 也直接发，不需要再点「强制确认」。成交数量只采用交易所返回值。</p>
+    <div class="kv" style="margin-top:12px">
+      <div><span>Entropy 持仓</span><b id="flatten-pos-e">—</b></div>
+      <div><span>Lighter 持仓</span><b id="flatten-pos-l">—</b></div>
+    </div>
+    <table class="legs">
+      <thead>
+        <tr><th>腿</th><th>方向</th><th>数量</th><th>参考名义</th></tr>
+      </thead>
+      <tbody id="flatten-legs"></tbody>
+    </table>
+    <p class="hint" id="flatten-partial" hidden>另一边持仓没有读到，不会替它编一个数量。</p>
+    <p class="hint" id="flatten-foot">确认后走实盘引擎，reduce-only。单腿失败会 HALT。两边都平掉才会解除已有的 HALT。取消则不下单。</p>
+    <div class="foot">
+      <button class="ghost" type="button" id="flatten-cancel">取消</button>
+      <button class="danger" type="button" id="flatten-ok">确认清仓</button>
     </div>
   </div>
 </div>
@@ -595,6 +706,10 @@
 const $ = (id) => document.getElementById(id);
 let lastProposalId = null;
 let lastPayload = null;
+let lastFlatten = null;
+let startNeedsForce = false;
+let startForceCard = null;
+let startForceGap = "";
 let formMode = "record";
 let seenConfirm = false;
 
@@ -611,10 +726,52 @@ function usd(v) {
   if (v == null || Number.isNaN(Number(v))) return "—";
   return "$" + Number(v).toFixed(2);
 }
-function iso(v) {
-  if (v === true) return "逐仓";
-  if (v === false) return "全仓";
-  return "未知";
+function iso(v, lev) {
+  let text = "未知";
+  if (v === true) text = "逐仓";
+  else if (v === false) text = "全仓";
+  if (lev != null && Number.isFinite(Number(lev))) text += " " + Number(lev) + "x";
+  return text;
+}
+function ntl(v) {
+  if (v == null || v === "") return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  const digits = Math.abs(n - Math.round(n)) < 0.005 ? 0 : 2;
+  return "$" + n.toFixed(digits);
+}
+function optNum(id) {
+  const raw = $(id).value;
+  if (raw === "" || raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+
+function forceCardText(card) {
+  const c = card || {};
+  return {
+    session: "当前时段 " + (c.name || "—") + " · 该时段实测中枢 " +
+      (c.midline_bps == null ? "—" : Number(c.midline_bps).toFixed(1)) + " bps",
+    task: "任务中枢 " + (c.task_midline_bps == null ? "—" : Number(c.task_midline_bps).toFixed(1)) +
+      " bps · " + (c.deviation_text || ""),
+    line: c.risk_line || "带宽 1 bps，错中枢风险大于费率缺口",
+  };
+}
+
+function paintStartForce() {
+  const node = $("start-force");
+  if (!node || !startNeedsForce) {
+    if (node) node.hidden = true;
+    return;
+  }
+  const text = forceCardText(startForceCard);
+  node.hidden = false;
+  $("start-force-gap").textContent = startForceGap
+    || "非 RTH：需要第二次点击强制启动才会武装";
+  $("start-force-session").textContent = text.session;
+  $("start-force-task").textContent = text.task;
+  $("start-force-line").textContent = text.line;
 }
 
 function setStatus(el, label) {
@@ -650,6 +807,12 @@ function openCreate(task) {
   $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 10;
   formMode = t.mode || "record";
   $("f-confirm").checked = t.manual_confirm !== false;
+  $("f-auto").checked = t.auto_confirm === true;
+  $("f-auto-max").value = t.auto_confirm_max_usd != null ? t.auto_confirm_max_usd : "";
+  $("f-day-ntl").value = t.auto_daily_max_notional_usd != null ? t.auto_daily_max_notional_usd : "";
+  $("f-day-n").value = t.auto_daily_max_count != null ? t.auto_daily_max_count : "";
+  $("f-size").value = t.sizing_mode === "margin" ? "margin" : "cash";
+  $("f-safety").value = t.margin_safety != null ? t.margin_safety : 0.8;
   $("f-rth").checked = t.rth_only !== false;
   applyModeButtons();
   deviationWarning();
@@ -665,8 +828,8 @@ function renderLegs(legs) {
     const tr = document.createElement("tr");
     for (const text of [
       leg.venue + (leg.dex ? " (" + leg.dex + ")" : ""),
-      leg.direction,
-      "$" + Number(leg.notional_usd).toFixed(0),
+      leg.direction + (leg.base_qty != null ? " " + Number(leg.base_qty).toFixed(4) : ""),
+      ntl(leg.notional_usd),
       usd(leg.available),
       iso(leg.isolated),
     ]) {
@@ -686,6 +849,13 @@ function showConfirm(payload) {
     return;
   }
   lastPayload = payload;
+  const closing = payload.intent === "close" || payload.reduce_only;
+  $("confirm-eyebrow").textContent = closing ? "CLOSE" : "OPEN";
+  $("confirm-title").textContent = closing ? "确认平仓（只减仓）" : "确认开仓";
+  $("c-net-label").textContent = closing ? "溢价 − 中枢" : "扣费后净边际";
+  $("c-lead").textContent = closing
+    ? "平仓两边只减仓。溢价已回到任务带宽内（含边界）并持续约 3 秒。自动确认若打开，仍按开仓时的往返边际（约 1.8 bps）而不是单边 0.9。"
+    : "净边际已扣除单边 0.9 bps。自动确认另计往返约 1.8 bps（开+平），不是单边 0.9。Tier2 Self 应计单独一行，未到账，不加进净边际。";
   $("c-net").textContent = num(payload.net_edge_bps, 2) + " bps";
   $("c-net").className = "netline " + (Number(payload.net_edge_bps) >= 0 ? "pos" : "neg");
   $("c-accrual").textContent = "≈ " + Number(payload.accrual_bps).toFixed(2) + " bps";
@@ -708,8 +878,14 @@ function showConfirm(payload) {
       " bps · " + (card.deviation_text || "");
     $("c-force-line").textContent = card.risk_line || "带宽 1 bps，错中枢风险大于费率缺口";
   }
+  const autoNote = payload.auto_blocked
+    || (payload.auto_confirm
+      ? ("自动确认开。往返门槛 " + num(payload.round_trip_fee_bps, 1) + " bps。")
+      : "自动确认关。若打开，门槛是往返约 1.8 bps，不是单边 0.9。");
+  $("c-auto").hidden = !autoNote;
+  $("c-auto").textContent = autoNote || "";
   const enabled = !!payload.confirm_enabled;
-  $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : "确认";
+  $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : (closing ? "确认平仓" : "确认开仓");
   $("c-ok").disabled = !enabled;
   $("c-block").hidden = !payload.block_reason;
   $("c-block").textContent = payload.block_reason || "";
@@ -798,11 +974,11 @@ function render(s) {
   $("eq-e").textContent = usd(ent.equity);
   $("av-e").textContent = usd(ent.available);
   $("pos-e").textContent = dash(ent.position);
-  $("iso-e").textContent = iso(ent.isolated);
+  $("iso-e").textContent = iso(ent.isolated, ent.leverage);
   $("eq-l").textContent = usd(lig.equity);
   $("av-l").textContent = usd(lig.available);
   $("pos-l").textContent = dash(lig.position);
-  $("iso-l").textContent = iso(lig.isolated);
+  $("iso-l").textContent = iso(lig.isolated, lig.leverage);
   const creds = acct.creds || {};
   $("acct-note").textContent = acct.note
     || ((creds.entropy || creds.lighter) ? "已检测到密钥，数值来自只读查询。" : "密钥只留在服务器。页面不接收私钥。");
@@ -823,19 +999,76 @@ function render(s) {
     ? ("最近确认 " + dash(last.confirm_id) + " · "
       + (last.sent ? "已发送" : "未发送") + " · " + dash(last.status || last.error))
     : "尚无确认订单";
+  const watch = s.revert_watch;
+  const revert = $("revert-line");
+  if (watch && watch.inside) {
+    revert.hidden = false;
+    revert.textContent = watch.ready
+      ? "溢价在带宽内已满 " + Number(watch.persist_sec).toFixed(0) + " 秒，平仓确认可发。"
+      : ("平仓观察：溢价在带宽内 " + Number(watch.elapsed_sec).toFixed(1)
+        + "s / " + Number(watch.persist_sec).toFixed(0) + "s（含边界，不是碰中枢）");
+  } else {
+    revert.hidden = true;
+  }
+  if (s.sizing_note) {
+    $("sizing-line").textContent = s.sizing_note;
+  }
+  if (s.running && !s.paused) startNeedsForce = false;
+  $("btn-start").textContent = startNeedsForce ? "强制启动" : "启动";
   $("btn-start").disabled = !!s.running && !s.paused;
+  paintStartForce();
   $("btn-pause").disabled = !s.running || !!s.paused;
   $("btn-stop").disabled = !s.running && !s.pid;
   showConfirm(s.proposal || null);
   $("btn-card").disabled = !s.proposal;
+  applyFlatten(s.flatten || null);
+}
+
+function applyFlatten(offer) {
+  const open = !!(offer && offer.available);
+  $("btn-flatten").hidden = !open;
+  $("btn-flatten").disabled = !!(offer && offer.busy);
+  const note = $("flatten-note");
+  if (open) {
+    note.hidden = false;
+    note.textContent = offer.note || "有持仓。手动清仓不看回归带宽，非 RTH 也可发，仍要确认。";
+  } else {
+    note.hidden = true;
+    note.textContent = "";
+  }
+  if ($("flatten-modal").hidden) lastFlatten = open ? offer : null;
+}
+
+function renderFlatten(offer) {
+  $("flatten-pos-e").textContent = dash(offer.entropy_position);
+  $("flatten-pos-l").textContent = dash(offer.lighter_position);
+  $("flatten-partial").hidden = !offer.partial;
+  const body = $("flatten-legs");
+  body.replaceChildren();
+  for (const leg of offer.legs || []) {
+    const tr = document.createElement("tr");
+    const qty = leg.base_qty == null ? "—" : Number(leg.base_qty).toFixed(6);
+    const side = (leg.direction || "") + " · 只减仓";
+    for (const text of [leg.venue || "—", side, qty, ntl(leg.notional_usd)]) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
 }
 
 async function refresh() {
   try {
-    const res = await fetch("/api/status");
+    const res = await fetch("/api/status", {cache: "no-store"});
+    if (!res.ok) throw new Error("status " + res.status);
     render(await res.json());
   } catch (err) {
     $("stat-status").textContent = "状态不可用";
+    $("stat-status").className = "v bad";
+    $("stat-status-d").textContent = "状态请求失败";
+    const taskLabel = $("task-status");
+    if (taskLabel) setStatus(taskLabel, "已停止");
   }
 }
 
@@ -851,12 +1084,19 @@ async function post(url, body) {
 }
 
 $("open-create").addEventListener("click", async () => {
-  const status = await fetch("/api/status").then((r) => r.json());
-  if (status.running) {
-    alert("先停止，再修改任务。");
-    return;
+  let task = null;
+  try {
+    const res = await fetch("/api/status", {cache: "no-store"});
+    const status = await res.json();
+    if (res.ok && status.running) {
+      alert("先停止，再修改任务。");
+      return;
+    }
+    if (res.ok) task = status.task;
+  } catch (err) {
+    task = null;
   }
-  openCreate(status.task);
+  openCreate(task);
 });
 $("create-close").addEventListener("click", () => { $("create-modal").hidden = true; });
 $("create-cancel").addEventListener("click", () => { $("create-modal").hidden = true; });
@@ -880,10 +1120,17 @@ $("create-form").addEventListener("submit", async (ev) => {
       max_position_usd: Number($("f-cap").value),
       mode: formMode,
       manual_confirm: $("f-confirm").checked,
+      auto_confirm: $("f-auto").checked,
+      auto_confirm_max_usd: optNum("f-auto-max"),
+      auto_daily_max_notional_usd: optNum("f-day-ntl"),
+      auto_daily_max_count: optNum("f-day-n"),
+      sizing_mode: $("f-size").value,
+      margin_safety: Number($("f-safety").value),
       rth_only: $("f-rth").checked,
     });
     $("create-modal").hidden = true;
     await refresh();
+    refreshBasis();
   } catch (err) {
     alert(err.message);
   } finally {
@@ -895,17 +1142,36 @@ $("clear-task").addEventListener("click", async () => {
   try {
     await post("/api/task/clear");
     await refresh();
+    refreshBasis();
   } catch (err) {
     alert(err.message);
   }
 });
 
 $("btn-start").addEventListener("click", async () => {
+  const forcing = startNeedsForce;
   $("btn-start").disabled = true;
   try {
-    await post("/api/session/start");
+    const result = await post("/api/session/start", {
+      force_start_outside_rth: forcing,
+    });
+    if (result && result.needs_force_start) {
+      startNeedsForce = true;
+      startForceCard = result.force_card || null;
+      startForceGap = result.gap || "";
+      await refresh();
+      return;
+    }
+    startNeedsForce = false;
+    startForceCard = null;
+    startForceGap = "";
   } catch (err) {
     alert(err.message);
+    if (forcing) {
+      $("btn-start").textContent = "强制启动";
+      $("btn-start").disabled = false;
+      paintStartForce();
+    }
   }
   await refresh();
 });
@@ -919,6 +1185,35 @@ $("btn-stop").addEventListener("click", async () => {
 });
 $("btn-card").addEventListener("click", () => {
   if (lastPayload) $("confirm-modal").hidden = false;
+});
+$("btn-flatten").addEventListener("click", () => {
+  if (!lastFlatten || !lastFlatten.available) return;
+  renderFlatten(lastFlatten);
+  $("flatten-ok").disabled = false;
+  $("flatten-modal").hidden = false;
+});
+$("flatten-x").addEventListener("click", () => { $("flatten-modal").hidden = true; });
+$("flatten-cancel").addEventListener("click", () => { $("flatten-modal").hidden = true; });
+$("flatten-ok").addEventListener("click", async () => {
+  if (!lastFlatten || $("flatten-ok").disabled) return;
+  const proposalId = lastFlatten.proposal_id;
+  $("flatten-ok").disabled = true;
+  try {
+    const result = await post("/api/flatten", {
+      confirm: true,
+      proposal_id: proposalId,
+    });
+    const note = result.sent
+      ? (result.halted ? "单腿未平，已 HALT" : "清仓已提交")
+      : (result.gap || "未发送");
+    alert(note);
+    $("flatten-modal").hidden = true;
+    lastFlatten = null;
+  } catch (err) {
+    alert(err.message);
+    $("flatten-ok").disabled = false;
+  }
+  await refresh();
 });
 $("btn-recon").addEventListener("click", async () => {
   try {
@@ -1024,8 +1319,405 @@ $("analyze").addEventListener("click", async () => {
   }
 });
 
+const BASIS_POLL_MS = 45000;
+let basisPayload = null;
+let basisLayout = null;
+
+function describeBasis(data) {
+  if (!data) return "分钟数据未就绪";
+  if (data.error) return data.error;
+  const n = (data.points || []).length;
+  const bands = data.bands || {};
+  const marks = (data.markers || []).length;
+  if (!n) return "还没有可画的分钟 · " + (data.csv_path || "logs/minutes.csv");
+  const mid = Number(bands.midline_bps);
+  const up = Number(bands.upper_bps);
+  const lo = Number(bands.lower_bps);
+  const midTxt = Number.isFinite(mid) ? mid.toFixed(1) : "—";
+  const upTxt = Number.isFinite(up) ? up.toFixed(1) : "—";
+  const loTxt = Number.isFinite(lo) ? lo.toFixed(1) : "—";
+  return n + " 根分钟 · 中枢 " + midTxt + " · 带宽 +" + upTxt + " / -" + loTxt
+    + (marks ? (" · 开平仓 " + marks) : " · 无开平仓标记");
+}
+
+function niceStep(span, count) {
+  if (!(span > 0) || !Number.isFinite(span)) return 1;
+  const raw = span / Math.max(count, 1);
+  const exp = Math.floor(Math.log10(raw));
+  const pow = Math.pow(10, exp);
+  const err = raw / pow;
+  const factor = err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1;
+  return factor * pow;
+}
+
+function axisTicks(lo, hi, count) {
+  const step = niceStep(hi - lo, count);
+  const out = [];
+  if (!(step > 0)) return out;
+  let v = Math.ceil(lo / step - 1e-9) * step;
+  for (let n = 0; n < 24 && v <= hi + step * 1e-6; n += 1, v += step) {
+    if (v >= lo - step * 0.2 && v <= hi + step * 0.2) out.push(v);
+  }
+  return out;
+}
+
+function fmtUsd(v) {
+  return Number(v).toLocaleString("en-US", {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+}
+
+function fmtBps(v) {
+  const n = Number(v);
+  const digits = Math.abs(n) >= 10 ? 1 : 2;
+  const sign = n > 0 ? "+" : "";
+  return sign + n.toFixed(digits);
+}
+
+const BASIS_WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  let h = d.getUTCHours();
+  const am = h < 12 ? "AM" : "PM";
+  h = h % 12 || 12;
+  const m = String(d.getUTCMinutes()).padStart(2, "0");
+  return BASIS_WD[d.getUTCDay()] + " " + h + ":" + m + " " + am;
+}
+
+function wrapFill(ctx, text, x, y, maxW, lineH) {
+  const words = String(text).split(/\s+/);
+  let line = "";
+  let yy = y;
+  for (const word of words) {
+    const trial = line ? (line + " " + word) : word;
+    if (ctx.measureText(trial).width > maxW && line) {
+      ctx.fillText(line, x, yy);
+      line = word;
+      yy += lineH;
+    } else {
+      line = trial;
+    }
+  }
+  if (line) ctx.fillText(line, x, yy);
+}
+
+function drawBasis() {
+  const canvas = $("basis-chart");
+  if (!canvas || !basisPayload) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w < 20 || h < 20) return;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#f4f1ea";
+  ctx.fillRect(0, 0, w, h);
+
+  const data = basisPayload || {points: []};
+  const points = (data.points || []).filter((p) =>
+    Number.isFinite(Number(p.entropy_usd)) &&
+    Number.isFinite(Number(p.hedge_usd)) &&
+    Number.isFinite(Number(p.basis_bps)) &&
+    Number.isFinite(Number(p.minute_ts)));
+  const bands = data.bands || {};
+  const mid = Number(bands.midline_bps);
+  const upLine = Number.isFinite(Number(bands.upper_line_bps))
+    ? Number(bands.upper_line_bps) : (Number.isFinite(mid) ? mid + 1 :  -0.7);
+  const loLine = Number.isFinite(Number(bands.lower_line_bps))
+    ? Number(bands.lower_line_bps) : (Number.isFinite(mid) ? mid - 1 : -2.7);
+  let legendX = 16;
+  ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+  function legendItem(color, label) {
+    if (legendX > w - 70) return;
+    ctx.beginPath();
+    ctx.fillStyle = color;
+    ctx.arc(legendX + 4, 16, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.fillText(label, legendX + 12, 20);
+    legendX += 12 + ctx.measureText(label).width + 14;
+  }
+  legendItem("#2f6fe0", "Entropy");
+  legendItem("#1f9a4a", "Lighter");
+  legendItem("#3d9a62", "basis > 0");
+  legendItem("#c45c5c", "basis < 0");
+  if (Number.isFinite(mid)) legendItem("#475569", "mid " + fmtBps(mid));
+
+  if (!points.length) {
+    ctx.fillStyle = "#1f2a33";
+    ctx.font = "14px ui-sans-serif, system-ui, sans-serif";
+    const msg = data.error
+      ? String(data.error)
+      : "还没有可画的分钟。记录器写入 logs/minutes.csv 之后，这里会画出两条价格和溢价。需要列：minute_ts, entropy_bid, entropy_ask, hedge_bid, hedge_ask, premium_close_bps。";
+    wrapFill(ctx, msg, 24, 80, w - 48, 20);
+    basisLayout = null;
+    return;
+  }
+
+  const plotL = 64;
+  const plotR = w - 58;
+  const plotT = 34;
+  const plotB = h - 28;
+  const prices = [];
+  const basisVals = [0];
+  if (Number.isFinite(mid)) basisVals.push(mid, upLine, loLine);
+  for (const p of points) {
+    prices.push(Number(p.entropy_usd), Number(p.hedge_usd));
+    basisVals.push(Number(p.basis_bps));
+  }
+  let pLo = Math.min.apply(null, prices);
+  let pHi = Math.max.apply(null, prices);
+  const pPad = (pHi - pLo) * 0.08 || Math.max(Math.abs(pHi) * 0.002, 0.01);
+  pLo -= pPad;
+  pHi += pPad;
+  let bLo = Math.min.apply(null, basisVals);
+  let bHi = Math.max.apply(null, basisVals);
+  const bPad = (bHi - bLo) * 0.12 || 1;
+  bLo -= bPad;
+  bHi += bPad;
+  if (!(pHi > pLo)) { pLo -= 1; pHi += 1; }
+  if (!(bHi > bLo)) { bLo -= 1; bHi += 1; }
+
+  let t0 = Number(points[0].minute_ts);
+  let t1 = Number(points[points.length - 1].minute_ts);
+  if (!(t1 > t0)) { t0 -= 60; t1 += 60; }
+  else {
+    const span = (t1 - t0) * 0.02;
+    t0 -= span;
+    t1 += span;
+  }
+  const xOf = (ts) => plotL + ((ts - t0) / (t1 - t0)) * (plotR - plotL);
+  const yPx = (v) => plotT + ((pHi - v) / (pHi - pLo)) * (plotB - plotT);
+  const yBps = (v) => plotT + ((bHi - v) / (bHi - bLo)) * (plotB - plotT);
+  const yZero = yBps(0);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(plotL, plotT, plotR - plotL, plotB - plotT);
+  ctx.clip();
+  for (let i = 1; i < points.length; i += 1) {
+    const v0 = Number(points[i - 1].basis_bps);
+    const v1 = Number(points[i].basis_bps);
+    const x0 = xOf(Number(points[i - 1].minute_ts));
+    const x1 = xOf(Number(points[i].minute_ts));
+    const segs = [];
+    if ((v0 >= 0 && v1 >= 0) || (v0 <= 0 && v1 <= 0)) {
+      if (!(v0 === 0 && v1 === 0)) segs.push([v0, v1, x0, x1]);
+    } else {
+      const t = v0 / (v0 - v1);
+      const xc = x0 + (x1 - x0) * t;
+      segs.push([v0, 0, x0, xc], [0, v1, xc, x1]);
+    }
+    for (const seg of segs) {
+      const color = (seg[0] + seg[1]) >= 0 ? "rgba(126, 196, 150, 0.72)" : "rgba(224, 150, 150, 0.78)";
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(seg[2], yBps(seg[0]));
+      ctx.lineTo(seg[3], yBps(seg[1]));
+      ctx.lineTo(seg[3], yZero);
+      ctx.lineTo(seg[2], yZero);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  if (points.length === 1) {
+    const v = Number(points[0].basis_bps);
+    ctx.fillStyle = v >= 0 ? "rgba(126, 196, 150, 0.72)" : "rgba(224, 150, 150, 0.78)";
+    const x = xOf(Number(points[0].minute_ts));
+    ctx.fillRect(x - 2, Math.min(yBps(v), yZero), 4, Math.abs(yBps(v) - yZero));
+  }
+
+  function hline(y, color, dash) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(plotL, y);
+    ctx.lineTo(plotR, y);
+    ctx.stroke();
+    ctx.restore();
+  }
+  for (const v of axisTicks(bLo, bHi, 4)) {
+    const y = yBps(v);
+    if (y > plotT + 2 && y < plotB - 2) hline(y, "rgba(190, 184, 172, 0.45)", []);
+  }
+  hline(yZero, "#a8a298", [4, 4]);
+  if (Number.isFinite(mid)) {
+    hline(yBps(mid), "#475569", [6, 4]);
+    hline(yBps(upLine), "#b49454", [2, 3]);
+    hline(yBps(loLine), "#b49454", [2, 3]);
+  }
+
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 1.7;
+  function stroke(key, color) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    points.forEach((p, i) => {
+      const x = xOf(Number(p.minute_ts));
+      const y = yPx(Number(p[key]));
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  stroke("entropy_usd", "#2f6fe0");
+  stroke("hedge_usd", "#1f9a4a");
+  if (points.length === 1) {
+    ctx.fillStyle = "#2f6fe0";
+    ctx.beginPath();
+    ctx.arc(xOf(Number(points[0].minute_ts)), yPx(Number(points[0].entropy_usd)), 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#1f9a4a";
+    ctx.beginPath();
+    ctx.arc(xOf(Number(points[0].minute_ts)), yPx(Number(points[0].hedge_usd)), 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  let labelX = -1000;
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  for (const marker of data.markers || []) {
+    const ts = Number(marker.ts);
+    if (!Number.isFinite(ts) || ts < t0 || ts > t1) continue;
+    const x = xOf(ts);
+    ctx.save();
+    ctx.strokeStyle = marker.kind === "open" ? "#1d4ed8" : "#9a3412";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, plotT);
+    ctx.lineTo(x, plotB);
+    ctx.stroke();
+    ctx.restore();
+    if (x - labelX > 36) {
+      ctx.fillStyle = marker.kind === "open" ? "#1d4ed8" : "#9a3412";
+      ctx.fillText(marker.kind === "open" ? "open" : "close", x + 3, plotT + 12);
+      labelX = x;
+    }
+  }
+  ctx.restore();
+
+  ctx.strokeStyle = "#1f2a33";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(plotL, plotT);
+  ctx.lineTo(plotL, plotB);
+  ctx.lineTo(plotR, plotB);
+  ctx.lineTo(plotR, plotT);
+  ctx.stroke();
+
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.fillStyle = "#6b7280";
+  ctx.fillText("USD", 8, plotT - 6);
+  for (const v of axisTicks(pLo, pHi, 4)) {
+    const y = yPx(v);
+    if (y < plotT || y > plotB) continue;
+    const label = fmtUsd(v);
+    ctx.fillText(label, Math.max(2, plotL - ctx.measureText(label).width - 6), y + 3);
+  }
+  ctx.fillText("bps", plotR + 6, plotT - 6);
+  for (const v of axisTicks(bLo, bHi, 4)) {
+    const y = yBps(v);
+    if (y < plotT || y > plotB) continue;
+    ctx.fillText(fmtBps(v), plotR + 6, y + 3);
+  }
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  const stamps = [];
+  const nLab = (points[points.length - 1].minute_ts > points[0].minute_ts) ? 4 : 1;
+  for (let i = 0; i < nLab; i += 1) {
+    const ts = nLab === 1
+      ? Number(points[0].minute_ts)
+      : Number(points[0].minute_ts) + (Number(points[points.length - 1].minute_ts) - Number(points[0].minute_ts)) * i / (nLab - 1);
+    stamps.push(ts);
+  }
+  let lastLab = -1000;
+  for (const ts of stamps) {
+    const label = fmtClock(ts);
+    const width = ctx.measureText(label).width;
+    let x = xOf(ts) - width / 2;
+    x = Math.max(plotL, Math.min(x, plotR - width));
+    if (x < lastLab + 8) continue;
+    ctx.fillText(label, x, h - 10);
+    lastLab = x + width;
+  }
+
+  basisLayout = {plotL, plotR, plotT, plotB, t0, t1, xOf, points, yPx, yBps};
+}
+
+function basisTip(ev) {
+  const tip = $("basis-tip");
+  const canvas = $("basis-chart");
+  if (!tip || !canvas || !basisLayout || !basisLayout.points.length) {
+    if (tip) tip.hidden = true;
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  const box = basisLayout;
+  if (x < box.plotL || x > box.plotR || y < box.plotT || y > box.plotB) {
+    tip.hidden = true;
+    return;
+  }
+  let best = box.points[0];
+  let bestD = Infinity;
+  for (const p of box.points) {
+    const d = Math.abs(box.xOf(Number(p.minute_ts)) - x);
+    if (d < bestD) { best = p; bestD = d; }
+  }
+  const kind = best.basis_bps >= 0 ? "basis ≥ 0" : "basis < 0";
+  tip.replaceChildren();
+  const lines = [
+    fmtClock(Number(best.minute_ts)) + " UTC",
+    "Entropy " + fmtUsd(best.entropy_usd),
+    "Lighter " + fmtUsd(best.hedge_usd),
+    "basis " + fmtBps(best.basis_bps) + " · " + kind,
+  ];
+  for (const line of lines) {
+    const div = document.createElement("div");
+    div.textContent = line;
+    tip.appendChild(div);
+  }
+  const frame = canvas.parentElement.getBoundingClientRect();
+  let left = ev.clientX - frame.left + 12;
+  let top = ev.clientY - frame.top + 12;
+  tip.hidden = false;
+  if (left + tip.offsetWidth > frame.width - 8) left = Math.max(8, left - tip.offsetWidth - 24);
+  if (top + tip.offsetHeight > frame.height - 8) top = Math.max(8, top - tip.offsetHeight - 24);
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+}
+
+async function refreshBasis() {
+  try {
+    const res = await fetch("/api/basis", {cache: "no-store"});
+    if (!res.ok) throw new Error("basis " + res.status);
+    basisPayload = await res.json();
+    $("basis-sub").textContent = describeBasis(basisPayload);
+  } catch (err) {
+    basisPayload = {points: [], error: "basis 图暂时不可用"};
+    $("basis-sub").textContent = "basis 图暂时不可用";
+  }
+  drawBasis();
+}
+
+const basisCanvas = $("basis-chart");
+if (basisCanvas) {
+  basisCanvas.addEventListener("mousemove", basisTip);
+  basisCanvas.addEventListener("mouseleave", () => { $("basis-tip").hidden = true; });
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => drawBasis()).observe(basisCanvas.parentElement);
+  } else {
+    window.addEventListener("resize", drawBasis);
+  }
+}
+
 refresh();
+refreshBasis();
 setInterval(refresh, 2000);
+setInterval(refreshBasis, BASIS_POLL_MS);
 </script>
 </body>
 </html>

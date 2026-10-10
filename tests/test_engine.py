@@ -195,6 +195,156 @@ def test_execute_confirmed_requires_id_and_halts_on_single_leg(tmp_path):
     asyncio.run(go())
 
 
+def test_execute_confirmed_reduce_only_closes_without_edge_and_halts():
+    """Inside-band books have no open edge. A close still sends reduce-only."""
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.entropy.set_book(100.00, 100.02, sz=50)
+    eng.hedge.set_book(100.00, 100.02, sz=50)
+    seen = []
+
+    async def ent(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("entropy", is_buy, qty, reduce_only))
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False, "fee_bps": 0.9}
+
+    async def hed(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("hedge", is_buy, qty, reduce_only))
+        return {"status": "canceled", "filled_base": 0.0, "avg_px": None,
+                "err": None, "unresolved": False}
+
+    eng.entropy.send_taker = ent
+    eng.hedge.send_taker = hed
+
+    async def go():
+        refused = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="close-1", cap_notional=10,
+            reduce_only=True, close_qty=None)
+        assert refused["sent"] is False
+        assert refused["error"] == "close_qty"
+        assert seen == []
+        # Fair books: the open planner would say no_edge. The close must send.
+        result = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="close-2", cap_notional=10,
+            reduce_only=True, close_qty=0.05)
+        assert result["sent"] is True
+        assert result["halted"] is True
+        assert result["halt_reason"] == "single-leg fill"
+        assert eng.halted is True
+        assert len(seen) == 2
+        assert all(flag is True for _, _, _, flag in seen)
+        assert seen[0][0] == "entropy" and seen[0][1] is True
+        assert seen[1][0] == "hedge" and seen[1][1] is False
+        assert abs(seen[0][2] - 0.05) < 1e-9
+        again = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="close-3", cap_notional=10,
+            reduce_only=True, close_qty=0.05)
+        assert again["sent"] is False
+        assert len(seen) == 2
+
+    asyncio.run(go())
+
+
+def test_reduce_only_logs_the_venue_fill_not_an_invented_one(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    path = tmp_path / "trades.csv"
+    eng.cfg.trades_csv = str(path)
+    eng.entropy.set_book(100.00, 100.02, sz=50)
+    eng.hedge.set_book(100.00, 100.02, sz=50)
+
+    async def fill(*, is_buy, qty, limit_px, reduce_only=False):
+        assert reduce_only is True
+        assert abs(qty - 0.007) < 1e-9
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False, "fee_bps": 0.9}
+
+    eng.entropy.send_taker = fill
+    eng.hedge.send_taker = fill
+
+    async def go():
+        result = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="flat-log", cap_notional=10,
+            reduce_only=True, close_qty=0.007)
+        assert result["sent"] is True
+        assert result["halted"] is False
+        assert abs(result["buy_fill"] - 0.007) < 1e-9
+        assert abs(result["sell_fill"] - 0.007) < 1e-9
+
+    asyncio.run(go())
+    text = path.read_text(encoding="utf-8")
+    assert "0.007" in text
+    row = text.strip().splitlines()[-1].split(",")
+    # qty, buy_fill, sell_fill are the order and the venue fills.
+    assert abs(float(row[4]) - 0.007) < 1e-9
+    assert abs(float(row[15]) - 0.007) < 1e-9
+    assert abs(float(row[16]) - 0.007) < 1e-9
+
+
+def test_reduce_legs_closes_only_the_open_venue(tmp_path):
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    path = tmp_path / "trades.csv"
+    eng.cfg.trades_csv = str(path)
+    eng.entropy.set_book(100.00, 100.02, sz=50)
+    eng.hedge.set_book(100.00, 100.02, sz=50)
+    seen = []
+
+    async def ent(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("entropy", is_buy, qty, reduce_only))
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False, "fee_bps": 0.9}
+
+    async def hed(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("hedge", is_buy, qty, reduce_only))
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False}
+
+    eng.entropy.send_taker = ent
+    eng.hedge.send_taker = hed
+
+    async def hed_miss(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("hedge", is_buy, qty, reduce_only))
+        return {"status": "canceled", "filled_base": 0.0, "avg_px": None,
+                "err": None, "unresolved": False}
+
+    async def run():
+        try:
+            await eng.execute_reduce_legs(confirm_id="", legs=[])
+        except RuntimeError as exc:
+            assert "confirm id" in str(exc)
+        else:
+            raise AssertionError("blank confirm id was accepted")
+        flat = await eng.execute_reduce_legs(confirm_id="none", legs=[])
+        assert flat["sent"] is False
+        result = await eng.execute_reduce_legs(
+            confirm_id="one",
+            legs=[{"venue": "entropy", "qty": 0.007, "is_buy": True}])
+        assert result["sent"] is True
+        assert result["halted"] is False
+        assert abs(result["buy_fill"] - 0.007) < 1e-9
+        assert result["sell_fill"] == 0.0
+        assert len(seen) == 1
+        assert seen[0][0] == "entropy" and seen[0][1] is True
+        assert seen[0][3] is True
+        assert abs(seen[0][2] - 0.007) < 1e-9
+        eng.hedge.send_taker = hed_miss
+        short = await eng.execute_reduce_legs(
+            confirm_id="miss",
+            legs=[{"venue": "lighter", "qty": 0.007, "is_buy": False}])
+        assert short["halted"] is True
+        assert short["sell_fill"] == 0.0
+        assert eng.halted is True
+        assert seen[-1][0] == "hedge"
+        assert seen[-1][3] is True
+
+    asyncio.run(run())
+    text = path.read_text(encoding="utf-8")
+    assert "not-sent" in text
+    lines = [line.split(",") for line in text.strip().splitlines()[1:]]
+    entropy_row = lines[0]
+    assert entropy_row[1] == "flatten"
+    assert abs(float(entropy_row[15]) - 0.007) < 1e-9
+    assert float(entropy_row[16]) == 0.0
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

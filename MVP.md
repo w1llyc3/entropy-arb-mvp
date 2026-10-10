@@ -233,7 +233,11 @@ Minute bars stay at `logs/minutes.csv` (one row per completed minute). The
 status view reads that file for minutes collected, samples coverage, the
 latest top-of-book and fillable@$100 cells, and deviation versus the task
 midline. It warns when the pid file's process is gone or when recent minutes
-are thin or stale.
+are thin or stale. The basis chart on the same page reads that CSV
+(Entropy and Lighter closes, `premium_close_bps`, task midline and ± bands)
+and refreshes about every 45 seconds. `python3 tools/plot_basis.py` writes
+the same picture to `.web/basis.png`. Open/close markers are drawn only
+when `logs/trades.csv` already has fill timestamps.
 
 ### Probe limits
 
@@ -264,4 +268,28 @@ does not auto-fire.
   Lighter index. Private keys are not returned. Position / isolated stay
   empty when the payload does not name SNDK.
 - **One task.** The form cannot target another symbol or venue. Unattended
-  live (manual confirm off) is refused.
+  live (manual confirm off) is refused. Auto-confirm is a separate switch
+  and **defaults off**.
+- **Close-on-revert.** A symmetric book proposes a reduce-only close only
+  after premium is inside the task band (edges included) for 3 seconds.
+  The rule is not a midline touch. The card says 平仓. One-leg failure
+  still HALTs.
+- **手动清仓.** A danger button, visible when either venue's SNDK position
+  is not flat. Confirm modal, then reduce-only on both legs for the
+  overlapping size, or each side's absolute size toward flat. Allowed
+  anytime (outside RTH, paused, halted) without the open-order
+  **强制确认** second click. A human confirm is still required.
+  Auto-confirm does not fire it. One-leg failure HALTs; a flat success
+  clears the risk halt. Fills in `.web/probe.log` and `logs/trades.csv`
+  are venue results.
+- **Round-trip gate.** Auto open and auto close both require expected edge
+  after fees to cover Entropy open+close (default **1.8 bps**, or twice a
+  measured fee). Do not use the one-way 0.9. Outside RTH, auto-confirm
+  does not click **强制确认**.
+- **Margin sizing.** Optional. Free margin × leverage × safety (0.80),
+  clipped by the $10 hard max. Missing margin or leverage refuses. Entropy
+  available is spot USDC. 10× isolated: about $11 notional locks about
+  $1.11 margin.
+- **Windows recorder.** The panel spawns the recorder with
+  `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS` so
+  starting it does not share uvicorn's console group.

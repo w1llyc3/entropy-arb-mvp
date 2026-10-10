@@ -41,6 +41,32 @@ def record_only_argv(symbol: str, hedge: str,
     ]
 
 
+# Windows process-creation flags. Named here so a POSIX test can check the
+# combination without the subprocess constants, which exist only on Windows.
+_WIN_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_WIN_CREATE_NO_WINDOW = 0x08000000
+_WIN_DETACHED_PROCESS = 0x00000008
+
+
+def detach_popen_kwargs() -> dict:
+    """Spawn flags that keep the recorder off uvicorn's console group.
+
+    On Windows the child is started with CREATE_NEW_PROCESS_GROUP |
+    CREATE_NO_WINDOW | DETACHED_PROCESS. A console-control event delivered
+    to the panel then does not kill the recorder, and the recorder does not
+    stay attached to the panel's console. POSIX keeps ``start_new_session``.
+    """
+    if sys.platform == "win32":
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP",
+                    _WIN_CREATE_NEW_PROCESS_GROUP)
+            | getattr(subprocess, "CREATE_NO_WINDOW", _WIN_CREATE_NO_WINDOW)
+            | getattr(subprocess, "DETACHED_PROCESS", _WIN_DETACHED_PROCESS)
+        )
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
 class RecorderError(Exception):
     def __init__(self, message: str, status_code: int = 400) -> None:
         super().__init__(message)
@@ -133,6 +159,9 @@ class RecorderControl:
 
     @staticmethod
     def _reap(pid: int) -> None:
+        # Windows has no WNOHANG / waitpid reap. Liveness is os.kill(pid, 0).
+        if sys.platform == "win32":
+            return
         try:
             os.waitpid(pid, os.WNOHANG)
         except (ChildProcessError, OSError):
@@ -187,10 +216,20 @@ class RecorderControl:
 
     def _signal(self, pid: int, sig: int) -> None:
         try:
-            os.killpg(pid, sig)
+            # Windows has no process groups. killpg is missing entirely.
+            if sys.platform == "win32":
+                os.kill(pid, sig)
+            else:
+                os.killpg(pid, sig)
         except ProcessLookupError:
             return
         except PermissionError:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+        except AttributeError:
+            # os.killpg absent (Windows, or a POSIX build without it).
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
@@ -207,7 +246,14 @@ class RecorderControl:
             if not self._pid_exists(pid):
                 return
             time.sleep(0.05)
-        self._signal(pid, signal.SIGKILL)
+        if sys.platform == "win32":
+            # signal.SIGKILL does not exist on Windows. Kill the tree.
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+            )
+        else:
+            self._signal(pid, signal.SIGKILL)
         deadline = time.time() + 2.0
         while time.time() < deadline:
             self._reap(pid)
@@ -305,7 +351,7 @@ class RecorderControl:
                     stdin=subprocess.DEVNULL,
                     stdout=logf,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True,
+                    **detach_popen_kwargs(),
                 )
             meta = {
                 "pid": proc.pid,

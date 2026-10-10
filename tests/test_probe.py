@@ -19,8 +19,9 @@ from web.live_exec import execute_admitted  # noqa: E402
 from web.probe import (  # noqa: E402
     ACCRUAL_BPS, ACCRUAL_LABEL, CONFIRM_FIELDS, DECISION_WARNING,
     FORCE_RISK_LINE, build_confirm_payload, confirm_field_errors,
-    decision_warnings, in_us_rth, leg_plan, normalize_task,
-    session_snapshot,
+    decision_warnings, evaluate_auto_gates, flatten_plan, in_us_rth,
+    leg_plan, normalize_task, premium_inside_band, round_trip_fee_bps,
+    session_snapshot, size_order_notional, symmetric_position,
 )
 from web.recorder_ctl import RecorderControl  # noqa: E402
 from web.session import ProbeError, ProbeSession  # noqa: E402
@@ -36,6 +37,7 @@ def _ts(moment: datetime) -> float:
 
 INSIDE = _ts(datetime(2026, 1, 7, 10, 0, tzinfo=NY))   # Wednesday 10:00 EST
 OUTSIDE = _ts(datetime(2026, 1, 7, 16, 0, tzinfo=NY))  # Wednesday 16:00 EST
+WEEKEND = _ts(datetime(2026, 1, 10, 12, 0, tzinfo=NY))  # Saturday noon EST
 NO_ENV = os.path.join(os.path.dirname(__file__), "no-such.env")
 
 
@@ -77,6 +79,8 @@ def test_decision_card_defaults_and_warning():
     assert spec["lighter_fee_bps"] == 0.0
     assert spec["referral_mode"] == "self_t2"
     assert spec["manual_confirm"] is True
+    assert spec["auto_confirm"] is False
+    assert spec["sizing_mode"] == "cash"
     assert spec["rth_only"] is True
     assert abs(ACCRUAL_BPS - 0.54) < 1e-9
     assert decision_warnings(spec) == []
@@ -285,13 +289,16 @@ def test_default_start_argv_is_record_only(tmp_path, monkeypatch):
     assert "LIVE" not in joined
 
 
-def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
+def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path, monkeypatch):
     sess = _session(tmp_path, OUTSIDE)
     sess.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
-    with pytest.raises(ProbeError) as raised:
-        sess.start()
-    assert raised.value.status_code == 409
-    assert "RTH" in str(raised.value)
+    spawned = _fake_spawn(sess, monkeypatch)
+    first = sess.start()
+    assert first["needs_force_start"] is True
+    assert first["running"] is False
+    assert first["live_armed"] is False
+    assert "RTH" in first["gap"]
+    assert spawned == []
 
     off = _session(tmp_path / "off", INSIDE)
     off.save_task({"mode": "live", "manual_confirm": False, "rth_only": True})
@@ -299,6 +306,113 @@ def test_live_arm_blocked_outside_rth_and_without_confirm(tmp_path):
         off.start()
     assert DECISION_WARNING in str(raised.value)
     assert raised.value.status_code == 409
+
+
+def _fake_spawn(sess, monkeypatch):
+    spawned = []
+
+    def fake_start(symbol, hedge):
+        argv = list(sess.record_argv(symbol, hedge))
+        spawned.append(argv)
+        return {"pid": 4242, "argv": argv, "symbol": symbol, "hedge": hedge,
+                "running": True}
+
+    monkeypatch.setattr(sess.ctl, "start", fake_start)
+    return spawned
+
+
+def test_outside_rth_start_needs_force_then_arms(tmp_path, monkeypatch):
+    sess = _session(tmp_path, OUTSIDE)
+    sess.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7,
+    })
+    spawned = _fake_spawn(sess, monkeypatch)
+    first = sess.start()
+    assert first["ok"] is False
+    assert first["needs_force_start"] is True
+    assert first["gap"] == "非 RTH：需要第二次点击强制启动才会武装"
+    card = first["force_card"]
+    snap = session_snapshot(datetime.fromtimestamp(OUTSIDE, UTC), -1.7)
+    assert card == snap
+    assert sess.task()["force_start_ack"] is True
+    assert spawned == []
+
+    jumped = _session(tmp_path / "jump", OUTSIDE)
+    jumped.save_task({"mode": "live", "manual_confirm": True, "rth_only": True})
+    jumped_spawned = _fake_spawn(jumped, monkeypatch)
+    with pytest.raises(ProbeError) as raised:
+        jumped.start(force_start_outside_rth=True)
+    assert raised.value.status_code == 409
+    assert jumped_spawned == []
+
+    second = sess.start(force_start_outside_rth=True)
+    assert second["needs_force_start"] is False
+    assert second["live_armed"] is True
+    assert second["force_start_outside_rth"] is True
+    assert "--record-only" in second["argv"]
+    assert sess.task().get("force_start_ack") is None
+    assert len(spawned) == 1
+    log = sess.log_path.read_text(encoding="utf-8")
+    assert "force_start_outside_rth=true" in log
+
+
+def test_inside_rth_and_record_skip_force_start(tmp_path, monkeypatch):
+    inside = _session(tmp_path / "in", INSIDE)
+    inside.save_task({
+        "mode": "live", "manual_confirm": True, "rth_only": True,
+        "midline_bps": -1.7,
+    })
+    spawned = _fake_spawn(inside, monkeypatch)
+    info = inside.start()
+    assert info["needs_force_start"] is False
+    assert info["live_armed"] is True
+    assert info["force_start_outside_rth"] is False
+    assert len(spawned) == 1
+
+    record = _session(tmp_path / "rec", OUTSIDE)
+    record.save_task({"mode": "record", "rth_only": True})
+    record_spawned = _fake_spawn(record, monkeypatch)
+    recorded = record.start()
+    assert recorded["live_armed"] is False
+    assert recorded["needs_force_start"] is False
+    assert record.task().get("force_start_ack") is None
+    assert len(record_spawned) == 1
+
+
+def test_http_force_start_outside_rth(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    _write_env(tmp_path)
+
+    def _quiet(symbol, hedge):
+        return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    app = create_app(tmp_path, command_builder=_quiet, now=lambda: OUTSIDE)
+    with TestClient(app) as client:
+        made = client.post("/api/task", json={
+            "mode": "live", "manual_confirm": True, "rth_only": True,
+            "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
+            "order_notional_usd": 10, "max_position_usd": 10,
+        })
+        assert made.status_code == 200, made.text
+        first = client.post("/api/session/start", json={})
+        assert first.status_code == 200, first.text
+        assert first.json()["needs_force_start"] is True
+        assert first.json()["running"] is False
+        jumped = client.post("/api/session/start", json={
+            "force_start_outside_rth": False,
+        })
+        assert jumped.json()["needs_force_start"] is True
+        second = client.post("/api/session/start", json={
+            "force_start_outside_rth": True,
+        })
+        assert second.status_code == 200, second.text
+        assert second.json()["live_armed"] is True
+        assert second.json()["force_start_outside_rth"] is True
+        client.post("/api/stop")
 
 
 def test_missing_env_refuses_live_and_confirm(tmp_path):
@@ -552,6 +666,7 @@ def test_accounts_do_not_leak_secrets(tmp_path):
     assert snap["entropy"]["available"] == pytest.approx(20.0)
     assert snap["entropy"]["position"] == pytest.approx(0.1)
     assert snap["entropy"]["isolated"] is True
+    assert snap["entropy"]["leverage"] == pytest.approx(5)
     assert snap["lighter"]["equity"] == pytest.approx(40.0)
     assert snap["lighter"]["isolated"] is True
     leaked = scrub({"note": "key " + secret})
@@ -700,3 +815,572 @@ def test_pause_resume_and_reconcile_do_not_route(tmp_path):
         status = client.get("/api/status").json()
         assert status["running"] is False
         assert status["status_label"] == "已停止"
+
+
+def _live(sess, **extra):
+    body = {
+        "mode": "live",
+        "manual_confirm": True,
+        "rth_only": True,
+        "midline_bps": -1.7,
+        "upper_bps": 1.0,
+        "lower_bps": 1.0,
+        "order_notional_usd": 10,
+        "max_position_usd": 10,
+    }
+    body.update(extra)
+    sess.save_task(body)
+    spec = sess.task()
+    spec["live_armed"] = True
+    sess._write_json(sess.task_path, spec)
+    return spec
+
+
+def _minute(ts, *, premium, sell, buy, funding=True):
+    latest = {
+        "minute_ts": ts,
+        "samples": 60,
+        "tob": {
+            "premium_close_bps": premium,
+            "sell_edge_mean_bps": sell,
+            "buy_edge_mean_bps": buy,
+            "entropy_bid": 100.0,
+            "entropy_ask": 100.1,
+        },
+        "fillable_100": {},
+    }
+    if funding:
+        latest["funding"] = {"entropy": 0.0001, "hedge": 0.0}
+    return latest
+
+
+def test_premium_inside_band_includes_edges_and_is_not_a_midline_touch():
+    spec = normalize_task({})
+    # midline -1.7, ±1 → [-2.7, -0.7]
+    assert premium_inside_band(-1.7, spec) is True
+    assert premium_inside_band(-2.7, spec) is True
+    assert premium_inside_band(-0.7, spec) is True
+    assert premium_inside_band(-2.7001, spec) is False
+    assert premium_inside_band(-0.699, spec) is False
+    assert premium_inside_band(None, spec) is False
+
+
+def test_symmetric_position_names_the_reduce_direction():
+    held = symmetric_position(-0.02, 0.02)
+    assert held["direction"] == "buy_entropy"
+    assert held["qty"] == pytest.approx(0.02)
+    reverse = symmetric_position(0.02, -0.02)
+    assert reverse["direction"] == "sell_entropy"
+    assert symmetric_position(-0.02, 0.05) is None
+    assert symmetric_position(-0.02, -0.02) is None
+    assert symmetric_position(0.0, 0.02) is None
+
+
+def test_revert_close_waits_for_persist_then_reduce_only(tmp_path):
+    clock = {"t": INSIDE}
+    calls = []
+
+    def _exec(req):
+        calls.append(req)
+        return _flat_result(req)
+
+    sess = ProbeSession(
+        tmp_path, RecorderControl(tmp_path), now=lambda: clock["t"],
+        account_reader=lambda: {
+            "creds": {"entropy": True, "lighter": True},
+            "entropy": {"available": 25.0, "position": -0.02,
+                        "isolated": True, "leverage": 10},
+            "lighter": {"available": 40.0, "position": 0.02,
+                        "isolated": True, "leverage": 10},
+            "note": None,
+        },
+        executor=_exec)
+    _write_env(tmp_path)
+    _live(sess)
+    inside = _minute(INSIDE, premium=-1.7, sell=0.2, buy=0.2)
+    assert sess.pending_payload(inside) is None
+    assert sess._revert_watch["ready"] is False
+    assert sess._revert_watch["elapsed_sec"] == 0
+    clock["t"] = INSIDE + 2.9
+    inside["minute_ts"] = clock["t"]
+    assert sess.pending_payload(inside) is None
+    assert sess._revert_watch["ready"] is False
+    # Leaving the band resets the timer. A later return must wait again.
+    clock["t"] = INSIDE + 3.0
+    outside = _minute(clock["t"], premium=5.0, sell=8.0, buy=-4.0)
+    assert sess.pending_payload(outside) is None
+    assert sess._revert_watch is None
+    clock["t"] = INSIDE + 3.1
+    inside["minute_ts"] = clock["t"]
+    assert sess.pending_payload(inside) is None
+    clock["t"] = INSIDE + 3.1 + 3.0
+    inside["minute_ts"] = clock["t"]
+    payload = sess.pending_payload(inside)
+    assert payload["intent"] == "close"
+    assert payload["reduce_only"] is True
+    assert payload["direction"] == "buy_entropy"
+    assert payload["legs"][0]["direction"] == "BUY"
+    assert payload["legs"][1]["direction"] == "SELL"
+    assert payload["legs"][0]["base_qty"] == pytest.approx(0.02)
+    admitted = sess.admit_confirm(payload)
+    assert admitted["sent"] is True
+    assert admitted["reduce_only"] is True
+    assert len(calls) == 1
+    assert calls[0]["reduce_only"] is True
+    assert calls[0]["close_qty"] == pytest.approx(0.02)
+    assert calls[0]["confirm_id"]
+
+
+def test_auto_confirm_blocked_without_round_trip_gate(tmp_path):
+    assert round_trip_fee_bps() == pytest.approx(1.8)
+    assert round_trip_fee_bps(0.92) == pytest.approx(1.84)
+    # One-way net is positive (1.2 − 0.9 = 0.3) and clears the sell hurdle
+    # (−0.7). Round-trip net is 1.2 − 1.8 = −0.6, so auto must not fire.
+    blocked = evaluate_auto_gates(
+        intent="open", pre_fee_edge_bps=1.2, entry_pre_fee_bps=None,
+        measured_fee_bps=None, notional_usd=10, auto_confirm_max_usd=10,
+        fresh=True, halted=False, rth=True,
+        funding_entropy=0.0001, funding_hedge=0.0,
+        available_entropy=25, available_lighter=40,
+        available_need_entropy=10, available_need_lighter=10,
+        daily_notional=0, daily_count=0,
+        daily_max_notional=None, daily_max_count=None)
+    assert blocked["ok"] is False
+    assert "1.8" in blocked["reason"] or "1.80" in blocked["reason"]
+    assert blocked["round_trip_net_bps"] < 0
+    passed = evaluate_auto_gates(
+        intent="open", pre_fee_edge_bps=2.0, entry_pre_fee_bps=None,
+        measured_fee_bps=None, notional_usd=10, auto_confirm_max_usd=10,
+        fresh=True, halted=False, rth=True,
+        funding_entropy=0.0001, funding_hedge=0.0,
+        available_entropy=25, available_lighter=40,
+        available_need_entropy=10, available_need_lighter=10,
+        daily_notional=0, daily_count=0,
+        daily_max_notional=None, daily_max_count=None)
+    assert passed["ok"] is True
+    assert passed["round_trip_net_bps"] == pytest.approx(0.2)
+    no_entry = evaluate_auto_gates(
+        intent="close", pre_fee_edge_bps=0.0, entry_pre_fee_bps=None,
+        measured_fee_bps=None, notional_usd=10, auto_confirm_max_usd=10,
+        fresh=True, halted=False, rth=True,
+        funding_entropy=0.0001, funding_hedge=0.0,
+        available_entropy=0, available_lighter=0,
+        available_need_entropy=0, available_need_lighter=0,
+        daily_notional=0, daily_count=0,
+        daily_max_notional=None, daily_max_count=None)
+    assert no_entry["ok"] is False
+
+    clock = {"t": INSIDE}
+    calls = []
+
+    def _exec(req):
+        calls.append(req)
+        return _flat_result(req)
+
+    sess = _session(tmp_path, INSIDE, executor=_exec)
+    sess.now = lambda: clock["t"]
+    _live(sess, auto_confirm=True)
+    thin = _minute(clock["t"], premium=5.0, sell=1.2, buy=-4.0)
+    card = sess.pending_payload(thin)
+    assert card is not None
+    assert card["intent"] == "open"
+    assert card["auto_blocked"]
+    assert "0.9" in card["auto_blocked"]
+    assert calls == []
+
+    rich = _minute(clock["t"], premium=5.0, sell=8.0, buy=-4.0)
+    fired = sess.pending_payload(rich)
+    assert fired is None
+    assert len(calls) == 1
+    assert calls[0]["auto_confirm"] is True
+    assert calls[0]["reduce_only"] is False
+    assert calls[0]["confirm_id"]
+    again = sess.pending_payload(rich)
+    assert again is not None
+    assert "冷却" in (again.get("auto_blocked") or "")
+    assert len(calls) == 1
+
+    outside = _session(tmp_path / "out", OUTSIDE, calls=calls)
+    # A fresh executor list so the RTH case cannot be confused with the fill.
+    out_calls = []
+    outside.executor = lambda req: out_calls.append(req) or _flat_result(req)
+    outside.now = lambda: OUTSIDE
+    _live(outside, auto_confirm=True)
+    huge = _minute(OUTSIDE, premium=5.0, sell=8.0, buy=-4.0)
+    held = outside.pending_payload(huge)
+    assert held is not None
+    assert "非 RTH" in held["auto_blocked"]
+    assert out_calls == []
+    first = outside.admit_confirm(held)
+    assert first["needs_force_confirm"] is True
+    assert out_calls == []
+    second = outside.admit_confirm(dict(held, force_confirm=True))
+    assert second["sent"] is True
+    assert second["force_confirm_outside_rth"] is True
+    assert len(out_calls) == 1
+
+
+def test_sizing_uses_margin_when_present_and_refuses_when_missing():
+    # 10× and $1.11 free → headroom $1.11 × 10 × 0.80 = $8.88, under a $20 cap.
+    # The $1.11 figure is the cash still free, not the margin already locked
+    # by a ~$11 fill.
+    sized = size_order_notional(
+        mode="margin", hard_max_usd=20, safety=0.80,
+        accounts={
+            "entropy": {"available": 1.11, "leverage": 10},
+            "lighter": {"available": 5.0, "leverage": 10},
+        })
+    assert sized["refused"] is False
+    assert sized["source"] == "margin"
+    assert sized["notional_usd"] == pytest.approx(1.11 * 10 * 0.80)
+    clipped = size_order_notional(
+        mode="margin", hard_max_usd=10, safety=0.80,
+        accounts={
+            "entropy": {"available": 5.0, "leverage": 10},
+            "lighter": {"available": 5.0, "leverage": 10},
+        })
+    assert clipped["notional_usd"] == pytest.approx(10)
+    missing = size_order_notional(
+        mode="margin", hard_max_usd=10, safety=0.80,
+        accounts={
+            "entropy": {"available": 5.0},
+            "lighter": {"available": 5.0, "leverage": 10},
+        })
+    assert missing["refused"] is True
+    assert missing["notional_usd"] is None
+    cash = size_order_notional(
+        mode="cash", hard_max_usd=10, accounts={"entropy": {}, "lighter": {}})
+    assert cash["notional_usd"] == pytest.approx(10)
+    assert cash["refused"] is False
+
+
+def test_margin_mode_refuses_when_headroom_is_below_the_hard_min(tmp_path):
+    """$1.11 free at 10× and 0.80 safety is $8.88, under the $10 probe min."""
+    calls = []
+    sess = ProbeSession(
+        tmp_path, RecorderControl(tmp_path), now=lambda: INSIDE,
+        account_reader=lambda: {
+            "creds": {"entropy": True, "lighter": True},
+            "entropy": {"available": 1.11, "position": 0.0,
+                        "isolated": True, "leverage": 10},
+            "lighter": {"available": 5.0, "position": 0.0,
+                        "isolated": True, "leverage": 10},
+            "note": None,
+        },
+        executor=lambda req: calls.append(req))
+    _write_env(tmp_path)
+    _live(sess, sizing_mode="margin", margin_safety=0.80)
+    latest = _minute(INSIDE, premium=5.0, sell=8.0, buy=-4.0)
+    assert sess.pending_payload(latest) is None
+    assert sess._sizing_note
+    assert "保证金" in sess._sizing_note
+    assert calls == []
+
+    # Plenty of free margin: headroom exceeds $10, so the hard max binds.
+    rich = ProbeSession(
+        tmp_path / "rich", RecorderControl(tmp_path / "rich"),
+        now=lambda: INSIDE,
+        account_reader=lambda: {
+            "creds": {"entropy": True, "lighter": True},
+            "entropy": {"available": 5.0, "position": 0.0,
+                        "isolated": True, "leverage": 10},
+            "lighter": {"available": 5.0, "position": 0.0,
+                        "isolated": True, "leverage": 10},
+            "note": None,
+        },
+        executor=lambda req: calls.append(req))
+    _write_env(tmp_path / "rich")
+    _live(rich, sizing_mode="margin", margin_safety=0.80)
+    card = rich.pending_payload(latest)
+    assert card is not None
+    assert card["legs"][0]["notional_usd"] == pytest.approx(10)
+    assert calls == []
+
+
+def test_entropy_available_uses_spot_usdc_not_zero_withdrawable(tmp_path):
+    secret = "0x" + "ab" * 32
+    (tmp_path / ".env").write_text(
+        "HL_PRIVATE_KEY=" + secret + "\n"
+        "HL_ACCOUNT_ADDRESS=0x" + "cd" * 20 + "\n"
+        "LIGHTER_ACCOUNT_INDEX=7\n"
+        "LIGHTER_API_KEY_INDEX=3\n"
+        "LIGHTER_API_PRIVATE_KEY=" + secret + "\n",
+        encoding="utf-8")
+
+    class Resp:
+        def __init__(self, payload):
+            self.payload = payload
+        def read(self):
+            return json.dumps(self.payload).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+
+    def opener(req, timeout=None):
+        raw = req.data.decode() if req.data else ""
+        body = json.loads(raw) if raw.startswith("{") else {}
+        url = req.full_url
+        if "hyperliquid" in url and body.get("type") == "spotClearinghouseState":
+            return Resp({"balances": [
+                {"coin": "USDC", "total": "25.0", "hold": "1.0"},
+            ]})
+        if "hyperliquid" in url:
+            return Resp({
+                "marginSummary": {"accountValue": "39.5"},
+                "withdrawable": "0",
+                "assetPositions": [{
+                    "position": {
+                        "coin": "io:SNDK",
+                        "szi": "-0.01",
+                        "leverage": {"type": "isolated", "value": 10},
+                        "marginUsed": "1.11",
+                    }
+                }],
+            })
+        return Resp({"accounts": []})
+
+    snap = read_accounts(tmp_path, opener=opener)
+    assert secret not in json.dumps(snap)
+    assert snap["entropy"]["withdrawable"] == pytest.approx(0)
+    assert snap["entropy"]["available"] == pytest.approx(24)
+    assert snap["entropy"]["spot_available"] == pytest.approx(24)
+    assert snap["entropy"]["leverage"] == pytest.approx(10)
+    assert snap["entropy"]["margin_used"] == pytest.approx(1.11)
+    assert snap["entropy"]["position"] == pytest.approx(-0.01)
+    assert snap["entropy"]["isolated"] is True
+
+
+def _positions(entropy, lighter):
+    return {
+        "creds": {"entropy": True, "lighter": True},
+        "entropy": {"equity": 30.0, "available": 25.0, "position": entropy,
+                    "isolated": True, "leverage": 10},
+        "lighter": {"equity": 40.0, "available": 40.0, "position": lighter,
+                    "isolated": True, "leverage": 10},
+        "note": None,
+    }
+
+
+def test_flatten_plan_names_the_overlap_and_refuses_when_flat():
+    held = flatten_plan(-0.007, 0.007)
+    assert held["kind"] == "pair"
+    assert held["reduce_only"] is True
+    assert held["direction"] == "buy_entropy"
+    assert held["qty"] == pytest.approx(0.007)
+    assert [leg["direction"] for leg in held["legs"]] == ["BUY", "SELL"]
+    assert held["legs"][0]["close_qty"] == pytest.approx(0.007)
+    reverse = flatten_plan(0.007, -0.007)
+    assert reverse["direction"] == "sell_entropy"
+    assert reverse["legs"][0]["direction"] == "SELL"
+    assert reverse["legs"][1]["direction"] == "BUY"
+    # Not a pair: each side's absolute size toward flat, not an invented overlap.
+    uneven = flatten_plan(-0.02, 0.05)
+    assert uneven["kind"] == "legs"
+    assert uneven["direction"] is None
+    assert [leg["close_qty"] for leg in uneven["legs"]] == pytest.approx([0.02, 0.05])
+    one_sided = flatten_plan(-0.007, 0.0)
+    assert one_sided["kind"] == "legs"
+    assert len(one_sided["legs"]) == 1
+    assert one_sided["legs"][0]["venue"] == "entropy"
+    assert one_sided["legs"][0]["is_buy"] is True
+    assert one_sided["legs"][0]["close_qty"] == pytest.approx(0.007)
+    assert flatten_plan(0.0, 0.0) is None
+    assert flatten_plan(None, None) is None
+    assert flatten_plan(0.0004, -0.0004) is None
+    unread = flatten_plan(None, 0.007)
+    assert unread["partial"] is True
+    assert [leg["venue"] for leg in unread["legs"]] == ["lighter"]
+    assert unread["legs"][0]["close_qty"] == pytest.approx(0.007)
+
+
+def test_flatten_proposes_reduce_only_outside_the_band(tmp_path):
+    """Weekend premium +5 bps vs midline -1.7 never arms close-on-revert."""
+    calls = []
+
+    def _exec(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.007, sell=0.007)
+
+    sess = ProbeSession(
+        tmp_path, RecorderControl(tmp_path), now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.007),
+        executor=_exec)
+    _write_env(tmp_path)
+    _live(sess)
+    risk = sess.risk()
+    risk["halted"] = True
+    risk["halt_reason"] = "single-leg fill"
+    risk["net_base"] = 0.007
+    sess._save_risk(risk)
+    latest = _minute(WEEKEND, premium=5.0, sell=8.0, buy=-4.0)
+    assert sess.pending_payload(latest) is None
+    assert sess._revert_watch is None
+    assert calls == []
+    offer = sess.flatten_offer(latest)
+    assert offer["available"] is True
+    assert offer["kind"] == "pair"
+    assert offer["reduce_only"] is True
+    assert offer["anytime"] is True
+    assert offer["rth_required"] is False
+    assert offer["direction"] == "buy_entropy"
+    assert offer["qty"] == pytest.approx(0.007)
+    assert offer["entropy_position"] == pytest.approx(-0.007)
+    assert offer["lighter_position"] == pytest.approx(0.007)
+    with pytest.raises(ProbeError, match="explicit confirm"):
+        sess.admit_flatten({"proposal_id": offer["proposal_id"]})
+    assert calls == []
+    admitted = sess.admit_flatten({
+        "confirm": True, "proposal_id": offer["proposal_id"],
+    })
+    assert admitted["sent"] is True
+    assert admitted["reduce_only"] is True
+    assert admitted["intent"] == "flatten"
+    assert admitted["anytime"] is True
+    assert admitted["force_confirm_outside_rth"] is False
+    assert admitted["halted"] is False
+    assert len(calls) == 1
+    assert calls[0]["reduce_only"] is True
+    assert calls[0]["intent"] == "flatten"
+    assert calls[0]["flatten_kind"] == "pair"
+    assert calls[0]["direction"] == "buy_entropy"
+    assert calls[0]["close_qty"] == pytest.approx(0.007)
+    assert calls[0]["confirm_id"]
+    assert calls[0]["force_confirm_outside_rth"] is False
+    log = (tmp_path / ".web" / "probe.log").read_text(encoding="utf-8")
+    assert "flatten " in log
+    assert "reduce_only=true" in log
+    assert "anytime=true" in log
+    assert "force_confirm_outside_rth=false" in log
+    assert "buy_fill=0.007" in log
+    assert "sell_fill=0.007" in log
+    assert sess.risk()["halted"] is False
+    assert sess.risk()["halt_reason"] is None
+    # The open-order force path is unchanged: this clock is still outside RTH.
+    assert sess.rth_now() is False
+
+
+def test_flatten_refuses_when_already_flat(tmp_path):
+    calls = []
+    sess = ProbeSession(
+        tmp_path, RecorderControl(tmp_path), now=lambda: WEEKEND,
+        account_reader=lambda: _positions(0.0, 0.0),
+        executor=lambda req: calls.append(req) or _flat_result(req))
+    _write_env(tmp_path)
+    assert sess.flatten_offer(None) is None
+    with pytest.raises(ProbeError, match="already flat") as raised:
+        sess.admit_flatten({"confirm": True, "proposal_id": "stale"})
+    assert raised.value.status_code == 409
+    assert calls == []
+    log_path = tmp_path / ".web" / "probe.log"
+    if log_path.is_file():
+        assert "buy_fill" not in log_path.read_text(encoding="utf-8")
+
+
+def test_flatten_one_leg_halts_and_one_sided_does_not_open_the_flat_venue(tmp_path):
+    calls = []
+
+    def miss(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.007, sell=0.0)
+
+    pair = ProbeSession(
+        tmp_path / "pair", RecorderControl(tmp_path / "pair"),
+        now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.007),
+        executor=miss)
+    _write_env(tmp_path / "pair")
+    offer = pair.flatten_offer(None)
+    body = pair.admit_flatten({"confirm": True, "proposal_id": offer["proposal_id"]})
+    assert body["sent"] is True
+    assert body["halted"] is True
+    assert pair.risk()["halted"] is True
+    assert pair.risk()["halt_reason"] == "single-leg fill"
+
+    side_calls = []
+
+    def side(req):
+        side_calls.append(req)
+        # A filled one-sided reduce is flat. buy_fill is the venue number;
+        # net_base is not buy minus a missing second leg.
+        result = _flat_result(req, buy=0.007, sell=0.0)
+        result["halted"] = False
+        result["halt_reason"] = None
+        result["net_base"] = 0.0
+        result["ok"] = True
+        return result
+
+    one = ProbeSession(
+        tmp_path / "one", RecorderControl(tmp_path / "one"),
+        now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.0),
+        executor=side)
+    _write_env(tmp_path / "one")
+    offer = one.flatten_offer(None)
+    assert offer["kind"] == "legs"
+    assert len(offer["legs"]) == 1
+    sent = one.admit_flatten({"confirm": True, "proposal_id": offer["proposal_id"]})
+    assert sent["sent"] is True
+    assert len(side_calls) == 1
+    legs = side_calls[0]["flatten_legs"]
+    assert len(legs) == 1
+    assert legs[0]["venue"] == "entropy"
+    assert legs[0]["is_buy"] is True
+    assert legs[0]["qty"] == pytest.approx(0.007)
+    assert "lighter" not in {leg["venue"] for leg in legs}
+    # The fake reports a fill and no halt, so the one-sided reduce clears.
+    assert one.risk()["halted"] is False
+
+
+def test_http_flatten_button_and_route(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    calls = []
+
+    def executor(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.007, sell=0.007)
+
+    _write_env(tmp_path)
+    app = create_app(
+        tmp_path, now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.007),
+        executor=executor)
+    with TestClient(app) as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        assert 'id="btn-flatten"' in page.text
+        assert "手动清仓" in page.text
+        assert 'id="flatten-modal"' in page.text
+        status = client.get("/api/status").json()
+        offer = status["flatten"]
+        assert offer["available"] is True
+        assert offer["qty"] == pytest.approx(0.007)
+        refused = client.post("/api/flatten", json={
+            "confirm": False, "proposal_id": offer["proposal_id"],
+        })
+        assert refused.status_code == 409
+        assert calls == []
+        ok = client.post("/api/flatten", json={
+            "confirm": True, "proposal_id": offer["proposal_id"],
+        })
+        assert ok.status_code == 200
+        assert ok.json()["sent"] is True
+        assert ok.json()["reduce_only"] is True
+        assert calls[0]["close_qty"] == pytest.approx(0.007)
+        assert calls[0]["reduce_only"] is True
+
+    flat_calls = []
+    flat = create_app(
+        tmp_path / "flat", now=lambda: WEEKEND,
+        account_reader=lambda: _positions(0.0, 0.0),
+        executor=lambda req: flat_calls.append(req))
+    _write_env(tmp_path / "flat")
+    with TestClient(flat) as client:
+        assert client.get("/api/status").json()["flatten"] is None
+        denied = client.post("/api/flatten", json={"confirm": True})
+        assert denied.status_code == 409
+        assert "already flat" in denied.json()["detail"]
+        assert flat_calls == []
