@@ -18,11 +18,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from entropy_arb.config import HEDGE_VENUES
 
+from web.basis import build_basis
 from web.recorder_ctl import RecorderControl, RecorderError
 from web.report import assemble_status, run_analyze
 from web.session import ProbeError, ProbeSession
@@ -190,6 +191,16 @@ def create_app(root: Optional[Path] = None, command_builder=None,
     @app.post("/api/analyze")
     def analyze() -> dict:
         return run_analyze(root)
+
+    @app.get("/api/basis")
+    def basis(hours: float = 0.0) -> JSONResponse:
+        """Historical minute chart. Polled by the page; not a push feed."""
+        if hours != hours or hours < 0 or hours > 24 * 366:
+            hours = 0.0
+        return JSONResponse(
+            build_basis(root, hours=hours),
+            headers={"Cache-Control": "no-store"},
+        )
 
     return app
 

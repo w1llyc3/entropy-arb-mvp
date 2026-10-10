@@ -74,6 +74,13 @@ self_t2 应计约 0.54 bps 标记未到账）见 [MVP.md](MVP.md)。**启动**�
 RTH 外必须再点一次 **强制确认**。命令行实盘不变：
 `python3 main.py --symbol SNDK --hedge lighter`。
 
+同一页面会画 `logs/minutes.csv`：左轴是 Entropy 与 Lighter 的分钟收盘价（美元），
+右轴是 `premium_close_bps`（相对 0 绿正红负），并叠上任务中枢和上下沿（未保存任务时为
+-1.7 和 ±1）。大约每 45 秒重读一次，不是逐笔推送。开平仓竖线只在 `logs/trades.csv`
+已有成交时间时出现。需要的列：`minute_ts`、`entropy_bid`、`entropy_ask`、
+`hedge_bid`、`hedge_ask`、`premium_close_bps`。静态图：
+`python3 tools/plot_basis.py` 写到 `.web/basis.png`。
+
 ## 快速开始
 
 ```bash

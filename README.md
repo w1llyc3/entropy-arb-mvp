@@ -130,6 +130,15 @@ trading by itself and does not receive API keys. **启动** always passes
 dual-leg order through `Engine.execute_confirmed`; outside RTH it requires
 a second click, **强制确认**. The CLI live command above is unchanged.
 
+The same page plots `logs/minutes.csv`: Entropy and Lighter minute-close
+prices (left axis, USD) and `premium_close_bps` (right axis, bps, green
+above 0 and red below) with the task midline and ± bands (Decision Card
+-1.7 and ±1 until a task is saved). It reloads about every 45 seconds.
+Open/close ticks appear only when `logs/trades.csv` already has fill
+timestamps. Required columns: `minute_ts`, `entropy_bid`, `entropy_ask`,
+`hedge_bid`, `hedge_ask`, `premium_close_bps`. A static copy:
+`python3 tools/plot_basis.py` writes `.web/basis.png`.
+
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
 executable premium of each direction against its full hurdle (fees and
@@ -230,6 +239,8 @@ entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute orderbook bars
 tools/analyze.py         minutes.csv -> suggested thresholds
+tools/plot_basis.py      minutes.csv -> .web/basis.png
+web/basis.py             minute bars -> basis series for the panel chart
 tests/                   python3 -m pytest tests/
 ```
 
