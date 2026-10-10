@@ -195,6 +195,55 @@ def test_execute_confirmed_requires_id_and_halts_on_single_leg(tmp_path):
     asyncio.run(go())
 
 
+def test_execute_confirmed_reduce_only_closes_without_edge_and_halts():
+    """Inside-band books have no open edge. A close still sends reduce-only."""
+    eng = make_engine(midline=0.0, upper=1.0, lower=1.0)
+    eng.entropy.set_book(100.00, 100.02, sz=50)
+    eng.hedge.set_book(100.00, 100.02, sz=50)
+    seen = []
+
+    async def ent(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("entropy", is_buy, qty, reduce_only))
+        return {"status": "filled", "filled_base": qty, "avg_px": limit_px,
+                "err": None, "unresolved": False, "fee_bps": 0.9}
+
+    async def hed(*, is_buy, qty, limit_px, reduce_only=False):
+        seen.append(("hedge", is_buy, qty, reduce_only))
+        return {"status": "canceled", "filled_base": 0.0, "avg_px": None,
+                "err": None, "unresolved": False}
+
+    eng.entropy.send_taker = ent
+    eng.hedge.send_taker = hed
+
+    async def go():
+        refused = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="close-1", cap_notional=10,
+            reduce_only=True, close_qty=None)
+        assert refused["sent"] is False
+        assert refused["error"] == "close_qty"
+        assert seen == []
+        # Fair books: the open planner would say no_edge. The close must send.
+        result = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="close-2", cap_notional=10,
+            reduce_only=True, close_qty=0.05)
+        assert result["sent"] is True
+        assert result["halted"] is True
+        assert result["halt_reason"] == "single-leg fill"
+        assert eng.halted is True
+        assert len(seen) == 2
+        assert all(flag is True for _, _, _, flag in seen)
+        assert seen[0][0] == "entropy" and seen[0][1] is True
+        assert seen[1][0] == "hedge" and seen[1][1] is False
+        assert abs(seen[0][2] - 0.05) < 1e-9
+        again = await eng.execute_confirmed(
+            direction="buy_entropy", confirm_id="close-3", cap_notional=10,
+            reduce_only=True, close_qty=0.05)
+        assert again["sent"] is False
+        assert len(seen) == 2
+
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

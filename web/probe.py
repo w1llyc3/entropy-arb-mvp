@@ -27,6 +27,14 @@ HEDGE = "lighter"
 REFERRAL_MODE = "self_t2"
 PERSIST_SEC = 3.0
 MIN_ORDER_USD = 10.0
+# Entropy taker open + taker close. Lighter Standard is ~0, so the round
+# trip is 1.8 bps unless a fill has measured a different Entropy fee.
+# Auto-confirm must use this, never the one-way 0.9 bps open fee.
+ROUND_TRIP_OPEN_CLOSE = 2
+MARGIN_SAFETY = 0.80
+# Opposite-leg sizes within this fraction (or NET_TOL_BASE, whichever is
+# larger) count as one arb. A one-leg residual is a HALT, not a close.
+SYM_REL_TOL = 0.02
 
 # Gross Tier2-self accrual on the 0.9 bps fee. Not cash. Not added to net edge.
 # 0.9 * 0.50 * 1.20 = 0.54 bps. Rounded so the confirm card shows 0.54.
@@ -65,6 +73,7 @@ CONFIRM_FIELDS = (
     "legs",
     "tail_vs_median",
     "confirm",
+    "intent",
 )
 LEG_FIELDS = ("venue", "direction", "notional_usd", "available", "isolated")
 
@@ -96,9 +105,25 @@ def decision_defaults() -> dict:
         "accrual_label": ACCRUAL_LABEL,
         "persist_sec": PERSIST_SEC,
         "manual_confirm": True,
+        "auto_confirm": False,
+        "auto_confirm_max_usd": DECISION_ORDER_USD,
+        "auto_daily_max_notional_usd": None,
+        "auto_daily_max_count": None,
+        "sizing_mode": "cash",
+        "margin_safety": MARGIN_SAFETY,
         "rth_only": True,
         "mode": "record",
     }
+
+
+def _optional_cap(raw: dict, name: str) -> Optional[float]:
+    """Blank, null, or <= 0 means the optional daily cap is off."""
+    if name not in raw or raw.get(name) in (None, ""):
+        return None
+    number = _num(raw.get(name), name)
+    if number <= 0:
+        return None
+    return number
 
 
 def _num(value, name: str) -> float:
@@ -153,6 +178,31 @@ def normalize_task(body: Optional[dict]) -> dict:
         raise ValueError("rth_only must be true or false")
     spec["manual_confirm"] = (bool(raw["manual_confirm"])
                               if "manual_confirm" in raw else True)
+    if "auto_confirm" in raw and not isinstance(raw["auto_confirm"], bool):
+        raise ValueError("auto_confirm must be true or false")
+    spec["auto_confirm"] = (bool(raw["auto_confirm"])
+                            if "auto_confirm" in raw else False)
+    if raw.get("auto_confirm_max_usd") in (None, ""):
+        spec["auto_confirm_max_usd"] = spec["order_notional_usd"]
+    else:
+        spec["auto_confirm_max_usd"] = _num(
+            raw.get("auto_confirm_max_usd"), "auto_confirm_max_usd")
+    if spec["auto_confirm_max_usd"] <= 0:
+        raise ValueError("auto_confirm_max_usd must be > 0")
+    if spec["auto_confirm_max_usd"] - spec["order_notional_usd"] > 1e-9:
+        raise ValueError(
+            "auto_confirm_max_usd cannot exceed the order hard max")
+    spec["auto_daily_max_notional_usd"] = _optional_cap(
+        raw, "auto_daily_max_notional_usd")
+    spec["auto_daily_max_count"] = _optional_cap(raw, "auto_daily_max_count")
+    sizing = str(raw.get("sizing_mode", spec["sizing_mode"]) or "").strip().lower()
+    if sizing not in ("cash", "margin"):
+        raise ValueError("sizing_mode must be cash or margin")
+    spec["sizing_mode"] = sizing
+    spec["margin_safety"] = _num(
+        raw.get("margin_safety", spec["margin_safety"]), "margin_safety")
+    if not 0 < spec["margin_safety"] <= 1:
+        raise ValueError("margin_safety must be in (0, 1]")
     spec["rth_only"] = bool(raw["rth_only"]) if "rth_only" in raw else True
     # Fees and referral stay on the Decision Card even if the body tries
     # to overwrite them.
@@ -164,6 +214,7 @@ def normalize_task(body: Optional[dict]) -> dict:
     spec["symbol"] = SYMBOL
     spec["entropy_dex"] = ENTROPY_DEX
     spec["hedge"] = HEDGE
+    spec["persist_sec"] = PERSIST_SEC
     return spec
 
 
@@ -286,7 +337,261 @@ def qualifying_direction(spec: dict, sell_pre: Optional[float],
     }
 
 
-def leg_plan(direction: str, notional: float, accounts: Optional[dict]) -> list:
+def round_trip_fee_bps(measured_open_fee: Optional[float] = None) -> float:
+    """Entropy open fee plus Entropy close fee. Lighter Standard stays ~0.
+
+    The default is 1.8 bps. A measured Entropy taker fee replaces 0.9 on
+    both legs of the round trip. Callers must not treat the one-way 0.9
+    as if it already paid for the close.
+    """
+    one = ENTROPY_FEE_BPS
+    if measured_open_fee is not None:
+        try:
+            candidate = float(measured_open_fee)
+        except (TypeError, ValueError):
+            candidate = None
+        else:
+            if math.isfinite(candidate) and candidate >= 0:
+                one = candidate
+    return ROUND_TRIP_OPEN_CLOSE * one + ROUND_TRIP_OPEN_CLOSE * LIGHTER_FEE_BPS
+
+
+def round_trip_net_bps(pre_fee_edge_bps: Optional[float],
+                       measured_open_fee: Optional[float] = None
+                       ) -> Optional[float]:
+    """Pre-fee edge minus the open+close fee. None when the edge is missing."""
+    if pre_fee_edge_bps is None:
+        return None
+    try:
+        pre = float(pre_fee_edge_bps)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(pre):
+        return None
+    return pre - round_trip_fee_bps(measured_open_fee)
+
+
+def premium_inside_band(premium: Optional[float], spec: dict) -> bool:
+    """True when premium has returned inside the task band, edges included.
+
+    The close rule is the complement of the open band, not a midline touch.
+    With midline -1.7 and ±1.0, inside means -2.7 <= premium <= -0.7.
+    A print on either edge is already back; a print outside keeps the
+    position. The caller still waits ``persist_sec`` before proposing.
+    """
+    if premium is None:
+        return False
+    try:
+        px = float(premium)
+        mid = float(spec["midline_bps"])
+        upper = float(spec["upper_bps"])
+        lower = float(spec["lower_bps"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    if not all(math.isfinite(v) for v in (px, mid, upper, lower)):
+        return False
+    return (mid - lower) <= px <= (mid + upper)
+
+
+def _pos(value) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def symmetric_position(entropy_pos, lighter_pos) -> Optional[dict]:
+    """Opposite, similar sizes. Returns the reduce-only close, or None.
+
+    Entropy short / Lighter long closes with buy_entropy. The reverse
+    closes with sell_entropy. Qty is the overlapping base size already on
+    the books — nothing is invented from a model fill.
+    """
+    ent = _pos(entropy_pos)
+    lig = _pos(lighter_pos)
+    if ent is None or lig is None or ent == 0 or lig == 0:
+        return None
+    if ent * lig >= 0:
+        return None
+    gap = abs(abs(ent) - abs(lig))
+    limit = max(NET_TOL_BASE, SYM_REL_TOL * max(abs(ent), abs(lig)))
+    if gap > limit:
+        return None
+    if ent < 0 and lig > 0:
+        direction, held = "buy_entropy", "sell_entropy"
+    else:
+        direction, held = "sell_entropy", "buy_entropy"
+    return {
+        "direction": direction,
+        "held": held,
+        "qty": min(abs(ent), abs(lig)),
+    }
+
+
+def margin_headroom_notional(*, free_margin, leverage, safety: float
+                             ) -> Optional[float]:
+    """Notional headroom from free margin × leverage × safety.
+
+    Returns None when either input is missing. Callers must refuse rather
+    than substitute a cash notional. ``free_margin`` is spot USDC on
+    Entropy (dex withdrawable can be 0 while isolated) and available
+    balance on Lighter. A 10× isolated fill of about $11 locks about
+    $1.11 of margin (notional / leverage, plus a small venue buffer).
+    That locked number is not headroom; headroom is the cash still free.
+    """
+    margin = _pos(free_margin)
+    lev = _pos(leverage)
+    try:
+        safe = float(safety)
+    except (TypeError, ValueError):
+        return None
+    if margin is None or lev is None or not math.isfinite(safe):
+        return None
+    if lev <= 0 or margin < 0 or not 0 < safe <= 1:
+        return None
+    return margin * lev * safe
+
+
+def size_order_notional(*, mode: str, hard_max_usd: float,
+                        accounts: Optional[dict],
+                        safety: float = MARGIN_SAFETY,
+                        min_usd: float = 0.0) -> dict:
+    """Cash mode returns the hard max. Margin mode sizes from both venues.
+
+    The hard max always clips. Missing margin or leverage refuses; the
+    cash hard max is not used as a stand-in.
+    """
+    try:
+        hard = float(hard_max_usd)
+    except (TypeError, ValueError):
+        hard = None
+    if hard is None or not math.isfinite(hard) or hard <= 0:
+        return {"notional_usd": None, "source": mode, "refused": True,
+                "reason": "hard max is not a positive number",
+                "headroom_usd": None}
+    if str(mode or "cash") != "margin":
+        return {"notional_usd": hard, "source": "cash", "refused": False,
+                "reason": None, "headroom_usd": None}
+    accounts = accounts or {}
+    rooms = []
+    for name in ("entropy", "lighter"):
+        leg = accounts.get(name) or {}
+        room = margin_headroom_notional(
+            free_margin=leg.get("available"),
+            leverage=leg.get("leverage"),
+            safety=safety,
+        )
+        if room is None:
+            return {
+                "notional_usd": None,
+                "source": "margin",
+                "refused": True,
+                "reason": ("保证金或杠杆缺失，拒绝按保证金缩放"
+                           "（不会改用现金名义）"),
+                "headroom_usd": None,
+            }
+        rooms.append(room)
+    headroom = min(rooms)
+    notional = min(hard, headroom)
+    if notional + 1e-9 < float(min_usd):
+        return {
+            "notional_usd": None,
+            "source": "margin",
+            "refused": True,
+            "reason": (f"保证金×杠杆×{float(safety):.2f} 得到 "
+                       f"${notional:.2f}，低于 ${float(min_usd):.0f}"),
+            "headroom_usd": headroom,
+        }
+    return {"notional_usd": notional, "source": "margin", "refused": False,
+            "reason": None, "headroom_usd": headroom}
+
+
+def evaluate_auto_gates(*, intent: str, pre_fee_edge_bps: Optional[float],
+                        entry_pre_fee_bps: Optional[float],
+                        measured_fee_bps: Optional[float],
+                        notional_usd: float, auto_confirm_max_usd: float,
+                        fresh: bool, halted: bool, rth: bool,
+                        funding_entropy: Optional[float],
+                        funding_hedge: Optional[float],
+                        available_entropy: Optional[float],
+                        available_lighter: Optional[float],
+                        available_need_entropy: float,
+                        available_need_lighter: float,
+                        daily_notional: float, daily_count: int,
+                        daily_max_notional: Optional[float],
+                        daily_max_count: Optional[float]) -> dict:
+    """Gates that must pass before an auto open or an auto close.
+
+    The round-trip check uses open+close fees (default 1.8 bps). An open
+    is judged on the live pre-fee edge. A close is judged on the recorded
+    entry edge, because the revert itself is inside the band and no longer
+    shows an open signal. Outside RTH this never returns ok.
+    """
+    fee = round_trip_fee_bps(measured_fee_bps)
+    basis = entry_pre_fee_bps if intent == "close" else pre_fee_edge_bps
+    net = round_trip_net_bps(basis, measured_fee_bps)
+    out = {
+        "ok": False,
+        "reason": None,
+        "round_trip_fee_bps": fee,
+        "round_trip_net_bps": None if net is None else round(float(net), 4),
+    }
+
+    def fail(reason: str) -> dict:
+        out["reason"] = reason
+        return out
+
+    if halted:
+        return fail("HALT")
+    if not rth:
+        return fail("非 RTH：自动确认不会强制发单")
+    if not fresh:
+        return fail("books not fresh")
+    if net is None:
+        return fail("没有可计算的往返边际")
+    if net < 0:
+        return fail(
+            f"往返净边际 {net:.2f} bps 未覆盖开+平 {fee:.2f} bps"
+            "（不用单边 0.9）")
+    try:
+        notional = float(notional_usd)
+        auto_max = float(auto_confirm_max_usd)
+    except (TypeError, ValueError):
+        return fail("notional is not a number")
+    if notional - auto_max > 1e-9:
+        return fail("notional above auto_confirm_max_usd")
+    if (daily_max_notional is not None
+            and float(daily_notional) + notional - float(daily_max_notional) > 1e-9):
+        return fail("daily notional cap")
+    if (daily_max_count is not None
+            and int(daily_count) + 1 > int(daily_max_count)):
+        return fail("daily count cap")
+    if _pos(funding_entropy) is None or _pos(funding_hedge) is None:
+        return fail("funding not available")
+    if intent != "close":
+        ent_av = _pos(available_entropy)
+        lig_av = _pos(available_lighter)
+        if ent_av is None or lig_av is None:
+            return fail("available not readable")
+        if ent_av + 1e-9 < float(available_need_entropy):
+            return fail("entropy available below margin")
+        if lig_av + 1e-9 < float(available_need_lighter):
+            return fail("lighter available below margin")
+    out["ok"] = True
+    return out
+
+
+def trading_day(now: datetime) -> str:
+    """America/New_York calendar day for the auto-confirm counter."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(_new_york()).date().isoformat()
+
+
+def leg_plan(direction: str, notional: float, accounts: Optional[dict],
+             base_qty: Optional[float] = None) -> list:
     """Per-leg direction, notional, available, isolated. Secrets never appear."""
     accounts = accounts or {}
     ent = accounts.get("entropy") or {}
@@ -295,7 +600,7 @@ def leg_plan(direction: str, notional: float, accounts: Optional[dict]) -> list:
         ent_side, lig_side = "SELL", "BUY"
     else:
         ent_side, lig_side = "BUY", "SELL"
-    return [
+    legs = [
         {
             "venue": "Entropy",
             "dex": ENTROPY_DEX,
@@ -312,6 +617,10 @@ def leg_plan(direction: str, notional: float, accounts: Optional[dict]) -> list:
             "isolated": lig.get("isolated"),
         },
     ]
+    if base_qty is not None:
+        for leg in legs:
+            leg["base_qty"] = float(base_qty)
+    return legs
 
 
 def build_confirm_payload(spec: dict, proposal: dict, *, rth: bool,
@@ -332,6 +641,8 @@ def build_confirm_payload(spec: dict, proposal: dict, *, rth: bool,
         "legs": proposal["legs"],
         "tail_vs_median": tail,
         "confirm": True,
+        "intent": proposal.get("intent") or "open",
+        "reduce_only": bool(proposal.get("reduce_only")),
     }
     missing = missing_confirm_fields(payload)
     if missing:
@@ -394,6 +705,8 @@ def confirm_field_errors(payload: dict) -> list:
         errors.append("tail_vs_median must be a string or null")
     if not isinstance(payload.get("proposal_id"), str) or not payload["proposal_id"]:
         errors.append("proposal_id is required")
+    if payload.get("intent") not in ("open", "close"):
+        errors.append("intent must be open or close")
     return errors
 
 

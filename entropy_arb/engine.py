@@ -447,10 +447,12 @@ class Engine:
 
     # ------------------------------------------------------------- execution
 
-    async def _execute(self, buy, sell, plan: ArbPlan) -> bool:
+    async def _execute(self, buy, sell, plan: ArbPlan, *,
+                       reduce_only: bool = False) -> bool:
         """Send both legs and settle the fills. Both venue locks are held by
         the caller. Returns True when an outcome is unresolved and the caller
-        must escalate to reconcile."""
+        must escalate to reconcile. ``reduce_only`` is the close path: both
+        legs are sent reduce-only and a one-leg residual still counts."""
         if self.halted:
             return False
         cfg = self.cfg
@@ -468,8 +470,10 @@ class Engine:
         self._record_send(buy)
         self._record_send(sell)
         res = await asyncio.gather(
-            buy.send_taker(is_buy=True, qty=plan.qty, limit_px=buy_bound),
-            sell.send_taker(is_buy=False, qty=plan.qty, limit_px=sell_bound),
+            buy.send_taker(is_buy=True, qty=plan.qty, limit_px=buy_bound,
+                           reduce_only=reduce_only),
+            sell.send_taker(is_buy=False, qty=plan.qty, limit_px=sell_bound,
+                            reduce_only=reduce_only),
             return_exceptions=True)
         binfo, sinfo = (r if isinstance(r, dict) else
                         {"status": "send-failed", "filled_base": 0.0,
@@ -549,11 +553,45 @@ class Engine:
             "error": binfo.get("err") or sinfo.get("err"),
             "unresolved": bool(unresolved),
             "status": f"{binfo.get('status')}/{sinfo.get('status')}",
+            "reduce_only": bool(reduce_only),
         }
         return bool(unresolved)
 
+    def _plan_reduce(self, buy, sell, qty: float):
+        """Size a reduce-only close from a known base qty. No edge required.
+
+        The qty is the overlapping position. Touch prices are the IOC
+        bounds; this does not invent a fill and does not walk for edge.
+        """
+        asks = buy.book.sorted_asks()
+        bids = sell.book.sorted_bids()
+        if not asks or not bids:
+            return None, "empty_book"
+        qty = floor_step(float(qty), self._step)
+        if qty <= 0:
+            return None, "close_qty"
+        buy_limit = asks[0][0]
+        sell_limit = bids[0][0]
+        if buy_limit <= 0 or sell_limit <= 0:
+            return None, "empty_book"
+        return ArbPlan(
+            qty=qty,
+            buy_limit=buy_limit,
+            sell_limit=sell_limit,
+            buy_notional=qty * buy_limit,
+            sell_notional=qty * sell_limit,
+            q_max=qty,
+            q_max_notional=qty * buy_limit,
+            top_premium_bps=(sell_limit / buy_limit - 1.0) * 1e4,
+            marginal_premium_bps=(sell_limit / buy_limit - 1.0) * 1e4,
+            buy_fee=buy.fee_bps / 1e4,
+            sell_fee=sell.fee_bps / 1e4,
+        ), "ok"
+
     async def execute_confirmed(self, *, direction: str, confirm_id: str,
-                                cap_notional: float) -> dict:
+                                cap_notional: float,
+                                reduce_only: bool = False,
+                                close_qty: Optional[float] = None) -> dict:
         """One dual-leg slice for an admitted panel confirm.
 
         Uses the same ``_execute`` path as the strategy loop (both legs go
@@ -561,6 +599,10 @@ class Engine:
         A residual net after the pair halts this engine; the caller must not
         open again while that net is non-zero. This method does not hedge —
         a hedge would be a second order without its own confirm.
+
+        ``reduce_only`` closes an existing symmetric arb. ``close_qty`` is
+        that overlapping base size. The open edge planner is not used,
+        because a revert inside the band is not a new edge.
         """
         if not str(confirm_id or "").strip():
             raise RuntimeError("refusing order without an admitted confirm id")
@@ -584,32 +626,44 @@ class Engine:
             return _not_sent(confirm_id, "stale_book")
         if not (buy.ready_to_trade() and sell.ready_to_trade()):
             return _not_sent(confirm_id, "not_ready")
-        cap = min(float(cap_notional), float(cfg.max_order_notional),
-                  float(buy.cap_usd), float(sell.cap_usd), 10.0)
-        if cap <= 0:
-            return _not_sent(confirm_id, "cap")
-        ref = buy.book.best_ask() or sell.book.best_bid() or 0.0
-        if ref > 0:
-            cap = min(cap, max(self._headroom(buy, sell, ref), 0.0))
-        if cap + 1e-9 < min(self._min_notional, 10.0) * 0.98:
-            return _not_sent(confirm_id, "position_cap")
-        # A $10 cap floored to the size step can land a hair under the
-        # configured minimum. Keep the slice, but never above the cap.
-        saved_min = self._min_notional
-        self._min_notional = min(saved_min, cap * 0.98)
-        try:
-            plan, reason = self._plan(buy, sell, cap)
-        finally:
-            self._min_notional = saved_min
-        if plan is None:
-            return _not_sent(confirm_id, reason or "no_plan")
-        if (plan.buy_notional > cap * 1.02 + 1e-6
-                or plan.sell_notional > cap * 1.02 + 1e-6):
-            return _not_sent(confirm_id, "notional_above_cap")
+        if reduce_only:
+            try:
+                qty = float(close_qty)
+            except (TypeError, ValueError):
+                return _not_sent(confirm_id, "close_qty")
+            if qty <= 0:
+                return _not_sent(confirm_id, "close_qty")
+            plan, reason = self._plan_reduce(buy, sell, qty)
+            if plan is None:
+                return _not_sent(confirm_id, reason or "no_plan")
+        else:
+            cap = min(float(cap_notional), float(cfg.max_order_notional),
+                      float(buy.cap_usd), float(sell.cap_usd), 10.0)
+            if cap <= 0:
+                return _not_sent(confirm_id, "cap")
+            ref = buy.book.best_ask() or sell.book.best_bid() or 0.0
+            if ref > 0:
+                cap = min(cap, max(self._headroom(buy, sell, ref), 0.0))
+            if cap + 1e-9 < min(self._min_notional, 10.0) * 0.98:
+                return _not_sent(confirm_id, "position_cap")
+            # A $10 cap floored to the size step can land a hair under the
+            # configured minimum. Keep the slice, but never above the cap.
+            saved_min = self._min_notional
+            self._min_notional = min(saved_min, cap * 0.98)
+            try:
+                plan, reason = self._plan(buy, sell, cap)
+            finally:
+                self._min_notional = saved_min
+            if plan is None:
+                return _not_sent(confirm_id, reason or "no_plan")
+            if (plan.buy_notional > cap * 1.02 + 1e-6
+                    or plan.sell_notional > cap * 1.02 + 1e-6):
+                return _not_sent(confirm_id, "notional_above_cap")
         await self._vlock(buy.key).acquire()
         await self._vlock(sell.key).acquire()
         try:
-            unresolved = await self._execute(buy, sell, plan)
+            unresolved = await self._execute(
+                buy, sell, plan, reduce_only=bool(reduce_only))
         finally:
             self._vlock(buy.key).release()
             self._vlock(sell.key).release()

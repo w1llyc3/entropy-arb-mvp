@@ -130,6 +130,35 @@ trading by itself and does not receive API keys. **启动** always passes
 dual-leg order through `Engine.execute_confirmed`; outside RTH it requires
 a second click, **强制确认**. The CLI live command above is unchanged.
 
+**Close-on-revert.** While both venues hold a symmetric arb (Entropy short
+and Lighter long, or the reverse), the panel watches premium against the
+task band. A close card (reduce-only, both legs) appears when premium is
+back **inside** the band, edges included —
+`midline − lower ≤ premium ≤ midline + upper` — and stays there for
+`persist_sec` (3s, the same order as the open persist). It does not wait
+for a midline touch. One leg failing still **HALT**s. The card is labeled
+close, not open.
+
+**Auto-confirm stays off** until the form enables it. Before an auto open
+or an auto close, the expected edge must cover the **round trip** (Entropy
+open + close ≈ **1.8 bps**, or twice a measured Entropy fee; Lighter
+Standard ≈ 0). The one-way 0.9 bps open fee is not the gate. An auto close
+uses the entry edge stored when the open filled — the revert is inside the
+band, so it is not required to show a fresh 1.8 bps. Notional must
+sit at or under `auto_confirm_max_usd` (default = the order hard max).
+Optional daily notional and count caps live in `.web/auto_daily.json`.
+Books must be fresh, the probe must not be halted, and funding plus
+available must be readable. **Outside RTH, auto-confirm never takes the
+force path** — a person still has to click **强制确认**.
+
+**Sizing.** Cash mode keeps the order hard max. Margin mode sizes from
+free margin × leverage × a safety factor (default 0.80), then clips to
+that hard max. Missing margin or leverage refuses the order. On Entropy,
+free cash is **spot USDC**; an isolated `io` position can show
+`withdrawable` 0. A 10× isolated fill of about **$11** notional locks
+about **$1.11** of margin (notional / leverage, plus a small buffer).
+That locked amount is not headroom.
+
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
 executable premium of each direction against its full hurdle (fees and

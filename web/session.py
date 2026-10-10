@@ -4,6 +4,15 @@ Arming 探针实盘 never builds a live ``main.py`` command. The subprocess, whe
 one is started, is record-only. A confirm admits an id and only then calls
 ``Engine.execute_confirmed`` (see ``web.live_exec``). Outside US RTH the
 first click does not send; a second 「强制确认」 is required.
+
+A live symmetric book (Entropy short / Lighter long, or the reverse) is
+watched against the task band. When premium is back inside the band,
+inclusive of the edges, and stays there for ``persist_sec`` (3s), the
+panel proposes a reduce-only close. One leg failing still HALTs.
+
+``auto_confirm`` defaults off. When it is on, an open or a close is sent
+only inside RTH and only after the round-trip gate (default 1.8 bps, not
+the one-way 0.9). Outside RTH the force click stays human.
 """
 from __future__ import annotations
 
@@ -25,7 +34,10 @@ from web.probe import (
     DECISION_WARNING,
     ENTROPY_FEE_BPS,
     FEE_MISMATCH_TOL_BPS,
+    MARGIN_SAFETY,
+    MIN_ORDER_USD,
     NET_TOL_BASE,
+    PERSIST_SEC,
     RTH_WINDOW,
     STATUS_HALT,
     SYMBOL,
@@ -34,15 +46,21 @@ from web.probe import (
     confirm_field_errors,
     decision_defaults,
     decision_warnings,
+    evaluate_auto_gates,
     in_us_rth,
     leg_plan,
     net_edge_bps,
     normalize_task,
+    premium_inside_band,
     probe_config_dict,
     qualifying_direction,
+    round_trip_fee_bps,
     session_snapshot,
+    size_order_notional,
     status_label,
+    symmetric_position,
     tail_vs_median,
+    trading_day,
 )
 from web.recorder_ctl import RecorderControl, RecorderError, record_only_argv
 from web.report import read_minutes, recorder_csv_rel
@@ -73,8 +91,15 @@ class ProbeSession:
         self.config_path = self.dir / "probe.yaml"
         self.risk_path = self.dir / "risk.json"
         self.log_path = self.dir / "probe.log"
+        self.entry_path = self.dir / "entry.json"
+        self.daily_path = self.dir / "auto_daily.json"
         self._account_cache = None
         self._accounts_at = 0.0
+        self._revert_since = None
+        self._revert_watch = None
+        self._sizing_note = None
+        self._auto_block_until = 0.0
+        self._last_auto = None
 
     # ----------------------------------------------------------------- files
 
@@ -241,6 +266,13 @@ class ProbeSession:
             "accrual_bps": ACCRUAL_BPS,
             "accrual_label": ACCRUAL_LABEL,
             "manual_confirm": bool(spec.get("manual_confirm")),
+            "auto_confirm": bool(spec.get("auto_confirm")),
+            "auto_confirm_max_usd": spec.get("auto_confirm_max_usd"),
+            "auto_daily_max_notional_usd": spec.get("auto_daily_max_notional_usd"),
+            "auto_daily_max_count": spec.get("auto_daily_max_count"),
+            "sizing_mode": spec.get("sizing_mode") or "cash",
+            "margin_safety": spec.get("margin_safety"),
+            "persist_sec": spec.get("persist_sec") or PERSIST_SEC,
             "rth_only": bool(spec.get("rth_only", True)),
             "mode": spec.get("mode"),
             "mode_label": "探针实盘" if spec.get("mode") == "live" else "只记录",
@@ -454,28 +486,191 @@ class ProbeSession:
         self._accounts_at = now
         return self._account_cache
 
-    def refresh_proposal(self, latest: Optional[dict]) -> Optional[dict]:
-        """Open a confirm card when the live probe sees a qualifying net edge.
+    def _entry(self) -> dict:
+        data = self._read_json(self.entry_path)
+        return data if isinstance(data, dict) else {}
 
-        Record mode never proposes. Outside RTH the card can still be shown
-        with confirm disabled; ``admit_confirm`` refuses it.
+    def _save_entry(self, entry: Optional[dict]) -> None:
+        if not entry:
+            try:
+                self.entry_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        self._write_json(self.entry_path, entry)
+
+    def _daily(self) -> dict:
+        day = trading_day(self._clock())
+        data = self._read_json(self.daily_path) or {}
+        if data.get("day") != day:
+            return {"day": day, "notional_usd": 0.0, "count": 0}
+        try:
+            notional = float(data.get("notional_usd") or 0.0)
+        except (TypeError, ValueError):
+            notional = 0.0
+        try:
+            count = int(data.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return {"day": day, "notional_usd": notional, "count": count}
+
+    def _bump_daily(self, notional: float) -> None:
+        day = self._daily()
+        day["notional_usd"] = float(day["notional_usd"]) + float(notional)
+        day["count"] = int(day["count"]) + 1
+        self._write_json(self.daily_path, day)
+
+    def _clear_revert(self) -> None:
+        self._revert_since = None
+        self._revert_watch = None
+
+    def _drop_pending(self, queue: dict) -> None:
+        if queue.get("pending"):
+            self._save_queue({"pending": None, "history": queue["history"]})
+
+    def _close_notional(self, qty: float, latest: Optional[dict],
+                        fallback: float) -> float:
+        tob = (latest or {}).get("tob") or {}
+        try:
+            bid = float(tob.get("entropy_bid"))
+            ask = float(tob.get("entropy_ask"))
+        except (TypeError, ValueError):
+            return float(fallback)
+        if bid <= 0 or ask <= 0:
+            return float(fallback)
+        return float(qty) * (bid + ask) / 2.0
+
+    def _pos_sig(self, accounts: dict):
+        def _r(value):
+            try:
+                if isinstance(value, bool):
+                    return None
+                return round(float(value), 8)
+            except (TypeError, ValueError):
+                return None
+        ent = (accounts.get("entropy") or {}).get("position")
+        lig = (accounts.get("lighter") or {}).get("position")
+        return (_r(ent), _r(lig))
+
+    def refresh_proposal(self, latest: Optional[dict]) -> Optional[dict]:
+        """Open a confirm card, or a reduce-only close after an inside-band revert.
+
+        Record mode never proposes. A symmetric Entropy/Lighter book is
+        not an open: premium must sit inside the task band
+        (midline − lower <= premium <= midline + upper, edges included)
+        for ``persist_sec`` before a close card is raised. Outside that
+        band the close timer resets. Flat books keep the open path.
         """
         spec = self.task()
         queue = self.queue()
         if not spec or spec.get("mode") != "live" or not spec.get("live_armed"):
-            if queue.get("pending"):
-                self._save_queue({"pending": None, "history": queue["history"]})
+            self._drop_pending(queue)
+            self._clear_revert()
             return None
         if not spec.get("manual_confirm"):
+            self._clear_revert()
             return None
+        accounts = self._accounts()
+        held = symmetric_position(
+            (accounts.get("entropy") or {}).get("position"),
+            (accounts.get("lighter") or {}).get("position"))
+        if held is not None:
+            return self._refresh_close(spec, queue, latest, accounts, held)
+        self._clear_revert()
+        return self._refresh_open(spec, queue, latest, accounts)
+
+    def _refresh_close(self, spec: dict, queue: dict, latest: Optional[dict],
+                       accounts: dict, held: dict) -> Optional[dict]:
+        view = self._edge_view(latest)
+        premium = view.get("premium_close_bps")
+        persist = float(spec.get("persist_sec") or PERSIST_SEC)
+        if not premium_inside_band(premium, spec):
+            self._clear_revert()
+            self._drop_pending(queue)
+            return None
+        now = float(self.now())
+        if self._revert_since is None:
+            self._revert_since = now
+        elapsed = max(0.0, now - float(self._revert_since))
+        ready = elapsed + 1e-9 >= persist
+        self._revert_watch = {
+            "inside": True,
+            "elapsed_sec": round(elapsed, 3),
+            "persist_sec": persist,
+            "ready": ready,
+            "rule": "inside_band",
+        }
+        if not ready:
+            pending = queue.get("pending")
+            if pending and pending.get("intent") == "close":
+                self._drop_pending(queue)
+            elif pending and pending.get("intent") != "close":
+                self._drop_pending(queue)
+            return None
+        notional = self._close_notional(
+            held["qty"], latest, float(spec["order_notional_usd"]))
+        deviation = None
+        if premium is not None and spec.get("midline_bps") is not None:
+            deviation = round(float(premium) - float(spec["midline_bps"]), 4)
+        pending = queue.get("pending")
+        if (pending and pending.get("intent") == "close"
+                and pending.get("direction") == held["direction"]):
+            pending["pre_fee_edge_bps"] = (
+                round(float(premium), 4) if premium is not None else None)
+            pending["net_edge_bps"] = deviation
+            pending["close_qty"] = held["qty"]
+            pending["legs"] = leg_plan(
+                held["direction"], notional, accounts, base_qty=held["qty"])
+            pending["rth"] = self.rth_now()
+            self._save_queue(queue)
+            return pending
+        proposal = {
+            "proposal_id": uuid.uuid4().hex,
+            "intent": "close",
+            "reduce_only": True,
+            "close_qty": held["qty"],
+            "held": held["held"],
+            "direction": held["direction"],
+            "pre_fee_edge_bps": (
+                round(float(premium), 4) if premium is not None else None),
+            "net_edge_bps": deviation if deviation is not None else 0.0,
+            "legs": leg_plan(
+                held["direction"], notional, accounts, base_qty=held["qty"]),
+            "tail_vs_median": None,
+            "rth": self.rth_now(),
+            "created_at": self.now(),
+        }
+        queue["pending"] = proposal
+        self._save_queue(queue)
+        return proposal
+
+    def _refresh_open(self, spec: dict, queue: dict, latest: Optional[dict],
+                      accounts: dict) -> Optional[dict]:
         view = self._edge_view(latest)
         qual = qualifying_direction(spec, view["sell_pre_bps"], view["buy_pre_bps"])
         if qual is None:
-            if queue.get("pending"):
-                self._save_queue({"pending": None, "history": queue["history"]})
+            self._sizing_note = None
+            self._drop_pending(queue)
             return None
+        sized = size_order_notional(
+            mode=spec.get("sizing_mode") or "cash",
+            hard_max_usd=float(spec["order_notional_usd"]),
+            accounts=accounts,
+            safety=float(spec.get("margin_safety") or MARGIN_SAFETY),
+            min_usd=(MIN_ORDER_USD if spec.get("sizing_mode") == "margin"
+                     else 0.0),
+        )
+        self._sizing_note = sized.get("reason")
+        if sized.get("refused") or sized.get("notional_usd") is None:
+            self._drop_pending(queue)
+            return None
+        notional = float(sized["notional_usd"])
         pending = queue.get("pending")
+        if pending and pending.get("intent") not in (None, "open"):
+            pending = None
         if pending and pending.get("direction") == qual["direction"]:
+            pending["intent"] = "open"
+            pending["reduce_only"] = False
             pending["net_edge_bps"] = qual["net_edge_bps"]
             pending["pre_fee_edge_bps"] = qual["pre_fee_edge_bps"]
             pending["tail_vs_median"] = tail_vs_median(
@@ -485,15 +680,17 @@ class ProbeSession:
             return pending
         proposal = {
             "proposal_id": uuid.uuid4().hex,
+            "intent": "open",
+            "reduce_only": False,
             "direction": qual["direction"],
             "pre_fee_edge_bps": qual["pre_fee_edge_bps"],
             "net_edge_bps": qual["net_edge_bps"],
-            "legs": leg_plan(qual["direction"], spec["order_notional_usd"],
-                             self._accounts()),
+            "legs": leg_plan(qual["direction"], notional, accounts),
             "tail_vs_median": tail_vs_median(
                 self._history_nets(qual["direction"]), qual["net_edge_bps"]),
             "rth": self.rth_now(),
             "created_at": self.now(),
+            "sizing": sized.get("source"),
         }
         queue["pending"] = proposal
         self._save_queue(queue)
@@ -518,7 +715,103 @@ class ProbeSession:
         payload["force_ack"] = bool(pending.get("force_ack"))
         payload["session"] = snap
         payload["force_card"] = snap if not rth else None
+        gate = self._auto_gate(
+            spec, pending, latest, rth=rth,
+            halted=bool(self.risk().get("halted")))
+        payload["round_trip_fee_bps"] = gate["round_trip_fee_bps"]
+        payload["round_trip_net_bps"] = gate["round_trip_net_bps"]
+        payload["auto_confirm"] = bool(spec.get("auto_confirm"))
+        payload["auto_blocked"] = None
+        if spec.get("auto_confirm"):
+            if not rth:
+                payload["auto_blocked"] = "非 RTH：自动确认不会强制发单"
+            elif not payload["confirm_enabled"]:
+                payload["auto_blocked"] = block
+            elif gate["ok"]:
+                if self._auto_fire(spec, pending):
+                    return None
+                payload["auto_blocked"] = "自动确认冷却中，仓位未变"
+            else:
+                payload["auto_blocked"] = gate["reason"]
         return payload
+
+    def _leg_notional(self, pending: dict, spec: dict) -> float:
+        legs = pending.get("legs") or []
+        if legs and isinstance(legs[0], dict):
+            try:
+                return float(legs[0].get("notional_usd"))
+            except (TypeError, ValueError):
+                pass
+        return float(spec["order_notional_usd"])
+
+    def _available_needs(self, spec: dict, notional: float, accounts: dict):
+        if spec.get("sizing_mode") != "margin":
+            return notional, notional
+        try:
+            ent_lev = float((accounts.get("entropy") or {})["leverage"])
+            lig_lev = float((accounts.get("lighter") or {})["leverage"])
+            if ent_lev <= 0 or lig_lev <= 0:
+                raise ValueError
+            return notional / ent_lev, notional / lig_lev
+        except (KeyError, TypeError, ValueError):
+            return notional, notional
+
+    def _auto_gate(self, spec: dict, pending: dict, latest: Optional[dict],
+                   *, rth: bool, halted: bool) -> dict:
+        accounts = self._accounts()
+        ent = accounts.get("entropy") or {}
+        lig = accounts.get("lighter") or {}
+        fund = (latest or {}).get("funding") or {}
+        notional = self._leg_notional(pending, spec)
+        need_e, need_l = self._available_needs(spec, notional, accounts)
+        daily = self._daily()
+        entry = self._entry()
+        measured = self.risk().get("actual_fee_bps")
+        return evaluate_auto_gates(
+            intent=pending.get("intent") or "open",
+            pre_fee_edge_bps=pending.get("pre_fee_edge_bps"),
+            entry_pre_fee_bps=entry.get("pre_fee_edge_bps"),
+            measured_fee_bps=measured,
+            notional_usd=notional,
+            auto_confirm_max_usd=float(spec.get("auto_confirm_max_usd")
+                                       or spec["order_notional_usd"]),
+            fresh=books_fresh(latest, now=float(self.now())),
+            halted=bool(halted or self.risk().get("halted")),
+            rth=bool(rth),
+            funding_entropy=fund.get("entropy"),
+            funding_hedge=fund.get("hedge"),
+            available_entropy=ent.get("available"),
+            available_lighter=lig.get("available"),
+            available_need_entropy=need_e,
+            available_need_lighter=need_l,
+            daily_notional=daily["notional_usd"],
+            daily_count=daily["count"],
+            daily_max_notional=spec.get("auto_daily_max_notional_usd"),
+            daily_max_count=spec.get("auto_daily_max_count"),
+        )
+
+    def _auto_fire(self, spec: dict, pending: dict) -> bool:
+        """Send one auto order. False when the same position already auto-fired."""
+        now = float(self.now())
+        if now < float(self._auto_block_until):
+            return False
+        accounts = self._accounts()
+        sig = self._pos_sig(accounts)
+        intent = pending.get("intent") or "open"
+        last = self._last_auto or {}
+        if last.get("sig") == sig and last.get("intent") == intent:
+            return False
+        self._auto_block_until = now + float(spec.get("persist_sec") or PERSIST_SEC)
+        queue = self.queue()
+        current = queue.get("pending") or {}
+        if current.get("proposal_id") != pending.get("proposal_id"):
+            return False
+        result = self._route_admitted(spec, queue, current, outside=False, auto=True)
+        if result.get("sent"):
+            self._last_auto = {"sig": sig, "intent": intent}
+            self._bump_daily(self._leg_notional(current, spec))
+            self._account_cache = None
+        return True
 
     def _archive(self, queue: dict, action: str, proposal: dict,
                  **extra) -> None:
@@ -631,14 +924,18 @@ class ProbeSession:
         return self._route_admitted(spec, queue, pending, outside=not rth)
 
     def _route_admitted(self, spec: dict, queue: dict, pending: dict,
-                        *, outside: bool) -> dict:
+                        *, outside: bool, auto: bool = False) -> dict:
         confirm_id = uuid.uuid4().hex
         if not confirm_id:
             raise ProbeError("refusing order without an admitted confirm id",
                              status_code=500)
         direction = pending.get("direction")
+        reduce_only = bool(pending.get("reduce_only"))
         self._log(
             f"route confirm_id={confirm_id} direction={direction} "
+            f"intent={pending.get('intent') or 'open'} "
+            f"reduce_only={str(reduce_only).lower()} "
+            f"auto_confirm={str(bool(auto)).lower()} "
             f"force_confirm_outside_rth={str(bool(outside)).lower()}")
         # Drop the pending card before the send so a second click cannot
         # admit the same proposal again.
@@ -652,6 +949,10 @@ class ProbeSession:
             "max_position_usd": float(spec["max_position_usd"]),
             "root": str(self.root),
             "force_confirm_outside_rth": bool(outside),
+            "reduce_only": reduce_only,
+            "close_qty": pending.get("close_qty"),
+            "intent": pending.get("intent") or "open",
+            "auto_confirm": bool(auto),
         }
         try:
             result = self.executor(req)
@@ -680,6 +981,17 @@ class ProbeSession:
         # _archive rewrote the queue from the pre-clear copy's history.
         # pending is set to None there. Good.
         risk = self.risk()
+        if sent and not risk.get("halted"):
+            if reduce_only:
+                self._save_entry(None)
+                self._clear_revert()
+            else:
+                self._save_entry({
+                    "direction": direction,
+                    "pre_fee_edge_bps": pending.get("pre_fee_edge_bps"),
+                    "notional_usd": self._leg_notional(pending, spec),
+                    "ts": self.now(),
+                })
         self._log(
             f"result confirm_id={confirm_id} routed={str(routed).lower()} "
             f"sent={str(sent).lower()} ok={str(bool(result.get('ok'))).lower()} "
@@ -697,6 +1009,9 @@ class ProbeSession:
             "proposal_id": proposal.get("proposal_id"),
             "confirm_id": confirm_id,
             "force_confirm_outside_rth": bool(outside),
+            "reduce_only": reduce_only,
+            "auto_confirm": bool(auto),
+            "intent": pending.get("intent") or "open",
             "halted": bool(risk.get("halted")),
             "fee_mismatch": bool(risk.get("fee_mismatch")),
             "entropy_fee_bps": result.get("entropy_fee_bps"),
@@ -777,6 +1092,7 @@ class ProbeSession:
             proposal = self.pending_payload(base.get("latest"))
         elif self.queue().get("pending") and not live_armed:
             self._save_queue({"pending": None, "history": self.queue()["history"]})
+            self._clear_revert()
         out = dict(base)
         out["paused"] = paused
         out["status_label"] = label
@@ -811,13 +1127,20 @@ class ProbeSession:
         out["net_base"] = risk.get("net_base")
         task_mid = float(spec["midline_bps"]) if spec else -1.7
         out["session"] = session_snapshot(self._clock(), task_mid)
+        out["revert_watch"] = self._revert_watch
+        out["sizing_note"] = self._sizing_note
+        out["auto_confirm"] = bool(spec and spec.get("auto_confirm"))
+        out["round_trip_fee_bps"] = round_trip_fee_bps(risk.get("actual_fee_bps"))
         out["gaps"] = [
             "启动探针实盘仍只拉起 --record-only 记录进程。下单只发生在已承认的确认单上，并走 Engine.execute_confirmed。",
+            "对称持仓（Entropy 空 / Lighter 多，或相反）时，溢价回到任务带宽内（含边界）并持续 persist_sec（3 秒）才提出只减仓平仓。不是碰到中枢才平。",
+            "自动确认默认关闭。打开后，开仓和平仓都要过往返门槛（Entropy 开+平约 1.8 bps，不是单边 0.9），且非 RTH 不会自动走强制确认。",
+            "保证金缩放只在两边都读到可用保证金和杠杆时启用，并受单笔硬顶约束。缺失则拒绝，不拿现金名义冒充。",
             "非美股 RTH 不禁用确认，但必须先看强制确认卡，再点「强制确认」才会发单。",
             "默认仍建议仅美国 RTH 启动。中枢不会按时段自动切换。",
             "对账只记一条请求，不会做链上持仓同步。",
             "RTH 为美东周一至周五 09:30–16:00，不含交易所假日。",
-            "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓。",
+            "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓，也拒绝平仓确认。",
         ]
         return scrub(out)
 

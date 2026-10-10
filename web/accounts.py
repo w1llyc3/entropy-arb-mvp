@@ -4,6 +4,12 @@ The panel parses ``.env`` only to decide whether a public account query is
 possible. Private keys are never returned, logged, or sent to the browser.
 Position and margin mode are filled when the public payload names SNDK;
 otherwise those cells stay null and the UI shows a gap.
+
+Entropy ``available`` is spot USDC (total − hold) when that balance is in
+the response. An isolated ``io`` position can report ``withdrawable`` 0
+while spot USDC is still free cash; sizing and gates use the spot number.
+``withdrawable`` is kept beside it. Leverage and margin-used are copied
+only when the payload names them — they are never filled in.
 """
 from __future__ import annotations
 
@@ -109,7 +115,10 @@ def _apply_hl(out: dict, payload: dict) -> None:
     if margin.get("accountValue") is not None:
         out["entropy"]["equity"] = float(margin["accountValue"])
     if payload.get("withdrawable") is not None:
-        out["entropy"]["available"] = float(payload["withdrawable"])
+        withdrawable = float(payload["withdrawable"])
+        out["entropy"]["withdrawable"] = withdrawable
+        # Spot USDC, applied later, replaces this when the spot read lands.
+        out["entropy"]["available"] = withdrawable
     for item in payload.get("assetPositions") or []:
         pos = (item or {}).get("position") or {}
         coin = str(pos.get("coin") or "")
@@ -119,7 +128,27 @@ def _apply_hl(out: dict, payload: dict) -> None:
         lev = pos.get("leverage") or {}
         if isinstance(lev, dict) and lev.get("type"):
             out["entropy"]["isolated"] = str(lev["type"]).lower() == "isolated"
+        if isinstance(lev, dict) and lev.get("value") is not None:
+            out["entropy"]["leverage"] = float(lev["value"])
+        if pos.get("marginUsed") is not None:
+            out["entropy"]["margin_used"] = float(pos["marginUsed"])
         break
+
+
+def _apply_hl_spot(out: dict, payload: dict) -> None:
+    """Free USDC on the unified spot balance. Does nothing if USDC is absent."""
+    for bal in payload.get("balances") or []:
+        if not isinstance(bal, dict):
+            continue
+        if str(bal.get("coin") or "").upper() != "USDC":
+            continue
+        if bal.get("total") is None:
+            return
+        total = float(bal["total"])
+        hold = float(bal.get("hold") or 0.0)
+        out["entropy"]["spot_available"] = total - hold
+        out["entropy"]["available"] = total - hold
+        return
 
 
 def _apply_lighter(out: dict, payload: dict) -> None:
@@ -144,6 +173,12 @@ def _apply_lighter(out: dict, payload: dict) -> None:
             out["lighter"]["isolated"] = mode
         elif isinstance(mode, str) and mode:
             out["lighter"]["isolated"] = mode.lower() == "isolated"
+        if pos.get("leverage") is not None:
+            out["lighter"]["leverage"] = float(pos["leverage"])
+        for key in ("allocated_margin", "margin"):
+            if pos.get(key) is not None:
+                out["lighter"]["margin_used"] = float(pos[key])
+                break
         break
 
 
@@ -166,6 +201,16 @@ def read_accounts(root: Path, opener=None, timeout: float = 2.5) -> dict:
                 timeout)
             if isinstance(payload, dict):
                 _apply_hl(out, payload)
+        except (OSError, urllib.error.URLError, ValueError, TypeError, KeyError):
+            errors = True
+        try:
+            spot = _opener_json(
+                fetch, HL_INFO,
+                {"type": "spotClearinghouseState",
+                 "user": vals["HL_ACCOUNT_ADDRESS"]},
+                timeout)
+            if isinstance(spot, dict):
+                _apply_hl_spot(out, spot)
         except (OSError, urllib.error.URLError, ValueError, TypeError, KeyError):
             errors = True
     if flags["lighter"] and vals.get("LIGHTER_ACCOUNT_INDEX"):

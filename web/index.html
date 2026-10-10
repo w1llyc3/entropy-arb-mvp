@@ -256,7 +256,7 @@
     .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
     .grid.two { grid-template-columns: 1fr 1fr; }
     label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-    input[type="text"], input[type="number"] {
+    input[type="text"], input[type="number"], select {
       width: 100%;
       background: #0b1117;
       border: 1px solid var(--line);
@@ -427,6 +427,8 @@
         </article>
       </div>
       <p class="hint" id="acct-note">密钥只留在服务器。页面不接收私钥。</p>
+      <p class="hint" id="sizing-line">缩放默认是现金硬顶。保证金模式：可用 × 杠杆 × 安全系数，再被硬顶截断。10× 逐仓约 $11 名义锁约 $1.11 保证金。Entropy 可用是现货 USDC；逐仓时 dex withdrawable 可以是 0。</p>
+      <p class="hint" id="revert-line" hidden></p>
     </div>
 
     <div class="panel">
@@ -459,7 +461,7 @@
       </div>
       <p class="hint" id="contrast-line">Contrast (not Gate ids): SELL entropy net p50 — · BUY entropy net p50 —</p>
       <pre id="analyze-out" hidden></pre>
-      <p class="hint">确认入队不会向交易所发单。对账只记请求。RTH 为美东周一至周五 09:30–16:00，不含假日。CLI 实盘仍是 <span class="mono">python main.py --symbol SNDK --hedge lighter</span>。</p>
+      <p class="hint">确认入队不会向交易所发单。自动确认默认关闭；打开后门槛是往返约 1.8 bps，不是单边 0.9，且非 RTH 不会自动强制发单。对账只记请求。RTH 为美东周一至周五 09:30–16:00，不含假日。CLI 实盘仍是 <span class="mono">python main.py --symbol SNDK --hedge lighter</span>。</p>
     </div>
   </section>
 </main>
@@ -524,7 +526,7 @@
       </div>
       <div class="grid two">
         <div>
-          <label for="f-ord">单笔名义 (USD)</label>
+          <label for="f-ord">单笔硬顶 (USD)</label>
           <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" max="10" required>
         </div>
         <div>
@@ -538,8 +540,38 @@
       </div>
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
+        <label><input id="f-auto" type="checkbox"> 自动确认（默认关）</label>
         <label><input id="f-rth" type="checkbox" checked> 仅美国 RTH 才允许启动探针实盘（America/New_York 09:30–16:00，周一至周五）</label>
       </div>
+      <p class="hint">自动确认按往返费率：Entropy 开仓 + 平仓约 1.8 bps，不是单边 0.9。非 RTH 不会自动走强制确认。名义不超过自动上限（默认等于单笔硬顶）。日名义 / 日次数留空表示不设上限。</p>
+      <div class="grid">
+        <div>
+          <label for="f-auto-max">自动确认名义上限 (USD)</label>
+          <input id="f-auto-max" type="number" step="1" min="1" max="10" placeholder="默认同单笔硬顶">
+        </div>
+        <div>
+          <label for="f-day-ntl">日名义上限 (USD，可选)</label>
+          <input id="f-day-ntl" type="number" step="1" min="0" placeholder="不设">
+        </div>
+        <div>
+          <label for="f-day-n">日次数上限（可选）</label>
+          <input id="f-day-n" type="number" step="1" min="0" placeholder="不设">
+        </div>
+      </div>
+      <div class="grid two">
+        <div>
+          <label for="f-size">缩放</label>
+          <select id="f-size">
+            <option value="cash" selected>现金名义（硬顶）</option>
+            <option value="margin">保证金 × 杠杆</option>
+          </select>
+        </div>
+        <div>
+          <label for="f-safety">保证金安全系数</label>
+          <input id="f-safety" type="number" step="0.05" min="0.05" max="1" value="0.8">
+        </div>
+      </div>
+      <p class="hint">保证金模式用可用保证金 × 杠杆 × 安全系数，再被单笔硬顶截断。10× 逐仓时，约 $11 名义锁约 $1.11 保证金。杠杆或保证金读不到就拒绝，不会改用现金名义。Entropy 可用取现货 USDC。</p>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
     <div class="foot">
@@ -553,13 +585,13 @@
   <div class="modal" role="dialog" aria-labelledby="confirm-title">
     <header>
       <div>
-        <div class="eyebrow">CONFIRM</div>
-        <h2 id="confirm-title">确认探针订单</h2>
+        <div class="eyebrow" id="confirm-eyebrow">OPEN</div>
+        <h2 id="confirm-title">确认开仓</h2>
       </div>
       <button class="x" type="button" id="confirm-x" aria-label="关闭">×</button>
     </header>
-    <p class="hint">净边际已扣除 0.9 bps。Tier2 Self 应计单独一行，未到账，不加进净边际。</p>
-    <div class="k" style="color:var(--faint);margin-top:12px">扣费后净边际</div>
+    <p class="hint" id="c-lead">净边际已扣除单边 0.9 bps。自动确认另计往返约 1.8 bps（开+平），不是单边 0.9。Tier2 Self 应计单独一行，未到账，不加进净边际。</p>
+    <div class="k" style="color:var(--faint);margin-top:12px" id="c-net-label">扣费后净边际</div>
     <div class="netline" id="c-net">—</div>
     <div class="accrual">
       <div>Tier2 Self 应计 <span class="mono" id="c-accrual">≈ 0.54 bps</span></div>
@@ -582,8 +614,9 @@
       <div id="c-force-task"></div>
       <div id="c-force-line">带宽 1 bps，错中枢风险大于费率缺口</div>
     </div>
+    <div class="warn-line" id="c-auto" hidden></div>
     <p class="hint" id="c-block" hidden></p>
-    <p class="hint">确认会通过实盘引擎同时发送两腿。非 RTH 必须再点一次「强制确认」。取消则不下单。中枢不会随时段自动改变。</p>
+    <p class="hint" id="c-foot">确认会通过实盘引擎同时发送两腿。平仓为两边只减仓。非 RTH 必须再点一次「强制确认」，自动确认不会代点。取消则不下单。中枢不会随时段自动改变。平仓规则：溢价回到带宽内（含边界）并持续 3 秒，不是碰到中枢才平。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
@@ -611,10 +644,24 @@ function usd(v) {
   if (v == null || Number.isNaN(Number(v))) return "—";
   return "$" + Number(v).toFixed(2);
 }
-function iso(v) {
-  if (v === true) return "逐仓";
-  if (v === false) return "全仓";
-  return "未知";
+function iso(v, lev) {
+  let text = "未知";
+  if (v === true) text = "逐仓";
+  else if (v === false) text = "全仓";
+  if (lev != null && Number.isFinite(Number(lev))) text += " " + Number(lev) + "x";
+  return text;
+}
+function ntl(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  const digits = Math.abs(n - Math.round(n)) < 0.005 ? 0 : 2;
+  return "$" + n.toFixed(digits);
+}
+function optNum(id) {
+  const raw = $(id).value;
+  if (raw === "" || raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
 }
 
 function setStatus(el, label) {
@@ -650,6 +697,12 @@ function openCreate(task) {
   $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 10;
   formMode = t.mode || "record";
   $("f-confirm").checked = t.manual_confirm !== false;
+  $("f-auto").checked = t.auto_confirm === true;
+  $("f-auto-max").value = t.auto_confirm_max_usd != null ? t.auto_confirm_max_usd : "";
+  $("f-day-ntl").value = t.auto_daily_max_notional_usd != null ? t.auto_daily_max_notional_usd : "";
+  $("f-day-n").value = t.auto_daily_max_count != null ? t.auto_daily_max_count : "";
+  $("f-size").value = t.sizing_mode === "margin" ? "margin" : "cash";
+  $("f-safety").value = t.margin_safety != null ? t.margin_safety : 0.8;
   $("f-rth").checked = t.rth_only !== false;
   applyModeButtons();
   deviationWarning();
@@ -665,8 +718,8 @@ function renderLegs(legs) {
     const tr = document.createElement("tr");
     for (const text of [
       leg.venue + (leg.dex ? " (" + leg.dex + ")" : ""),
-      leg.direction,
-      "$" + Number(leg.notional_usd).toFixed(0),
+      leg.direction + (leg.base_qty != null ? " " + Number(leg.base_qty).toFixed(4) : ""),
+      ntl(leg.notional_usd),
       usd(leg.available),
       iso(leg.isolated),
     ]) {
@@ -686,6 +739,13 @@ function showConfirm(payload) {
     return;
   }
   lastPayload = payload;
+  const closing = payload.intent === "close" || payload.reduce_only;
+  $("confirm-eyebrow").textContent = closing ? "CLOSE" : "OPEN";
+  $("confirm-title").textContent = closing ? "确认平仓（只减仓）" : "确认开仓";
+  $("c-net-label").textContent = closing ? "溢价 − 中枢" : "扣费后净边际";
+  $("c-lead").textContent = closing
+    ? "平仓两边只减仓。溢价已回到任务带宽内（含边界）并持续约 3 秒。自动确认若打开，仍按开仓时的往返边际（约 1.8 bps）而不是单边 0.9。"
+    : "净边际已扣除单边 0.9 bps。自动确认另计往返约 1.8 bps（开+平），不是单边 0.9。Tier2 Self 应计单独一行，未到账，不加进净边际。";
   $("c-net").textContent = num(payload.net_edge_bps, 2) + " bps";
   $("c-net").className = "netline " + (Number(payload.net_edge_bps) >= 0 ? "pos" : "neg");
   $("c-accrual").textContent = "≈ " + Number(payload.accrual_bps).toFixed(2) + " bps";
@@ -708,8 +768,14 @@ function showConfirm(payload) {
       " bps · " + (card.deviation_text || "");
     $("c-force-line").textContent = card.risk_line || "带宽 1 bps，错中枢风险大于费率缺口";
   }
+  const autoNote = payload.auto_blocked
+    || (payload.auto_confirm
+      ? ("自动确认开。往返门槛 " + num(payload.round_trip_fee_bps, 1) + " bps。")
+      : "自动确认关。若打开，门槛是往返约 1.8 bps，不是单边 0.9。");
+  $("c-auto").hidden = !autoNote;
+  $("c-auto").textContent = autoNote || "";
   const enabled = !!payload.confirm_enabled;
-  $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : "确认";
+  $("c-ok").textContent = (force && payload.force_ack) ? "强制确认" : (closing ? "确认平仓" : "确认开仓");
   $("c-ok").disabled = !enabled;
   $("c-block").hidden = !payload.block_reason;
   $("c-block").textContent = payload.block_reason || "";
@@ -798,11 +864,11 @@ function render(s) {
   $("eq-e").textContent = usd(ent.equity);
   $("av-e").textContent = usd(ent.available);
   $("pos-e").textContent = dash(ent.position);
-  $("iso-e").textContent = iso(ent.isolated);
+  $("iso-e").textContent = iso(ent.isolated, ent.leverage);
   $("eq-l").textContent = usd(lig.equity);
   $("av-l").textContent = usd(lig.available);
   $("pos-l").textContent = dash(lig.position);
-  $("iso-l").textContent = iso(lig.isolated);
+  $("iso-l").textContent = iso(lig.isolated, lig.leverage);
   const creds = acct.creds || {};
   $("acct-note").textContent = acct.note
     || ((creds.entropy || creds.lighter) ? "已检测到密钥，数值来自只读查询。" : "密钥只留在服务器。页面不接收私钥。");
@@ -823,6 +889,20 @@ function render(s) {
     ? ("最近确认 " + dash(last.confirm_id) + " · "
       + (last.sent ? "已发送" : "未发送") + " · " + dash(last.status || last.error))
     : "尚无确认订单";
+  const watch = s.revert_watch;
+  const revert = $("revert-line");
+  if (watch && watch.inside) {
+    revert.hidden = false;
+    revert.textContent = watch.ready
+      ? "溢价在带宽内已满 " + Number(watch.persist_sec).toFixed(0) + " 秒，平仓确认可发。"
+      : ("平仓观察：溢价在带宽内 " + Number(watch.elapsed_sec).toFixed(1)
+        + "s / " + Number(watch.persist_sec).toFixed(0) + "s（含边界，不是碰中枢）");
+  } else {
+    revert.hidden = true;
+  }
+  if (s.sizing_note) {
+    $("sizing-line").textContent = s.sizing_note;
+  }
   $("btn-start").disabled = !!s.running && !s.paused;
   $("btn-pause").disabled = !s.running || !!s.paused;
   $("btn-stop").disabled = !s.running && !s.pid;
@@ -880,6 +960,12 @@ $("create-form").addEventListener("submit", async (ev) => {
       max_position_usd: Number($("f-cap").value),
       mode: formMode,
       manual_confirm: $("f-confirm").checked,
+      auto_confirm: $("f-auto").checked,
+      auto_confirm_max_usd: optNum("f-auto-max"),
+      auto_daily_max_notional_usd: optNum("f-day-ntl"),
+      auto_daily_max_count: optNum("f-day-n"),
+      sizing_mode: $("f-size").value,
+      margin_safety: Number($("f-safety").value),
       rth_only: $("f-rth").checked,
     });
     $("create-modal").hidden = true;

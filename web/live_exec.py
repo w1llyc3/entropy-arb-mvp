@@ -28,8 +28,16 @@ def execute_admitted(req: dict) -> dict:
         raise RuntimeError("refusing order without an admitted confirm id")
     order = float(req.get("order_notional_usd") or 0.0)
     position = float(req.get("max_position_usd") or 0.0)
+    reduce_only = bool(req.get("reduce_only"))
     if order - 10.0 > 1e-9 or position - 10.0 > 1e-9:
         raise RuntimeError("probe caps are $10")
+    if reduce_only:
+        try:
+            close_qty = float(req.get("close_qty"))
+        except (TypeError, ValueError):
+            raise RuntimeError("close requires a position qty")
+        if close_qty <= 0:
+            raise RuntimeError("close requires a position qty")
     return asyncio.run(_route(req, confirm_id))
 
 
@@ -70,6 +78,9 @@ async def _route(req: dict, confirm_id: str) -> dict:
             direction=str(req.get("direction") or ""),
             confirm_id=confirm_id,
             cap_notional=min(10.0, float(req.get("order_notional_usd") or 10.0)),
+            reduce_only=bool(req.get("reduce_only")),
+            close_qty=(float(req["close_qty"])
+                       if req.get("reduce_only") else None),
         )
         if result.get("sent") and result.get("entropy_fee_bps") is None:
             fee = await _entropy_fee(eng, result)
