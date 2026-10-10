@@ -41,6 +41,32 @@ def record_only_argv(symbol: str, hedge: str,
     ]
 
 
+# Windows process-creation flags. Named here so a POSIX test can check the
+# combination without the subprocess constants, which exist only on Windows.
+_WIN_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_WIN_CREATE_NO_WINDOW = 0x08000000
+_WIN_DETACHED_PROCESS = 0x00000008
+
+
+def detach_popen_kwargs() -> dict:
+    """Spawn flags that keep the recorder off uvicorn's console group.
+
+    On Windows the child is started with CREATE_NEW_PROCESS_GROUP |
+    CREATE_NO_WINDOW | DETACHED_PROCESS. A console-control event delivered
+    to the panel then does not kill the recorder, and the recorder does not
+    stay attached to the panel's console. POSIX keeps ``start_new_session``.
+    """
+    if sys.platform == "win32":
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP",
+                    _WIN_CREATE_NEW_PROCESS_GROUP)
+            | getattr(subprocess, "CREATE_NO_WINDOW", _WIN_CREATE_NO_WINDOW)
+            | getattr(subprocess, "DETACHED_PROCESS", _WIN_DETACHED_PROCESS)
+        )
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
 class RecorderError(Exception):
     def __init__(self, message: str, status_code: int = 400) -> None:
         super().__init__(message)
@@ -305,7 +331,7 @@ class RecorderControl:
                     stdin=subprocess.DEVNULL,
                     stdout=logf,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True,
+                    **detach_popen_kwargs(),
                 )
             meta = {
                 "pid": proc.pid,

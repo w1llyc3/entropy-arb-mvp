@@ -474,6 +474,17 @@ def test_panel_lock_flocks_on_posix(tmp_path, monkeypatch):
     assert "fcntl.flock" in source
 
 
+def test_windows_recorder_spawn_uses_detach_flags(monkeypatch):
+    import web.recorder_ctl as rc
+    monkeypatch.setattr(rc.sys, "platform", "win32")
+    flags = rc.detach_popen_kwargs()["creationflags"]
+    assert flags & 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    assert flags & 0x08000000  # CREATE_NO_WINDOW
+    assert flags & 0x00000008  # DETACHED_PROCESS
+    monkeypatch.setattr(rc.sys, "platform", "linux")
+    assert rc.detach_popen_kwargs() == {"start_new_session": True}
+
+
 def test_main_binds_loopback_only(monkeypatch):
     pytest.importorskip("fastapi")
     pytest.importorskip("uvicorn")

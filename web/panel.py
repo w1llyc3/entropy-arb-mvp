@@ -65,6 +65,12 @@ class TaskIn(BaseModel):
     max_position_usd: float = 10.0
     mode: str = "record"
     manual_confirm: bool = True
+    auto_confirm: bool = False
+    auto_confirm_max_usd: Optional[float] = None
+    auto_daily_max_notional_usd: Optional[float] = None
+    auto_daily_max_count: Optional[float] = None
+    sizing_mode: str = "cash"
+    margin_safety: float = 0.80
     rth_only: bool = True
 
 

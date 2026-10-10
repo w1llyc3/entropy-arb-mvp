@@ -134,6 +134,10 @@ def read_minutes(path: Path) -> dict:
                         "sell_bps": _blank(raw.get("fill_sell_edge_100_bps")),
                         "buy_bps": _blank(raw.get("fill_buy_edge_100_bps")),
                     },
+                    "funding": {
+                        "entropy": _float(raw.get("entropy_funding")),
+                        "hedge": _float(raw.get("hedge_funding")),
+                    },
                 })
     except OSError as exc:
         empty["csv_exists"] = True
@@ -223,6 +227,7 @@ def assemble_status(root: Path, proc: dict, now: Optional[float] = None) -> dict
             "samples": latest["samples"],
             "tob": latest["tob"],
             "fillable_100": latest["fillable_100"],
+            "funding": latest.get("funding") or {},
         }
     return {
         "running": bool(proc.get("running")),

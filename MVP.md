@@ -264,4 +264,20 @@ does not auto-fire.
   Lighter index. Private keys are not returned. Position / isolated stay
   empty when the payload does not name SNDK.
 - **One task.** The form cannot target another symbol or venue. Unattended
-  live (manual confirm off) is refused.
+  live (manual confirm off) is refused. Auto-confirm is a separate switch
+  and **defaults off**.
+- **Close-on-revert.** A symmetric book proposes a reduce-only close only
+  after premium is inside the task band (edges included) for 3 seconds.
+  The rule is not a midline touch. The card says 平仓. One-leg failure
+  still HALTs.
+- **Round-trip gate.** Auto open and auto close both require expected edge
+  after fees to cover Entropy open+close (default **1.8 bps**, or twice a
+  measured fee). Do not use the one-way 0.9. Outside RTH, auto-confirm
+  does not click **强制确认**.
+- **Margin sizing.** Optional. Free margin × leverage × safety (0.80),
+  clipped by the $10 hard max. Missing margin or leverage refuses. Entropy
+  available is spot USDC. 10× isolated: about $11 notional locks about
+  $1.11 margin.
+- **Windows recorder.** The panel spawns the recorder with
+  `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS` so
+  starting it does not share uvicorn's console group.
