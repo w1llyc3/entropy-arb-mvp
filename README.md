@@ -139,6 +139,18 @@ back **inside** the band, edges included —
 for a midline touch. One leg failing still **HALT**s. The card is labeled
 close, not open.
 
+**Manual flatten (手动清仓).** The danger button shows when either venue
+has a non-flat SNDK position, including when weekend premium sits outside
+the band and close-on-revert never fires. The click opens a confirm
+modal; nothing is sent until that confirm. The order is reduce-only
+through `Engine.execute_confirmed` for the overlapping size (or each
+side's absolute position toward flat when the book is not one pair). One
+leg failing **HALT**s. A flatten that comes back flat clears that halt.
+Flatten is allowed **anytime** — outside RTH, while paused, and while
+halted — and does **not** use the open-order second click **强制确认**.
+Auto-confirm never fires it. Fills written to `probe.log` and `trades.csv`
+are the venue results, not invented quantities.
+
 **Auto-confirm stays off** until the form enables it. Before an auto open
 or an auto close, the expected edge must cover the **round trip** (Entropy
 open + close ≈ **1.8 bps**, or twice a measured Entropy fee; Lighter

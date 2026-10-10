@@ -270,6 +270,14 @@ does not auto-fire.
   after premium is inside the task band (edges included) for 3 seconds.
   The rule is not a midline touch. The card says 平仓. One-leg failure
   still HALTs.
+- **手动清仓.** A danger button, visible when either venue's SNDK position
+  is not flat. Confirm modal, then reduce-only on both legs for the
+  overlapping size, or each side's absolute size toward flat. Allowed
+  anytime (outside RTH, paused, halted) without the open-order
+  **强制确认** second click. A human confirm is still required.
+  Auto-confirm does not fire it. One-leg failure HALTs; a flat success
+  clears the risk halt. Fills in `.web/probe.log` and `logs/trades.csv`
+  are venue results.
 - **Round-trip gate.** Auto open and auto close both require expected edge
   after fees to cover Entropy open+close (default **1.8 bps**, or twice a
   measured fee). Do not use the one-way 0.9. Outside RTH, auto-confirm

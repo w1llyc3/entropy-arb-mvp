@@ -305,12 +305,16 @@ def test_panel_pages_and_routes(tmp_path):
         "/", "/api/status", "/api/start", "/api/stop", "/api/analyze",
         "/api/probe", "/api/task", "/api/task/clear", "/api/session/start",
         "/api/pause", "/api/reconcile", "/api/confirm", "/api/confirm/cancel",
+        "/api/flatten",
     }
     with TestClient(app) as client:
         page = client.get("/")
         assert page.status_code == 200
         html = page.text
         assert "创建套利任务" in html
+        assert "手动清仓" in html
+        assert 'id="btn-flatten"' in html
+        assert 'id="flatten-modal"' in html
         assert "NEW STRATEGY" in html
         assert "只记录" in html
         assert "探针实盘" in html

@@ -369,6 +369,7 @@
           <button class="amber" id="btn-pause" type="button">暂停</button>
           <button class="ghost" id="btn-recon" type="button">对账</button>
           <button class="danger" id="btn-stop" type="button">停止</button>
+          <button class="danger" id="btn-flatten" type="button" hidden>手动清仓</button>
           <button class="ghost" id="btn-card" type="button" disabled>确认单</button>
         </div>
       </div>
@@ -427,6 +428,7 @@
         </article>
       </div>
       <p class="hint" id="acct-note">密钥只留在服务器。页面不接收私钥。</p>
+      <p class="hint" id="flatten-note" hidden></p>
       <p class="hint" id="sizing-line">缩放默认是现金硬顶。保证金模式：可用 × 杠杆 × 安全系数，再被硬顶截断。10× 逐仓约 $11 名义锁约 $1.11 保证金。Entropy 可用是现货 USDC；逐仓时 dex withdrawable 可以是 0。</p>
       <p class="hint" id="revert-line" hidden></p>
     </div>
@@ -624,10 +626,40 @@
   </div>
 </div>
 
+<div class="modal-back" id="flatten-modal" hidden>
+  <div class="modal" role="dialog" aria-labelledby="flatten-title">
+    <header>
+      <div>
+        <div class="eyebrow">FLATTEN</div>
+        <h2 id="flatten-title">确认手动清仓</h2>
+      </div>
+      <button class="x" type="button" id="flatten-x" aria-label="关闭">×</button>
+    </header>
+    <p class="hint" id="flatten-lead">两边只减仓，按当前 SNDK 持仓打回平。周末溢价停在带宽外时，回归平仓不会出现；这里不看带宽。非 RTH 也直接发，不需要再点「强制确认」。成交数量只采用交易所返回值。</p>
+    <div class="kv" style="margin-top:12px">
+      <div><span>Entropy 持仓</span><b id="flatten-pos-e">—</b></div>
+      <div><span>Lighter 持仓</span><b id="flatten-pos-l">—</b></div>
+    </div>
+    <table class="legs">
+      <thead>
+        <tr><th>腿</th><th>方向</th><th>数量</th><th>参考名义</th></tr>
+      </thead>
+      <tbody id="flatten-legs"></tbody>
+    </table>
+    <p class="hint" id="flatten-partial" hidden>另一边持仓没有读到，不会替它编一个数量。</p>
+    <p class="hint" id="flatten-foot">确认后走实盘引擎，reduce-only。单腿失败会 HALT。两边都平掉才会解除已有的 HALT。取消则不下单。</p>
+    <div class="foot">
+      <button class="ghost" type="button" id="flatten-cancel">取消</button>
+      <button class="danger" type="button" id="flatten-ok">确认清仓</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let lastProposalId = null;
 let lastPayload = null;
+let lastFlatten = null;
 let formMode = "record";
 let seenConfirm = false;
 
@@ -652,6 +684,7 @@ function iso(v, lev) {
   return text;
 }
 function ntl(v) {
+  if (v == null || v === "") return "—";
   const n = Number(v);
   if (!Number.isFinite(n)) return "—";
   const digits = Math.abs(n - Math.round(n)) < 0.005 ? 0 : 2;
@@ -908,6 +941,41 @@ function render(s) {
   $("btn-stop").disabled = !s.running && !s.pid;
   showConfirm(s.proposal || null);
   $("btn-card").disabled = !s.proposal;
+  applyFlatten(s.flatten || null);
+}
+
+function applyFlatten(offer) {
+  const open = !!(offer && offer.available);
+  $("btn-flatten").hidden = !open;
+  $("btn-flatten").disabled = !!(offer && offer.busy);
+  const note = $("flatten-note");
+  if (open) {
+    note.hidden = false;
+    note.textContent = offer.note || "有持仓。手动清仓不看回归带宽，非 RTH 也可发，仍要确认。";
+  } else {
+    note.hidden = true;
+    note.textContent = "";
+  }
+  if ($("flatten-modal").hidden) lastFlatten = open ? offer : null;
+}
+
+function renderFlatten(offer) {
+  $("flatten-pos-e").textContent = dash(offer.entropy_position);
+  $("flatten-pos-l").textContent = dash(offer.lighter_position);
+  $("flatten-partial").hidden = !offer.partial;
+  const body = $("flatten-legs");
+  body.replaceChildren();
+  for (const leg of offer.legs || []) {
+    const tr = document.createElement("tr");
+    const qty = leg.base_qty == null ? "—" : Number(leg.base_qty).toFixed(6);
+    const side = (leg.direction || "") + " · 只减仓";
+    for (const text of [leg.venue || "—", side, qty, ntl(leg.notional_usd)]) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
 }
 
 async function refresh() {
@@ -1005,6 +1073,35 @@ $("btn-stop").addEventListener("click", async () => {
 });
 $("btn-card").addEventListener("click", () => {
   if (lastPayload) $("confirm-modal").hidden = false;
+});
+$("btn-flatten").addEventListener("click", () => {
+  if (!lastFlatten || !lastFlatten.available) return;
+  renderFlatten(lastFlatten);
+  $("flatten-ok").disabled = false;
+  $("flatten-modal").hidden = false;
+});
+$("flatten-x").addEventListener("click", () => { $("flatten-modal").hidden = true; });
+$("flatten-cancel").addEventListener("click", () => { $("flatten-modal").hidden = true; });
+$("flatten-ok").addEventListener("click", async () => {
+  if (!lastFlatten || $("flatten-ok").disabled) return;
+  const proposalId = lastFlatten.proposal_id;
+  $("flatten-ok").disabled = true;
+  try {
+    const result = await post("/api/flatten", {
+      confirm: true,
+      proposal_id: proposalId,
+    });
+    const note = result.sent
+      ? (result.halted ? "单腿未平，已 HALT" : "清仓已提交")
+      : (result.gap || "未发送");
+    alert(note);
+    $("flatten-modal").hidden = true;
+    lastFlatten = null;
+  } catch (err) {
+    alert(err.message);
+    $("flatten-ok").disabled = false;
+  }
+  await refresh();
 });
 $("btn-recon").addEventListener("click", async () => {
   try {
