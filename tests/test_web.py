@@ -305,6 +305,7 @@ def test_panel_pages_and_routes(tmp_path):
         "/", "/api/status", "/api/start", "/api/stop", "/api/analyze",
         "/api/probe", "/api/task", "/api/task/clear", "/api/session/start",
         "/api/pause", "/api/reconcile", "/api/confirm", "/api/confirm/cancel",
+        "/api/basis",
     }
     with TestClient(app) as client:
         page = client.get("/")
