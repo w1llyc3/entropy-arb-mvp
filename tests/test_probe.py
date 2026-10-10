@@ -19,8 +19,8 @@ from web.live_exec import execute_admitted  # noqa: E402
 from web.probe import (  # noqa: E402
     ACCRUAL_BPS, ACCRUAL_LABEL, CONFIRM_FIELDS, DECISION_WARNING,
     FORCE_RISK_LINE, build_confirm_payload, confirm_field_errors,
-    decision_warnings, evaluate_auto_gates, in_us_rth, leg_plan,
-    normalize_task, premium_inside_band, round_trip_fee_bps,
+    decision_warnings, evaluate_auto_gates, flatten_plan, in_us_rth,
+    leg_plan, normalize_task, premium_inside_band, round_trip_fee_bps,
     session_snapshot, size_order_notional, symmetric_position,
 )
 from web.recorder_ctl import RecorderControl  # noqa: E402
@@ -37,6 +37,7 @@ def _ts(moment: datetime) -> float:
 
 INSIDE = _ts(datetime(2026, 1, 7, 10, 0, tzinfo=NY))   # Wednesday 10:00 EST
 OUTSIDE = _ts(datetime(2026, 1, 7, 16, 0, tzinfo=NY))  # Wednesday 16:00 EST
+WEEKEND = _ts(datetime(2026, 1, 10, 12, 0, tzinfo=NY))  # Saturday noon EST
 NO_ENV = os.path.join(os.path.dirname(__file__), "no-such.env")
 
 
@@ -1038,3 +1039,238 @@ def test_entropy_available_uses_spot_usdc_not_zero_withdrawable(tmp_path):
     assert snap["entropy"]["margin_used"] == pytest.approx(1.11)
     assert snap["entropy"]["position"] == pytest.approx(-0.01)
     assert snap["entropy"]["isolated"] is True
+
+
+def _positions(entropy, lighter):
+    return {
+        "creds": {"entropy": True, "lighter": True},
+        "entropy": {"equity": 30.0, "available": 25.0, "position": entropy,
+                    "isolated": True, "leverage": 10},
+        "lighter": {"equity": 40.0, "available": 40.0, "position": lighter,
+                    "isolated": True, "leverage": 10},
+        "note": None,
+    }
+
+
+def test_flatten_plan_names_the_overlap_and_refuses_when_flat():
+    held = flatten_plan(-0.007, 0.007)
+    assert held["kind"] == "pair"
+    assert held["reduce_only"] is True
+    assert held["direction"] == "buy_entropy"
+    assert held["qty"] == pytest.approx(0.007)
+    assert [leg["direction"] for leg in held["legs"]] == ["BUY", "SELL"]
+    assert held["legs"][0]["close_qty"] == pytest.approx(0.007)
+    reverse = flatten_plan(0.007, -0.007)
+    assert reverse["direction"] == "sell_entropy"
+    assert reverse["legs"][0]["direction"] == "SELL"
+    assert reverse["legs"][1]["direction"] == "BUY"
+    # Not a pair: each side's absolute size toward flat, not an invented overlap.
+    uneven = flatten_plan(-0.02, 0.05)
+    assert uneven["kind"] == "legs"
+    assert uneven["direction"] is None
+    assert [leg["close_qty"] for leg in uneven["legs"]] == pytest.approx([0.02, 0.05])
+    one_sided = flatten_plan(-0.007, 0.0)
+    assert one_sided["kind"] == "legs"
+    assert len(one_sided["legs"]) == 1
+    assert one_sided["legs"][0]["venue"] == "entropy"
+    assert one_sided["legs"][0]["is_buy"] is True
+    assert one_sided["legs"][0]["close_qty"] == pytest.approx(0.007)
+    assert flatten_plan(0.0, 0.0) is None
+    assert flatten_plan(None, None) is None
+    assert flatten_plan(0.0004, -0.0004) is None
+    unread = flatten_plan(None, 0.007)
+    assert unread["partial"] is True
+    assert [leg["venue"] for leg in unread["legs"]] == ["lighter"]
+    assert unread["legs"][0]["close_qty"] == pytest.approx(0.007)
+
+
+def test_flatten_proposes_reduce_only_outside_the_band(tmp_path):
+    """Weekend premium +5 bps vs midline -1.7 never arms close-on-revert."""
+    calls = []
+
+    def _exec(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.007, sell=0.007)
+
+    sess = ProbeSession(
+        tmp_path, RecorderControl(tmp_path), now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.007),
+        executor=_exec)
+    _write_env(tmp_path)
+    _live(sess)
+    risk = sess.risk()
+    risk["halted"] = True
+    risk["halt_reason"] = "single-leg fill"
+    risk["net_base"] = 0.007
+    sess._save_risk(risk)
+    latest = _minute(WEEKEND, premium=5.0, sell=8.0, buy=-4.0)
+    assert sess.pending_payload(latest) is None
+    assert sess._revert_watch is None
+    assert calls == []
+    offer = sess.flatten_offer(latest)
+    assert offer["available"] is True
+    assert offer["kind"] == "pair"
+    assert offer["reduce_only"] is True
+    assert offer["anytime"] is True
+    assert offer["rth_required"] is False
+    assert offer["direction"] == "buy_entropy"
+    assert offer["qty"] == pytest.approx(0.007)
+    assert offer["entropy_position"] == pytest.approx(-0.007)
+    assert offer["lighter_position"] == pytest.approx(0.007)
+    with pytest.raises(ProbeError, match="explicit confirm"):
+        sess.admit_flatten({"proposal_id": offer["proposal_id"]})
+    assert calls == []
+    admitted = sess.admit_flatten({
+        "confirm": True, "proposal_id": offer["proposal_id"],
+    })
+    assert admitted["sent"] is True
+    assert admitted["reduce_only"] is True
+    assert admitted["intent"] == "flatten"
+    assert admitted["anytime"] is True
+    assert admitted["force_confirm_outside_rth"] is False
+    assert admitted["halted"] is False
+    assert len(calls) == 1
+    assert calls[0]["reduce_only"] is True
+    assert calls[0]["intent"] == "flatten"
+    assert calls[0]["flatten_kind"] == "pair"
+    assert calls[0]["direction"] == "buy_entropy"
+    assert calls[0]["close_qty"] == pytest.approx(0.007)
+    assert calls[0]["confirm_id"]
+    assert calls[0]["force_confirm_outside_rth"] is False
+    log = (tmp_path / ".web" / "probe.log").read_text(encoding="utf-8")
+    assert "flatten " in log
+    assert "reduce_only=true" in log
+    assert "anytime=true" in log
+    assert "force_confirm_outside_rth=false" in log
+    assert "buy_fill=0.007" in log
+    assert "sell_fill=0.007" in log
+    assert sess.risk()["halted"] is False
+    assert sess.risk()["halt_reason"] is None
+    # The open-order force path is unchanged: this clock is still outside RTH.
+    assert sess.rth_now() is False
+
+
+def test_flatten_refuses_when_already_flat(tmp_path):
+    calls = []
+    sess = ProbeSession(
+        tmp_path, RecorderControl(tmp_path), now=lambda: WEEKEND,
+        account_reader=lambda: _positions(0.0, 0.0),
+        executor=lambda req: calls.append(req) or _flat_result(req))
+    _write_env(tmp_path)
+    assert sess.flatten_offer(None) is None
+    with pytest.raises(ProbeError, match="already flat") as raised:
+        sess.admit_flatten({"confirm": True, "proposal_id": "stale"})
+    assert raised.value.status_code == 409
+    assert calls == []
+    log_path = tmp_path / ".web" / "probe.log"
+    if log_path.is_file():
+        assert "buy_fill" not in log_path.read_text(encoding="utf-8")
+
+
+def test_flatten_one_leg_halts_and_one_sided_does_not_open_the_flat_venue(tmp_path):
+    calls = []
+
+    def miss(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.007, sell=0.0)
+
+    pair = ProbeSession(
+        tmp_path / "pair", RecorderControl(tmp_path / "pair"),
+        now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.007),
+        executor=miss)
+    _write_env(tmp_path / "pair")
+    offer = pair.flatten_offer(None)
+    body = pair.admit_flatten({"confirm": True, "proposal_id": offer["proposal_id"]})
+    assert body["sent"] is True
+    assert body["halted"] is True
+    assert pair.risk()["halted"] is True
+    assert pair.risk()["halt_reason"] == "single-leg fill"
+
+    side_calls = []
+
+    def side(req):
+        side_calls.append(req)
+        # A filled one-sided reduce is flat. buy_fill is the venue number;
+        # net_base is not buy minus a missing second leg.
+        result = _flat_result(req, buy=0.007, sell=0.0)
+        result["halted"] = False
+        result["halt_reason"] = None
+        result["net_base"] = 0.0
+        result["ok"] = True
+        return result
+
+    one = ProbeSession(
+        tmp_path / "one", RecorderControl(tmp_path / "one"),
+        now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.0),
+        executor=side)
+    _write_env(tmp_path / "one")
+    offer = one.flatten_offer(None)
+    assert offer["kind"] == "legs"
+    assert len(offer["legs"]) == 1
+    sent = one.admit_flatten({"confirm": True, "proposal_id": offer["proposal_id"]})
+    assert sent["sent"] is True
+    assert len(side_calls) == 1
+    legs = side_calls[0]["flatten_legs"]
+    assert len(legs) == 1
+    assert legs[0]["venue"] == "entropy"
+    assert legs[0]["is_buy"] is True
+    assert legs[0]["qty"] == pytest.approx(0.007)
+    assert "lighter" not in {leg["venue"] for leg in legs}
+    # The fake reports a fill and no halt, so the one-sided reduce clears.
+    assert one.risk()["halted"] is False
+
+
+def test_http_flatten_button_and_route(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from web.panel import create_app
+
+    calls = []
+
+    def executor(req):
+        calls.append(req)
+        return _flat_result(req, buy=0.007, sell=0.007)
+
+    _write_env(tmp_path)
+    app = create_app(
+        tmp_path, now=lambda: WEEKEND,
+        account_reader=lambda: _positions(-0.007, 0.007),
+        executor=executor)
+    with TestClient(app) as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        assert 'id="btn-flatten"' in page.text
+        assert "手动清仓" in page.text
+        assert 'id="flatten-modal"' in page.text
+        status = client.get("/api/status").json()
+        offer = status["flatten"]
+        assert offer["available"] is True
+        assert offer["qty"] == pytest.approx(0.007)
+        refused = client.post("/api/flatten", json={
+            "confirm": False, "proposal_id": offer["proposal_id"],
+        })
+        assert refused.status_code == 409
+        assert calls == []
+        ok = client.post("/api/flatten", json={
+            "confirm": True, "proposal_id": offer["proposal_id"],
+        })
+        assert ok.status_code == 200
+        assert ok.json()["sent"] is True
+        assert ok.json()["reduce_only"] is True
+        assert calls[0]["close_qty"] == pytest.approx(0.007)
+        assert calls[0]["reduce_only"] is True
+
+    flat_calls = []
+    flat = create_app(
+        tmp_path / "flat", now=lambda: WEEKEND,
+        account_reader=lambda: _positions(0.0, 0.0),
+        executor=lambda req: flat_calls.append(req))
+    _write_env(tmp_path / "flat")
+    with TestClient(flat) as client:
+        assert client.get("/api/status").json()["flatten"] is None
+        denied = client.post("/api/flatten", json={"confirm": True})
+        assert denied.status_code == 409
+        assert "already flat" in denied.json()["detail"]
+        assert flat_calls == []

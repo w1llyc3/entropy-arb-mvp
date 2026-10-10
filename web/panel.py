@@ -4,7 +4,9 @@ Binds nowhere by itself. ``python3 -m web`` listens on 127.0.0.1 only.
 Secrets stay in the server ``.env`` and are scrubbed from every response.
 Starting the panel does not arm live trading. Confirm admits an id and then
 calls ``Engine.execute_confirmed``. Outside US RTH that send waits for a
-second 「强制确认」.
+second 「强制确认」. Manual flatten (``POST /api/flatten``) is reduce-only
+and is allowed outside RTH without that second click; a person still
+confirms the modal.
 """
 from __future__ import annotations
 
@@ -190,6 +192,14 @@ def create_app(root: Optional[Path] = None, command_builder=None,
     def confirm_cancel() -> dict:
         try:
             return session.cancel_confirm()
+        except ProbeError as exc:
+            _probe(exc)
+
+    @app.post("/api/flatten")
+    def flatten(body: ConfirmIn) -> dict:
+        """Reduce-only flatten. Requires confirm=true. Refuses a flat book."""
+        try:
+            return session.admit_flatten(body.model_dump())
         except ProbeError as exc:
             _probe(exc)
 

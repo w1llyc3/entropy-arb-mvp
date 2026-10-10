@@ -13,6 +13,12 @@ panel proposes a reduce-only close. One leg failing still HALTs.
 ``auto_confirm`` defaults off. When it is on, an open or a close is sent
 only inside RTH and only after the round-trip gate (default 1.8 bps, not
 the one-way 0.9). Outside RTH the force click stays human.
+
+Manual flatten (手动清仓) is separate. It is allowed anytime, including
+outside RTH, while paused, and while halted, because it only reduces
+risk. It does not use the open-order force-confirm second click. A human
+still has to confirm the modal. One leg failing still HALTs. A flatten
+that actually comes back flat clears that halt.
 """
 from __future__ import annotations
 
@@ -34,6 +40,7 @@ from web.probe import (
     DECISION_WARNING,
     ENTROPY_FEE_BPS,
     FEE_MISMATCH_TOL_BPS,
+    FLATTEN_NOTE,
     MARGIN_SAFETY,
     MIN_ORDER_USD,
     NET_TOL_BASE,
@@ -47,6 +54,7 @@ from web.probe import (
     decision_defaults,
     decision_warnings,
     evaluate_auto_gates,
+    flatten_plan,
     in_us_rth,
     leg_plan,
     net_edge_bps,
@@ -100,6 +108,8 @@ class ProbeSession:
         self._sizing_note = None
         self._auto_block_until = 0.0
         self._last_auto = None
+        self.flatten_path = self.dir / "flatten.json"
+        self._flatten_busy = False
 
     # ----------------------------------------------------------------- files
 
@@ -1064,6 +1074,304 @@ class ProbeSession:
         })
         self._save_risk(risk)
 
+    # --------------------------------------------------------------- flatten
+
+    def _clear_flatten_file(self) -> None:
+        try:
+            self.flatten_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _mark_notional(self, qty: float, latest: Optional[dict]) -> Optional[float]:
+        """Mark-to-mid from the latest minute. None when that print is missing."""
+        tob = (latest or {}).get("tob") or {}
+        try:
+            bid = float(tob.get("entropy_bid"))
+            ask = float(tob.get("entropy_ask"))
+        except (TypeError, ValueError):
+            return None
+        if bid <= 0 or ask <= 0:
+            return None
+        return float(qty) * (bid + ask) / 2.0
+
+    def _public_flatten(self, proposal_id: str, plan: dict, accounts: dict,
+                        latest: Optional[dict], *, busy: bool = False) -> dict:
+        ent_acct = accounts.get("entropy") or {}
+        lig_acct = accounts.get("lighter") or {}
+        books = {"entropy": ent_acct, "lighter": lig_acct}
+        legs = []
+        for leg in plan["legs"]:
+            acct = books.get(leg["venue"]) or {}
+            legs.append({
+                "venue": leg["label"],
+                "key": leg["venue"],
+                "direction": leg["direction"],
+                "position": leg["position"],
+                "base_qty": leg["close_qty"],
+                "notional_usd": self._mark_notional(leg["close_qty"], latest),
+                "available": acct.get("available"),
+                "isolated": acct.get("isolated"),
+                "reduce_only": True,
+            })
+        return {
+            "available": True,
+            "proposal_id": proposal_id,
+            "kind": plan["kind"],
+            "direction": plan.get("direction"),
+            "qty": plan.get("qty"),
+            "reduce_only": True,
+            "anytime": True,
+            "rth_required": False,
+            "busy": bool(busy),
+            "partial": bool(plan.get("partial")),
+            "entropy_position": plan.get("entropy_position"),
+            "lighter_position": plan.get("lighter_position"),
+            "legs": legs,
+            "note": FLATTEN_NOTE,
+        }
+
+    def flatten_offer(self, latest: Optional[dict] = None) -> Optional[dict]:
+        """The 手动清仓 card. None when both SNDK positions are flat.
+
+        The id stays put while the position signature does not change, so a
+        confirm can match it. Outside RTH this is still offered: flatten
+        does not wait for the revert band or the force-confirm second click.
+        """
+        accounts = self._accounts()
+        ent = (accounts.get("entropy") or {}).get("position")
+        lig = (accounts.get("lighter") or {}).get("position")
+        plan = flatten_plan(ent, lig)
+        if plan is None:
+            if not self._flatten_busy:
+                self._clear_flatten_file()
+            return None
+        sig = list(self._pos_sig(accounts))
+        stored = self._read_json(self.flatten_path) or {}
+        if (self._flatten_busy and stored.get("proposal_id")
+                and stored.get("sig") == sig):
+            return self._public_flatten(
+                stored["proposal_id"], plan, accounts, latest, busy=True)
+        if stored.get("sig") != sig or not stored.get("proposal_id"):
+            stored = {"proposal_id": uuid.uuid4().hex, "sig": sig}
+            self._write_json(self.flatten_path, stored)
+        return self._public_flatten(stored["proposal_id"], plan, accounts, latest)
+
+    def admit_flatten(self, payload: dict) -> dict:
+        """Human-confirmed reduce-only flatten. Refuses a flat book.
+
+        Allowed outside RTH without the open-order force click, and allowed
+        while halted or paused. The size is recomputed from the current
+        positions; the client does not get to name a qty.
+        """
+        if not isinstance(payload, dict) or payload.get("confirm") is not True:
+            raise ProbeError(
+                "flatten refused without an explicit confirm",
+                status_code=409)
+        if self._flatten_busy:
+            raise ProbeError("flatten already in flight", status_code=409)
+        self._account_cache = None
+        accounts = self._accounts(force=True)
+        ent = (accounts.get("entropy") or {}).get("position")
+        lig = (accounts.get("lighter") or {}).get("position")
+        plan = flatten_plan(ent, lig)
+        if plan is None:
+            self._clear_flatten_file()
+            raise ProbeError(
+                "flatten refused: already flat", status_code=409)
+        stored = self._read_json(self.flatten_path) or {}
+        if payload.get("proposal_id") != stored.get("proposal_id"):
+            raise ProbeError(
+                "flatten refused: proposal_id does not match",
+                status_code=409)
+        if stored.get("sig") != list(self._pos_sig(accounts)):
+            raise ProbeError(
+                "flatten refused: positions changed", status_code=409)
+        missing = self._creds_missing()
+        if missing:
+            self._log("flatten refused: credentials incomplete")
+            raise ProbeError(
+                "实盘密钥不完整，拒绝清仓：" + ", ".join(missing),
+                status_code=409)
+        spec = self.task() or decision_defaults()
+        try:
+            order_usd = float(spec.get("order_notional_usd") or 10.0)
+            pos_usd = float(spec.get("max_position_usd") or 10.0)
+        except (TypeError, ValueError):
+            raise ProbeError("flatten refused: probe caps are not numbers",
+                             status_code=400)
+        if order_usd - 10.0 > 1e-9 or pos_usd - 10.0 > 1e-9:
+            raise ProbeError("flatten refused: probe caps are $10",
+                             status_code=409)
+        if not self.config_path.is_file():
+            self._write_probe_yaml(spec)
+        self._flatten_busy = True
+        try:
+            return self._route_flatten(spec, plan, accounts=accounts)
+        finally:
+            self._flatten_busy = False
+            self._clear_flatten_file()
+            # The next status poll should see the post-trade book, not the
+            # 30s snapshot from before the send.
+            self._account_cache = None
+            self._accounts_at = 0.0
+
+    def _route_flatten(self, spec: dict, plan: dict, *, accounts: dict) -> dict:
+        confirm_id = uuid.uuid4().hex
+        if not confirm_id:
+            raise ProbeError("refusing order without an admitted confirm id",
+                             status_code=500)
+        rth = self.rth_now()
+        ent = (accounts.get("entropy") or {}).get("position")
+        lig = (accounts.get("lighter") or {}).get("position")
+        self._log(
+            f"flatten confirm_id={confirm_id} reduce_only=true "
+            f"kind={plan['kind']} direction={plan.get('direction') or ''} "
+            f"close_qty={'' if plan.get('qty') is None else plan.get('qty')} "
+            f"entropy_pos={ent} lighter_pos={lig} "
+            f"rth={str(bool(rth)).lower()} anytime=true "
+            f"force_confirm_outside_rth=false")
+        req = {
+            "confirm_id": confirm_id,
+            "direction": plan.get("direction") or "",
+            "order_notional_usd": float(spec.get("order_notional_usd") or 10.0),
+            "max_position_usd": float(spec.get("max_position_usd") or 10.0),
+            "root": str(self.root),
+            "reduce_only": True,
+            "intent": "flatten",
+            "flatten_kind": plan["kind"],
+            "force_confirm_outside_rth": False,
+        }
+        if plan["kind"] == "pair":
+            req["close_qty"] = float(plan["qty"])
+        else:
+            req["flatten_legs"] = [
+                {
+                    "venue": leg["venue"],
+                    "qty": float(leg["close_qty"]),
+                    "is_buy": bool(leg["is_buy"]),
+                }
+                for leg in plan["legs"]
+            ]
+        try:
+            result = self.executor(req)
+        except Exception as exc:
+            result = {
+                "ok": False, "routed": False, "sent": False, "halted": False,
+                "confirm_id": confirm_id,
+                "error": scrub(f"{type(exc).__name__}: {exc}"),
+                "buy_fill": 0.0, "sell_fill": 0.0, "net_base": 0.0,
+                "entropy_fee_bps": None, "status": "error",
+            }
+        if not isinstance(result, dict):
+            result = {"ok": False, "routed": False, "sent": False,
+                      "error": "bad executor result", "confirm_id": confirm_id}
+        if result.get("confirm_id") not in (None, confirm_id):
+            result["error"] = "confirm id mismatch"
+            result["sent"] = False
+            result["halted"] = False
+        result.setdefault("confirm_id", confirm_id)
+        self._apply_flatten_result(result)
+        risk = self.risk()
+        sent = bool(result.get("sent"))
+        if sent and not risk.get("halted"):
+            self._save_entry(None)
+            self._clear_revert()
+            queue = self.queue()
+            pending = queue.get("pending")
+            if pending and pending.get("intent") == "close":
+                self._archive(queue, "skipped", pending)
+        routed = bool(result.get("routed"))
+        self._log(
+            f"flatten result confirm_id={confirm_id} "
+            f"routed={str(routed).lower()} sent={str(sent).lower()} "
+            f"reduce_only=true "
+            f"buy_fill={result.get('buy_fill')} sell_fill={result.get('sell_fill')} "
+            f"halt={risk.get('halt_reason') or ''} "
+            f"error={result.get('error') or ''}")
+        if sent and risk.get("halted"):
+            gap = "单腿未平，已 HALT"
+        elif sent:
+            gap = "清仓已提交"
+        else:
+            gap = result.get("error") or "确认已承认，但没有发出订单"
+        return scrub({
+            "ok": bool(result.get("ok")),
+            "queued": False,
+            "routed": routed,
+            "sent": sent,
+            "reduce_only": True,
+            "intent": "flatten",
+            "anytime": True,
+            "force_confirm_outside_rth": False,
+            "proposal_id": None,
+            "confirm_id": confirm_id,
+            "kind": plan["kind"],
+            "direction": plan.get("direction"),
+            "close_qty": plan.get("qty"),
+            "halted": bool(risk.get("halted")),
+            "buy_fill": result.get("buy_fill"),
+            "sell_fill": result.get("sell_fill"),
+            "status": result.get("status"),
+            "gap": gap,
+        })
+
+    def _apply_flatten_result(self, result: dict) -> None:
+        """Record the venue fills. A flat success clears a prior risk halt.
+
+        Halt follows the engine flag (one requested leg failed). It does
+        not treat a one-sided reduce as a new open just because buy and
+        sell sizes differ. Fills are copied from the result, not invented.
+        """
+        risk = self.risk()
+        try:
+            buy = float(result.get("buy_fill") or 0.0)
+        except (TypeError, ValueError):
+            buy = 0.0
+        try:
+            sell = float(result.get("sell_fill") or 0.0)
+        except (TypeError, ValueError):
+            sell = 0.0
+        if result.get("halted"):
+            try:
+                net = float(result.get("net_base"))
+            except (TypeError, ValueError):
+                net = buy - sell
+            risk["halted"] = True
+            risk["halt_reason"] = result.get("halt_reason") or "single-leg fill"
+            risk["net_base"] = net
+        elif result.get("sent"):
+            risk["halted"] = False
+            risk["halt_reason"] = None
+            risk["net_base"] = 0.0
+        actual = result.get("entropy_fee_bps")
+        filled = buy > 0 or sell > 0
+        if filled and actual is not None:
+            try:
+                actual_f = float(actual)
+            except (TypeError, ValueError):
+                actual_f = None
+            if actual_f is not None:
+                risk["actual_fee_bps"] = actual_f
+                if abs(actual_f - ENTROPY_FEE_BPS) > FEE_MISMATCH_TOL_BPS:
+                    risk["fee_mismatch"] = True
+        risk["last_order"] = scrub({
+            "confirm_id": result.get("confirm_id"),
+            "intent": "flatten",
+            "reduce_only": True,
+            "ok": bool(result.get("ok")),
+            "routed": bool(result.get("routed")),
+            "sent": bool(result.get("sent")),
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "buy_fill": buy,
+            "sell_fill": sell,
+            "net_base": risk.get("net_base"),
+            "entropy_fee_bps": risk.get("actual_fee_bps"),
+            "assumed_fee_bps": ENTROPY_FEE_BPS,
+            "ts": self.now(),
+        })
+        self._save_risk(risk)
+
     # ------------------------------------------------------------------ status
 
     def last_reconcile(self) -> Optional[dict]:
@@ -1128,6 +1436,7 @@ class ProbeSession:
         task_mid = float(spec["midline_bps"]) if spec else -1.7
         out["session"] = session_snapshot(self._clock(), task_mid)
         out["revert_watch"] = self._revert_watch
+        out["flatten"] = self.flatten_offer(base.get("latest"))
         out["sizing_note"] = self._sizing_note
         out["auto_confirm"] = bool(spec and spec.get("auto_confirm"))
         out["round_trip_fee_bps"] = round_trip_fee_bps(risk.get("actual_fee_bps"))
@@ -1141,6 +1450,7 @@ class ProbeSession:
             "对账只记一条请求，不会做链上持仓同步。",
             "RTH 为美东周一至周五 09:30–16:00，不含交易所假日。",
             "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓，也拒绝平仓确认。",
+            "手动清仓随时可发（含非 RTH 和 HALT），两边只减仓，不看回归带宽，也不走开仓的二次强制确认。仍要人工确认。成功且净敞口归零则解除 HALT。",
         ]
         return scrub(out)
 

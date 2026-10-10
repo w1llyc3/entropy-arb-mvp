@@ -693,6 +693,154 @@ class Engine:
         self.last_execution = last
         return last
 
+    async def execute_reduce_legs(self, *, confirm_id: str, legs: list) -> dict:
+        """Reduce-only taker toward flat on each named leg.
+
+        Used when the book is not one symmetric overlap (one venue only, or
+        sizes that are not a pair). Each ``qty`` is that venue's absolute
+        position. Fills are the ``filled_base`` the venue returns. A leg
+        that errors, stays unresolved, or fills short of its qty HALTs.
+        The other venue is not opened to manufacture a hedge.
+        """
+        if not str(confirm_id or "").strip():
+            raise RuntimeError("refusing order without an admitted confirm id")
+        confirm_id = str(confirm_id).strip()
+        if self.halted:
+            return {
+                "ok": False, "routed": False, "sent": False, "halted": True,
+                "confirm_id": confirm_id, "error": "halted",
+                "buy_fill": 0.0, "sell_fill": 0.0, "net_base": 0.0,
+                "entropy_fee_bps": None, "status": "halted",
+                "reduce_only": True,
+            }
+        if not isinstance(legs, list) or not legs:
+            return _not_sent(confirm_id, "flat")
+        cfg = self.cfg
+        prepared = []
+        for raw in legs:
+            if not isinstance(raw, dict):
+                return _not_sent(confirm_id, "close_qty")
+            key = str(raw.get("venue") or "")
+            if key == "lighter":
+                key = "hedge"
+            venue = (self.venues or {}).get(key)
+            if venue is None:
+                return _not_sent(confirm_id, "close_qty")
+            try:
+                qty = floor_step(float(raw.get("qty")), self._step)
+            except (TypeError, ValueError):
+                return _not_sent(confirm_id, "close_qty")
+            if qty <= 0:
+                return _not_sent(confirm_id, "close_qty")
+            is_buy = bool(raw.get("is_buy"))
+            if (not venue.book.is_fresh(cfg.staleness_sec)
+                    or not venue.ready_to_trade()):
+                return _not_sent(confirm_id, "stale_book")
+            ref = venue.book.best_ask() if is_buy else venue.book.best_bid()
+            if not ref or ref <= 0:
+                return _not_sent(confirm_id, "empty_book")
+            slip = cfg.leg_slippage_bps / 1e4
+            if is_buy:
+                limit = venue.px_round(ref * (1 + slip), round_up=False)
+            else:
+                limit = venue.px_round(ref * (1 - slip), round_up=True)
+            prepared.append((venue, is_buy, qty, limit))
+
+        buy_fill = 0.0
+        sell_fill = 0.0
+        failed = False
+        statuses = []
+        fee = None
+        for venue, is_buy, qty, limit in prepared:
+            lock = self._vlock(venue.key)
+            await lock.acquire()
+            try:
+                self._record_send(venue)
+                try:
+                    info = await venue.send_taker(
+                        is_buy=is_buy, qty=qty, limit_px=limit,
+                        reduce_only=True)
+                except Exception as exc:
+                    info = {
+                        "status": "send-failed", "filled_base": 0.0,
+                        "avg_px": None, "err": repr(exc), "unresolved": False,
+                    }
+            finally:
+                lock.release()
+            if not isinstance(info, dict):
+                info = {
+                    "status": "send-failed", "filled_base": 0.0,
+                    "avg_px": None, "err": "bad result", "unresolved": False,
+                }
+            try:
+                filled = float(info.get("filled_base") or 0.0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            if filled < 0:
+                filled = 0.0
+            if is_buy:
+                buy_fill += filled
+                venue.position += filled
+            else:
+                sell_fill += filled
+                venue.position -= filled
+            short = filled + float(cfg.net_tolerance_base) < qty
+            leg_failed = bool(info.get("err") or info.get("unresolved") or short)
+            if leg_failed:
+                failed = True
+            if venue.key == "entropy":
+                fee = _fill_fee_bps(info, filled, info.get("avg_px") or limit)
+            statuses.append(f"{venue.name}:{info.get('status')}")
+            self._log_reduce_leg(
+                venue, is_buy=is_buy, qty=qty, limit_px=limit,
+                filled=filled, info=info, ok=not leg_failed)
+        if failed:
+            self.halted = True
+        return {
+            "ok": not failed,
+            "routed": True,
+            "sent": True,
+            "halted": failed,
+            "halt_reason": "single-leg fill" if failed else None,
+            "confirm_id": confirm_id,
+            "buy_fill": buy_fill,
+            "sell_fill": sell_fill,
+            "net_base": 0.0 if not failed else (buy_fill - sell_fill),
+            "entropy_fee_bps": fee,
+            "status": "/".join(statuses) if statuses else "flatten",
+            "reduce_only": True,
+            "error": None if not failed else "single-leg fill",
+        }
+
+    def _log_reduce_leg(self, venue, *, is_buy: bool, qty: float,
+                        limit_px: float, filled: float, info: dict,
+                        ok: bool) -> None:
+        """One trades.csv row for a reduce-only leg. The idle side is not a fill."""
+        idle = type("_Idle", (), {"name": "-"})()
+        notional = float(qty) * float(limit_px)
+        plan = ArbPlan(
+            qty=qty,
+            buy_limit=limit_px if is_buy else 0.0,
+            sell_limit=0.0 if is_buy else limit_px,
+            buy_notional=notional if is_buy else 0.0,
+            sell_notional=0.0 if is_buy else notional,
+            q_max=qty,
+            q_max_notional=notional,
+            top_premium_bps=0.0,
+            marginal_premium_bps=0.0,
+            buy_fee=(venue.fee_bps / 1e4) if is_buy else 0.0,
+            sell_fee=0.0 if is_buy else (venue.fee_bps / 1e4),
+        )
+        status = str(info.get("status") or "")
+        if is_buy:
+            self._log_csv(
+                "flatten", venue, idle, plan, ok, filled, 0.0,
+                status, "not-sent", 0.0, 0.0)
+        else:
+            self._log_csv(
+                "flatten", idle, venue, plan, ok, 0.0, filled,
+                "not-sent", status, 0.0, 0.0)
+
     def _record_trade(self, direction: str, plan: ArbPlan, fill_edge,
                       status: str, ok: bool) -> None:
         self.recent_trades.append({

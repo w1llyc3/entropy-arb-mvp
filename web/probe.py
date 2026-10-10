@@ -430,6 +430,90 @@ def symmetric_position(entropy_pos, lighter_pos) -> Optional[dict]:
     }
 
 
+# Manual flatten is risk-off. It does not wait for the revert band and it
+# does not take the open-order two-click force path outside RTH. A person
+# still has to confirm. Fills are whatever the venue returns.
+FLATTEN_NOTE = (
+    "手动清仓随时可发，包括非 RTH、暂停和 HALT。不看回归带宽，"
+    "也不走开仓的二次「强制确认」。仍要在弹窗里人工确认。"
+    "成交数量只记交易所返回值，不编造。"
+)
+
+
+def _open_position(value) -> Optional[float]:
+    """Signed size when it is past dust. None when flat, missing, or junk."""
+    pos = _pos(value)
+    if pos is None or abs(pos) <= NET_TOL_BASE:
+        return None
+    return pos
+
+
+def _flatten_leg(venue: str, label: str, pos: float, qty: float) -> dict:
+    closing_short = pos < 0
+    return {
+        "venue": venue,
+        "label": label,
+        "position": float(pos),
+        "close_qty": float(qty),
+        "is_buy": closing_short,
+        "direction": "BUY" if closing_short else "SELL",
+    }
+
+
+def flatten_plan(entropy_pos, lighter_pos) -> Optional[dict]:
+    """Reduce-only sizes that move SNDK toward flat. None when both are flat.
+
+    A symmetric opposite book closes the overlapping base size on both
+    legs (one ``execute_confirmed`` call with ``reduce_only``). Any other
+    open book closes each venue's own absolute size toward zero. A missing
+    read is not treated as zero and is not given an invented size.
+    """
+    ent = _pos(entropy_pos)
+    lig = _pos(lighter_pos)
+    ent_open = _open_position(ent)
+    lig_open = _open_position(lig)
+    if ent_open is None and lig_open is None:
+        return None
+    partial = ent is None or lig is None
+    pair = None
+    if ent_open is not None and lig_open is not None:
+        pair = symmetric_position(ent_open, lig_open)
+    if pair is not None:
+        qty = float(pair["qty"])
+        return {
+            "kind": "pair",
+            "direction": pair["direction"],
+            "qty": qty,
+            "reduce_only": True,
+            "partial": False,
+            "entropy_position": ent,
+            "lighter_position": lig,
+            "legs": [
+                _flatten_leg("entropy", "Entropy", ent_open, qty),
+                _flatten_leg("lighter", "Lighter", lig_open, qty),
+            ],
+        }
+    legs = []
+    if ent_open is not None:
+        legs.append(_flatten_leg(
+            "entropy", "Entropy", ent_open, abs(ent_open)))
+    if lig_open is not None:
+        legs.append(_flatten_leg(
+            "lighter", "Lighter", lig_open, abs(lig_open)))
+    if not legs:
+        return None
+    return {
+        "kind": "legs",
+        "direction": None,
+        "qty": None,
+        "reduce_only": True,
+        "partial": partial,
+        "entropy_position": ent,
+        "lighter_position": lig,
+        "legs": legs,
+    }
+
+
 def margin_headroom_notional(*, free_margin, leverage, safety: float
                              ) -> Optional[float]:
     """Notional headroom from free margin × leverage × safety.
