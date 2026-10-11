@@ -368,10 +368,12 @@
       <div class="kv">
         <div><span>中枢</span><b id="card-mid">-1.7</b></div>
         <div><span>带宽</span><b id="card-band">±1.0</b></div>
-        <div><span>单笔</span><b id="card-order">$10</b></div>
-        <div><span>单边上限</span><b id="card-pos">$10</b></div>
+        <div><span>单笔</span><b id="card-order">$11</b></div>
+        <div><span>单边上限</span><b id="card-pos">$11</b></div>
       </div>
       <div class="warn-line" id="card-warn" hidden>会偏离 Decision Card</div>
+      <p class="hint" id="card-balance" hidden></p>
+      <p class="hint" id="card-switch" hidden></p>
       <p class="hint" id="fee-line">费率：尚未成交，假设 0.90 bps</p>
       <p class="hint" id="card-empty">还没有任务。创建一个 SNDK 探针。</p>
     </article>
@@ -576,11 +578,11 @@
       <div class="grid two">
         <div>
           <label for="f-ord">单笔硬顶 (USD)</label>
-          <input id="f-ord" name="order_notional_usd" type="number" step="1" value="10" min="10" max="10" required>
+          <input id="f-ord" name="order_notional_usd" type="number" step="0.5" value="11" min="10.5" required>
         </div>
         <div>
           <label for="f-cap">单边持仓上限 (USD)</label>
-          <input id="f-cap" name="max_position_usd" type="number" step="1" value="10" min="10" max="10" required>
+          <input id="f-cap" name="max_position_usd" type="number" step="0.5" value="11" min="10.5" required>
         </div>
       </div>
       <div class="modes" role="group" aria-label="模式">
@@ -596,7 +598,7 @@
       <div class="grid">
         <div>
           <label for="f-auto-max">自动确认名义上限 (USD)</label>
-          <input id="f-auto-max" type="number" step="1" min="1" max="10" placeholder="默认同单笔硬顶">
+          <input id="f-auto-max" type="number" step="0.5" min="10.5" placeholder="默认同单笔硬顶">
         </div>
         <div>
           <label for="f-day-ntl">日名义上限 (USD，可选)</label>
@@ -620,7 +622,7 @@
           <input id="f-safety" type="number" step="0.05" min="0.05" max="1" value="0.8">
         </div>
       </div>
-      <p class="hint">保证金模式用可用保证金 × 杠杆 × 安全系数，再被单笔硬顶截断。10× 逐仓时，约 $11 名义锁约 $1.11 保证金。杠杆或保证金读不到就拒绝，不会改用现金名义。Entropy 可用取现货 USDC。</p>
+      <p class="hint">现金模式单笔至少 $10.50，动态上限是较小可用 × 0.9。余额未读到不发明上限。保证金模式用可用保证金 × 杠杆 × 安全系数，再被单笔硬顶截断。10× 逐仓时，约 $11 名义锁约 $1.11 保证金。杠杆或保证金读不到就拒绝，不会改用现金名义。Entropy 可用取现货 USDC。实盘武装后，时段边界且两边空仓才会切换中枢。</p>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
     <div class="foot">
@@ -803,8 +805,8 @@ function openCreate(task) {
   $("f-mid").value = t.midline_bps != null ? t.midline_bps : -1.7;
   $("f-up").value = t.upper_bps != null ? t.upper_bps : 1;
   $("f-lo").value = t.lower_bps != null ? t.lower_bps : 1;
-  $("f-ord").value = t.order_notional_usd != null ? t.order_notional_usd : 10;
-  $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 10;
+  $("f-ord").value = t.order_notional_usd != null ? t.order_notional_usd : 11;
+  $("f-cap").value = t.max_position_usd != null ? t.max_position_usd : 11;
   formMode = t.mode || "record";
   $("f-confirm").checked = t.manual_confirm !== false;
   $("f-auto").checked = t.auto_confirm === true;
@@ -913,13 +915,29 @@ function render(s) {
   if (task) {
     $("card-mid").textContent = num(task.midline_bps, 1);
     $("card-band").textContent = "±" + Number(task.upper_bps).toFixed(1) + " / " + Number(task.lower_bps).toFixed(1);
-    $("card-order").textContent = "$" + Number(task.order_notional_usd).toFixed(0);
-    $("card-pos").textContent = "$" + Number(task.max_position_usd).toFixed(0);
+    $("card-order").textContent = "$" + Number(task.order_notional_usd).toFixed(2);
+    $("card-pos").textContent = "$" + Number(task.max_position_usd).toFixed(2);
+    const bal = s.balance || {};
+    const balEl = $("card-balance");
+    if (bal.dynamic_cap_usd != null) {
+      balEl.hidden = false;
+      balEl.textContent = "动态上限 $" + Number(bal.dynamic_cap_usd).toFixed(2)
+        + "（Entropy $" + Number(bal.entropy_available).toFixed(2)
+        + " / Lighter $" + Number(bal.lighter_available).toFixed(2)
+        + " × " + bal.safety + "）";
+    } else {
+      balEl.hidden = true;
+    }
+    const swEl = $("card-switch");
+    swEl.hidden = !s.session_switch_block;
+    swEl.textContent = s.session_switch_block || "";
     $("card-empty").hidden = true;
     $("card-warn").hidden = !(task.warnings && task.warnings.length);
   } else {
     $("card-empty").hidden = false;
     $("card-warn").hidden = true;
+    $("card-balance").hidden = true;
+    $("card-switch").hidden = true;
   }
   $("clear-task").disabled = !task || !!s.running;
   $("open-create").textContent = task ? "修改参数" : "创建套利任务";

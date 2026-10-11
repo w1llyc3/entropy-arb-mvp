@@ -135,8 +135,38 @@ def _apply_hl(out: dict, payload: dict) -> None:
         break
 
 
+def _maintenance_usdc(payload: dict):
+    """USDC named in ``tokenToAvailableAfterMaintenance``, if that field exists."""
+    raw = payload.get("tokenToAvailableAfterMaintenance")
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, list):
+        pairs = []
+        for item in raw:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                pairs.append((item[0], item[1]))
+    else:
+        return None
+    for token, amount in pairs:
+        if isinstance(token, str) and token.strip().upper() == "USDC":
+            try:
+                number = float(amount)
+            except (TypeError, ValueError):
+                return None
+            if number == number and number not in (float("inf"), float("-inf")):
+                return number
+            return None
+    return None
+
+
 def _apply_hl_spot(out: dict, payload: dict) -> None:
-    """Free USDC on the unified spot balance. Does nothing if USDC is absent."""
+    """Free USDC on the unified spot balance. Does nothing if USDC is absent.
+
+    Available prefers ``tokenToAvailableAfterMaintenance`` when it names
+    USDC, otherwise total − hold. A zero perp account value is not Unified
+    cash, so equity follows the spot total in that case.
+    """
+    maintained = _maintenance_usdc(payload if isinstance(payload, dict) else {})
     for bal in payload.get("balances") or []:
         if not isinstance(bal, dict):
             continue
@@ -146,8 +176,12 @@ def _apply_hl_spot(out: dict, payload: dict) -> None:
             return
         total = float(bal["total"])
         hold = float(bal.get("hold") or 0.0)
-        out["entropy"]["spot_available"] = total - hold
-        out["entropy"]["available"] = total - hold
+        spot = maintained if maintained is not None else total - hold
+        out["entropy"]["spot_available"] = spot
+        out["entropy"]["available"] = spot
+        equity = out["entropy"].get("equity")
+        if equity is None or float(equity) == 0.0:
+            out["entropy"]["equity"] = total
         return
 
 

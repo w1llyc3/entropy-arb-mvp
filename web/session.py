@@ -42,6 +42,7 @@ from web.live_exec import execute_admitted
 from web.probe import (
     ACCRUAL_BPS,
     ACCRUAL_LABEL,
+    BALANCE_SAFETY,
     DECISION_WARNING,
     ENTROPY_FEE_BPS,
     FEE_MISMATCH_TOL_BPS,
@@ -53,6 +54,8 @@ from web.probe import (
     RTH_WINDOW,
     STATUS_HALT,
     SYMBOL,
+    available_short_reason,
+    balance_view,
     books_fresh,
     build_confirm_payload,
     confirm_field_errors,
@@ -64,11 +67,15 @@ from web.probe import (
     leg_plan,
     net_edge_bps,
     normalize_task,
+    notional_cap_reason,
     premium_inside_band,
     probe_config_dict,
     qualifying_direction,
     round_trip_fee_bps,
+    save_notional_reason,
+    session_name,
     session_snapshot,
+    session_switch_decision,
     size_order_notional,
     status_label,
     symmetric_position,
@@ -211,6 +218,25 @@ class ProbeSession:
         acct_net = self._account_net()
         if acct_net is not None and abs(acct_net) > NET_TOL_BASE:
             return "HALT：账户净敞口不为 0，拒绝新开仓"
+        spec = self.task()
+        pending = self.queue().get("pending") or {}
+        opening = (pending.get("intent") or "open") != "close"
+        if spec and opening and spec.get("session_switch_block"):
+            return str(spec["session_switch_block"])
+        # Cash opens must be fundable on both venues. Margin mode sizes
+        # from free margin × leverage and refuses inside size_order_notional.
+        # A close is reduce-only and is not blocked on the open notional.
+        if spec and opening and spec.get("sizing_mode") != "margin":
+            accounts = self._accounts()
+            short = available_short_reason(
+                accounts, spec.get("order_notional_usd"))
+            if short:
+                return short
+            capped = notional_cap_reason(
+                spec.get("order_notional_usd"), spec.get("max_position_usd"),
+                accounts, spec.get("balance_safety", BALANCE_SAFETY))
+            if capped:
+                return capped
         return None
 
     def _clock(self) -> datetime:
@@ -233,6 +259,12 @@ class ProbeSession:
             spec = normalize_task(body)
         except ValueError as exc:
             raise ProbeError(str(exc), status_code=400)
+        if spec.get("sizing_mode") != "margin":
+            cap_err = save_notional_reason(
+                spec["order_notional_usd"], spec["max_position_usd"],
+                self._accounts(), spec.get("balance_safety", BALANCE_SAFETY))
+            if cap_err:
+                raise ProbeError(cap_err, status_code=400)
         spec["live_armed"] = False
         spec["warnings"] = decision_warnings(spec)
         spec["saved_at"] = self.now()
@@ -287,6 +319,9 @@ class ProbeSession:
             "auto_daily_max_count": spec.get("auto_daily_max_count"),
             "sizing_mode": spec.get("sizing_mode") or "cash",
             "margin_safety": spec.get("margin_safety"),
+            "balance_safety": spec.get("balance_safety", BALANCE_SAFETY),
+            "session_anchor": spec.get("session_anchor"),
+            "session_switch_block": spec.get("session_switch_block"),
             "persist_sec": spec.get("persist_sec") or PERSIST_SEC,
             "rth_only": bool(spec.get("rth_only", True)),
             "mode": spec.get("mode"),
@@ -304,8 +339,67 @@ class ProbeSession:
 
     def _mark_armed(self, spec: dict, armed: bool) -> dict:
         spec["live_armed"] = bool(armed and spec.get("mode") == "live")
+        if spec["live_armed"]:
+            # Pin the session at arm time. A later boundary is the only
+            # moment the midline may follow SESSION_MIDLINE_BPS. rth_only
+            # is a start gate and is not touched here.
+            spec["session_anchor"] = session_name(float(self.now()))
+            spec["session_switch_block"] = None
+        else:
+            spec["session_switch_block"] = None
         spec["warnings"] = decision_warnings(spec)
         self._write_json(self.task_path, spec)
+        return spec
+
+    def _apply_session_boundary(self, spec: dict) -> dict:
+        """Follow the session midline only on a boundary, and only if flat.
+
+        A tick inside the same session does not rewrite the task. rth_only
+        is left as the operator saved it. An open position blocks new
+        opens and keeps the midline; a reduce-only close is still allowed.
+        """
+        if not spec or not spec.get("live_armed"):
+            return spec
+        now_name = session_name(float(self.now()))
+        decision = session_switch_decision(
+            spec.get("session_anchor"), now_name, self._accounts(),
+            armed=True)
+        action = decision.get("action")
+        if action == "pin":
+            if spec.get("session_anchor") != decision["session"]:
+                spec["session_anchor"] = decision["session"]
+                spec["session_switch_block"] = None
+                self._write_json(self.task_path, spec)
+            return spec
+        if action == "hold":
+            if spec.get("session_switch_block"):
+                spec["session_switch_block"] = None
+                self._write_json(self.task_path, spec)
+            return spec
+        if action == "block":
+            reason = decision["reason"]
+            if spec.get("session_switch_block") != reason:
+                spec["session_switch_block"] = reason
+                self._write_json(self.task_path, spec)
+                self._log("session switch blocked: " + reason)
+            return spec
+        if action != "apply":
+            return spec
+        old_mid = float(spec["midline_bps"])
+        new_mid = float(decision["midline_bps"])
+        frm = decision["from_session"]
+        to = decision["session"]
+        spec["midline_bps"] = new_mid
+        spec["session_anchor"] = to
+        spec["session_switch_block"] = None
+        spec["warnings"] = decision_warnings(spec)
+        self._write_json(self.task_path, spec)
+        self._write_probe_yaml(spec)
+        self._log(
+            f"session switch {frm} -> {to} midline {old_mid} -> {new_mid}")
+        queue = self.queue()
+        if queue.get("pending"):
+            self._save_queue({"pending": None, "history": queue["history"]})
         return spec
 
     # ------------------------------------------------------------------ spawn
@@ -621,6 +715,8 @@ class ProbeSession:
         band the close timer resets. Flat books keep the open path.
         """
         spec = self.task()
+        if spec and spec.get("live_armed"):
+            spec = self._apply_session_boundary(spec)
         queue = self.queue()
         if not spec or spec.get("mode") != "live" or not spec.get("live_armed"):
             self._drop_pending(queue)
@@ -756,8 +852,8 @@ class ProbeSession:
         return proposal
 
     def pending_payload(self, latest: Optional[dict]) -> Optional[dict]:
-        spec = self.task()
         pending = self.refresh_proposal(latest)
+        spec = self.task()
         if not spec or not pending:
             return None
         rth = self.rth_now()
@@ -915,6 +1011,8 @@ class ProbeSession:
                 "confirm payload rejected: " + "; ".join(field_errors),
                 status_code=400)
         spec = self._load_task()
+        if spec.get("live_armed"):
+            spec = self._apply_session_boundary(spec)
         if spec.get("mode") != "live" or not spec.get("live_armed"):
             raise ProbeError("confirm refused: probe is not live-armed",
                              status_code=409)
@@ -955,8 +1053,15 @@ class ProbeSession:
         except (TypeError, ValueError):
             raise ProbeError("confirm refused: numeric fields are not numbers",
                              status_code=400)
-        if order_usd - 10.0 > 1e-9 or pos_usd - 10.0 > 1e-9:
-            raise ProbeError("confirm refused: probe caps are $10", status_code=409)
+        if (pending.get("intent") or "open") != "close":
+            if order_usd + 1e-9 < MIN_ORDER_USD:
+                raise ProbeError(
+                    f"confirm refused: order is below ${MIN_ORDER_USD:.2f}",
+                    status_code=409)
+            if pos_usd + 1e-9 < order_usd:
+                raise ProbeError(
+                    "confirm refused: position cap does not cover the order",
+                    status_code=409)
         if not rth:
             force = payload.get("force_confirm") is True
             if not force:
@@ -1243,13 +1348,13 @@ class ProbeSession:
                 status_code=409)
         spec = self.task() or decision_defaults()
         try:
-            order_usd = float(spec.get("order_notional_usd") or 10.0)
-            pos_usd = float(spec.get("max_position_usd") or 10.0)
+            order_usd = float(spec.get("order_notional_usd") or MIN_ORDER_USD)
+            pos_usd = float(spec.get("max_position_usd") or MIN_ORDER_USD)
         except (TypeError, ValueError):
             raise ProbeError("flatten refused: probe caps are not numbers",
                              status_code=400)
-        if order_usd - 10.0 > 1e-9 or pos_usd - 10.0 > 1e-9:
-            raise ProbeError("flatten refused: probe caps are $10",
+        if order_usd <= 0 or pos_usd <= 0:
+            raise ProbeError("flatten refused: probe caps must be positive",
                              status_code=409)
         if not self.config_path.is_file():
             self._write_probe_yaml(spec)
@@ -1447,6 +1552,7 @@ class ProbeSession:
         proposal = None
         if spec and live_armed and not paused:
             proposal = self.pending_payload(base.get("latest"))
+            spec = self.task() or spec
         elif self.queue().get("pending") and not live_armed:
             self._save_queue({"pending": None, "history": self.queue()["history"]})
             self._clear_revert()
@@ -1459,7 +1565,12 @@ class ProbeSession:
         out["rth_window"] = RTH_WINDOW
         out["edge"] = self._edge_view(base.get("latest"))
         out["proposal"] = proposal
-        out["accounts"] = self._accounts()
+        accounts = self._accounts()
+        out["accounts"] = accounts
+        out["balance"] = balance_view(
+            accounts, (spec or {}).get("balance_safety", BALANCE_SAFETY))
+        out["session_switch_block"] = (
+            (spec or {}).get("session_switch_block") if spec else None)
         out["reconcile"] = self.last_reconcile()
         out["confirm_queue"] = {
             "pending": bool(proposal),
@@ -1495,7 +1606,9 @@ class ProbeSession:
             "自动确认默认关闭。打开后，开仓和平仓都要过往返门槛（Entropy 开+平约 1.8 bps，不是单边 0.9），且非 RTH 不会自动走强制确认。",
             "保证金缩放只在两边都读到可用保证金和杠杆时启用，并受单笔硬顶约束。缺失则拒绝，不拿现金名义冒充。",
             "非美股 RTH 不禁用确认，但必须先看强制确认卡，再点「强制确认」才会发单。",
-            "非美股 RTH 启动探针实盘不会直接武装：第一次返回强制启动卡，第二次带 force_start_outside_rth 才会武装。只记录不设这道门。中枢不会按时段自动切换。",
+            "非美股 RTH 启动探针实盘不会直接武装：第一次返回强制启动卡，第二次带 force_start_outside_rth 才会武装。只记录不设这道门。",
+            "实盘武装后，时段边界且两边空仓才会把中枢切到该时段。有仓或持仓未读到则暂停新开仓，中枢不动。平仓和手动清仓不受这道门挡住。",
+            "现金模式：单笔至少 $10.50，且不超过较小可用 × 0.9。任一可用读不到就拒绝，不猜测余额。",
             "对账只记一条请求，不会做链上持仓同步。",
             "RTH 为美东周一至周五 09:30–16:00，不含交易所假日。",
             "单腿成交会 HALT，净敞口不为 0 时拒绝新开仓，也拒绝平仓确认。",

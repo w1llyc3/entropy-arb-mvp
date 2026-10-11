@@ -73,8 +73,8 @@ def test_decision_card_defaults_and_warning():
     assert spec["hedge"] == "lighter"
     assert spec["midline_bps"] == -1.7
     assert spec["upper_bps"] == 1.0 and spec["lower_bps"] == 1.0
-    assert spec["order_notional_usd"] == 10
-    assert spec["max_position_usd"] == 10
+    assert spec["order_notional_usd"] == 11
+    assert spec["max_position_usd"] == 11
     assert spec["entropy_fee_bps"] == 0.9
     assert spec["lighter_fee_bps"] == 0.0
     assert spec["referral_mode"] == "self_t2"
@@ -92,10 +92,11 @@ def test_decision_card_defaults_and_warning():
         normalize_task({"symbol": "BTC"})
     with pytest.raises(ValueError):
         normalize_task({"hedge": "lighter-rh"})
-    with pytest.raises(ValueError, match="cap is \\$10"):
-        normalize_task({"order_notional_usd": 11})
-    with pytest.raises(ValueError, match="cap is \\$10"):
-        normalize_task({"max_position_usd": 25})
+    with pytest.raises(ValueError, match="10.5"):
+        normalize_task({"order_notional_usd": 10})
+    assert normalize_task({
+        "order_notional_usd": 18, "max_position_usd": 18,
+    })["order_notional_usd"] == 18
 
 
 def _write_env(root, *, complete=True):
@@ -162,8 +163,8 @@ def _arm(sess, *, rth_only=True, manual_confirm=True, midline=-1.7):
         "midline_bps": midline,
         "upper_bps": 1.0,
         "lower_bps": 1.0,
-        "order_notional_usd": 10,
-        "max_position_usd": 10,
+        "order_notional_usd": 11,
+        "max_position_usd": 11,
     })
     spec = sess.task()
     spec["live_armed"] = True
@@ -395,7 +396,7 @@ def test_http_force_start_outside_rth(tmp_path):
         made = client.post("/api/task", json={
             "mode": "live", "manual_confirm": True, "rth_only": True,
             "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert made.status_code == 200, made.text
         first = client.post("/api/session/start", json={})
@@ -603,8 +604,8 @@ def test_record_argv_stays_record_only_and_probe_yaml_loads(tmp_path):
                       symbol="SNDK", hedge_venue="lighter")
     assert cfg.midline_bps == -1.7
     assert cfg.upper_bps == 1.0 and cfg.lower_bps == 1.0
-    assert cfg.max_order_notional == 10
-    assert cfg.entropy.cap_usd == 10 and cfg.hedge.cap_usd == 10
+    assert cfg.max_order_notional == 11
+    assert cfg.entropy.cap_usd == 11 and cfg.hedge.cap_usd == 11
     assert cfg.entropy.fee_bps == 0.9 and cfg.hedge.fee_bps == 0.0
     assert cfg.referral_mode == "self_t2"
     assert cfg.premium_persist_sec == 3.0
@@ -697,9 +698,9 @@ def test_http_confirm_gate(tmp_path):
                      executor=executor,
                      account_reader=lambda: {
                          "creds": {"entropy": True, "lighter": True},
-                         "entropy": {"equity": 10, "available": 8,
+                         "entropy": {"equity": 100, "available": 100,
                                      "position": 0, "isolated": True},
-                         "lighter": {"equity": 12, "available": 9,
+                         "lighter": {"equity": 80, "available": 80,
                                      "position": 0, "isolated": False},
                          "note": None,
                      })
@@ -716,14 +717,14 @@ def test_http_confirm_gate(tmp_path):
         made = client.post("/api/task", json={
             "mode": "live", "manual_confirm": True, "rth_only": True,
             "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert made.status_code == 200, made.text
         assert made.json()["warnings"] == []
         drifted = client.post("/api/task", json={
             "mode": "live", "manual_confirm": False, "rth_only": True,
             "midline_bps": 0, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert drifted.status_code == 200
         assert drifted.json()["warnings"] == ["会偏离 Decision Card"]
@@ -731,7 +732,7 @@ def test_http_confirm_gate(tmp_path):
         made = client.post("/api/task", json={
             "mode": "live", "manual_confirm": True, "rth_only": True,
             "midline_bps": -1.7, "upper_bps": 1, "lower_bps": 1,
-            "order_notional_usd": 10, "max_position_usd": 10,
+            "order_notional_usd": 11, "max_position_usd": 11,
         })
         assert made.status_code == 200
         started = client.post("/api/session/start")
@@ -752,7 +753,12 @@ def test_http_confirm_gate(tmp_path):
         bad = client.post("/api/confirm", json=missing)
         assert bad.status_code == 400
         clock["t"] = OUTSIDE
-        payload["rth"] = False
+        # Flat book at the session boundary adopts the post midline.
+        jumped = client.get("/api/status").json()
+        assert jumped["task"]["midline_bps"] == pytest.approx(2.6)
+        payload = jumped["proposal"]
+        assert payload is not None
+        assert payload["rth"] is False
         held = client.post("/api/confirm", json=payload)
         assert held.status_code == 200, held.text
         assert held.json()["needs_force_confirm"] is True
@@ -761,7 +767,7 @@ def test_http_confirm_gate(tmp_path):
         card = held.json()["force_card"]
         assert card["risk_line"] == "带宽 1 bps，错中枢风险大于费率缺口"
         assert card["name"] == "us_post_overnight"
-        assert card["deviation_text"] == "偏离约 4 bps"
+        assert card["deviation_text"] == "偏离约 0 bps"
         clock["t"] = INSIDE
         # The pending net may have been refreshed; re-read so the echo matches.
         payload = client.get("/api/status").json()["proposal"]
@@ -825,8 +831,8 @@ def _live(sess, **extra):
         "midline_bps": -1.7,
         "upper_bps": 1.0,
         "lower_bps": 1.0,
-        "order_notional_usd": 10,
-        "max_position_usd": 10,
+        "order_notional_usd": 11,
+        "max_position_usd": 11,
     }
     body.update(extra)
     sess.save_task(body)
@@ -1093,7 +1099,7 @@ def test_margin_mode_refuses_when_headroom_is_below_the_hard_min(tmp_path):
     _live(rich, sizing_mode="margin", margin_safety=0.80)
     card = rich.pending_payload(latest)
     assert card is not None
-    assert card["legs"][0]["notional_usd"] == pytest.approx(10)
+    assert card["legs"][0]["notional_usd"] == pytest.approx(11)
     assert calls == []
 
 
