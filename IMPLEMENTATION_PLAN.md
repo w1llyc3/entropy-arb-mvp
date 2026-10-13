@@ -23,6 +23,28 @@
 
 PR 审查正文、测试与限制已准备；GitHub 认证/发布结果在最终交付说明。不得合并 main 或启用 live 后再补恢复。
 
+## P2 实施记录（2026-10-13，仅离线执行基础）
+
+分支 `impl/p2-durable-execution` 基于未合并的 P1 分支；P2 PR 使用 `impl/p1-reliability` 为 base，避免重复审查 P1 改动。真实 CLI/Web 入口保持 RECORD_ONLY，无真实账户/SDK/私钥/订单。
+
+- 新增 `entropy_arb/storage.py`：SQLite schema v1、WAL/FULL/foreign keys，commands/operations/legs/fills/events，短事务、稳定客户端 token、proposal 唯一消费、请求 payload hash、风险名义预留、持久化状态与监控计数。数据库锁超时/损坏/未知 schema 拒绝继续，不创建空账本覆盖旧证据。
+- 相同请求 key/内容重放得到原 operation；同 key 或同 proposal 内容变更拒绝。同 proposal 的等价别名请求原子关联同一 operation。线程/多进程并发竞争最多一个发送 claim。
+- 新增 `entropy_arb/execution.py`：默认不发送，即使传入 fake venue。显式打开模拟发送也只接受标记为 simulation 的注入对象；没有真实适配器连接、HTTP 开关或自动启用路径。
+- 两腿发送前先持久化 intent 与 stable IDs，再事务提交两条 SUBMITTING。发送超时/结果落盘失败保留可查询边界；Unknown 不变成 Failed，不创建新 ID 重发。恢复只 query；只有 PREPARED 且未越过提交边界才可证实 NOT_SENT。
+- 累积成交不回退；terminal 证据矛盾、重复 trade ID 内容变更或成交总量超限进入持久化恢复闭锁。fills 入库接口唯一去重，但当前 dispatcher 仅处理累积订单报告；真正关联交易所 fill/fee 查询仍属 P3。
+- 订单结果明确也只进入 RECONCILING（或开仓已知不等量时 NEEDS_REDUCTION）。不会根据本次 reduce 的 signed fill 推断账户净敞口，不自动补单或清仓。没有开放 SETTLED/预留释放/再次开仓路径：必须由 P3 的权威持仓对账补齐。
+- Stable client token 目前是内部 UUID，不声称已适配 Lighter 整数范围或真实交易所去重语义；这些能力需要协议验证和 P3 适配。
+
+测试覆盖新增 30 项：100 个线程请求幂等、50 个 proposal 别名请求、4 个客户端子进程同时消费、重复执行、事务 rollback、模拟磁盘满/结果 commit 失败、DB busy、损坏与旧 schema、partial/unknown/单侧减仓、查询异常、重复成交、矛盾报告。5 类专用子进程 `os._exit` 窗口验证 SQLite 重开：提交事务内、SUBMITTING 后、单腿接受、双腿接受、单腿结果 commit 后。模拟交易所证据独立写入临时文件，不是真实接口或真实系统断电验证。
+
+最终完整回归命令：
+
+```powershell
+.\.venv-audit\Scripts\python.exe -m pytest tests --basetemp=.venv-audit/p2-reviewed -q --tb=short
+```
+
+结果：195 passed、1 skipped（POSIX flock）、1 既有 Starlette/httpx 弃用 warning。生产 read-only 查询、权威仓位恢复、unique service owner、JSON/API 迁移、真实适配器结果分类、24h soak 与断电测试仍未实现/验证。P2 的离线全绿不能作为 live 启用依据。
+
 基线 `45d1d1f`；本轮只文档。顺序遵循 Specification → Architecture → Rules → Implementation → Test → Monitoring；每个阶段包含测试与监控，不把它们推迟到最后。Reliability 优先，保留已经工作的模块。
 
 ## P0：文档与基线（本轮）

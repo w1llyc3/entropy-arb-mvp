@@ -6,6 +6,9 @@
 logs/
 *.log
 .web/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 
 # python
 __pycache__/

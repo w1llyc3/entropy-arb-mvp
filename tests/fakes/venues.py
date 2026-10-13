@@ -19,6 +19,7 @@ class ExchangeState:
 
 
 class FakeVenue:
+    is_simulation = True
     def __init__(self, state=None, *, fault=None, fill_fraction=Decimal(1),
                  query_lag=0):
         self.state = state if state is not None else ExchangeState()
