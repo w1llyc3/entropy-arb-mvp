@@ -67,4 +67,3 @@ class FakeVenue:
 
     def repeated_events(self):
         return self.state.events + self.state.events[::-1] + self.state.events
-
