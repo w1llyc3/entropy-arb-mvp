@@ -326,7 +326,11 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 symbol: str, hedge_venue: str) -> Config:
     # Explicit UTF-8: Chinese Windows opens text as GBK, and config.yaml
     # (and .env) are UTF-8, including Chinese comments.
-    load_dotenv(env_file, encoding="utf-8")
+    if env_file is not None:
+        load_dotenv(env_file, encoding="utf-8")
+    # None means credential-free, including inherited environment secrets.
+    env_s = _env_s if env_file is not None else lambda name: None
+    env_i = _env_i if env_file is not None else lambda name: None
     try:
         with open(config_file, encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
@@ -368,8 +372,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("entropy.dex 'xyz' with hedge_venue 'tradexyz' is "
                           "the same market on both legs / 两条腿是同一个市场")
 
-    entropy_hl_creds = HLCreds(_env_s("HL_PRIVATE_KEY"),
-                               _env_s("HL_ACCOUNT_ADDRESS"))
+    entropy_hl_creds = HLCreds(env_s("HL_PRIVATE_KEY"),
+                               env_s("HL_ACCOUNT_ADDRESS"))
     entropy_fee = float(_get(raw, "entropy", "taker_fee_bps", 0.9))
     if entropy_fee <= 0:
         raise ConfigError(
@@ -395,8 +399,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
             hl_dex="xyz",
             hl_creds=HLCreds(
-                _env_s("HL_PRIVATE_KEY_XYZ") or _env_s("HL_PRIVATE_KEY"),
-                _env_s("HL_ACCOUNT_ADDRESS_XYZ") or _env_s("HL_ACCOUNT_ADDRESS")),
+                env_s("HL_PRIVATE_KEY_XYZ") or env_s("HL_PRIVATE_KEY"),
+                env_s("HL_ACCOUNT_ADDRESS_XYZ") or env_s("HL_ACCOUNT_ADDRESS")),
         )
     else:
         hedge = VenueConf(
@@ -407,9 +411,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),
             lighter_profile=LIGHTER_PROFILES[hedge_venue],
-            lighter_creds=LighterCreds(_env_i("LIGHTER_ACCOUNT_INDEX"),
-                                       _env_i("LIGHTER_API_KEY_INDEX"),
-                                       _env_s("LIGHTER_API_PRIVATE_KEY")),
+            lighter_creds=LighterCreds(env_i("LIGHTER_ACCOUNT_INDEX"),
+                                       env_i("LIGHTER_API_KEY_INDEX"),
+                                       env_s("LIGHTER_API_PRIVATE_KEY")),
         )
 
     ledger = raw.get("fees_ledger") or {}

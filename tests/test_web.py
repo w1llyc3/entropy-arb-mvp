@@ -80,10 +80,11 @@ def _linked_repo(tmp_path):
     root = tmp_path / "repo"
     (root / "tools").mkdir(parents=True)
     (root / "logs").mkdir()
-    os.symlink(os.path.join(ROOT, "tools", "analyze.py"),
-               root / "tools" / "analyze.py")
-    os.symlink(os.path.join(ROOT, "entropy_arb"), root / "entropy_arb")
-    os.symlink(os.path.join(ROOT, "config.yaml"), root / "config.yaml")
+    import shutil
+    shutil.copy2(os.path.join(ROOT, "tools", "analyze.py"), root / "tools" / "analyze.py")
+    shutil.copytree(os.path.join(ROOT, "entropy_arb"), root / "entropy_arb",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy2(os.path.join(ROOT, "config.yaml"), root / "config.yaml")
     return root
 
 
@@ -92,6 +93,7 @@ def test_record_only_argv_cannot_trade():
     assert argv[1:] == [
         "main.py", "--record-only", "--no-dashboard",
         "--symbol", "SNDK", "--hedge", "lighter",
+        "--record-control-dir", ".web",
     ]
     assert "--record-only" in argv
     joined = " ".join(argv)
@@ -155,7 +157,8 @@ def test_dead_pid_warns_and_stop_clears_it(tmp_path):
     pid = 2_000_000_000
     while True:
         try:
-            os.kill(pid, 0)
+            if not RecorderControl._pid_exists(pid):
+                break
         except ProcessLookupError:
             break
         except OSError:
@@ -195,8 +198,7 @@ def test_start_stop_cleans_up_the_subprocess(tmp_path):
         ctl.stop()
     assert not (tmp_path / ".web" / "recorder.pid").exists()
     assert not (tmp_path / ".web" / "recorder.json").exists()
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert not RecorderControl._pid_exists(pid)
     # a second stop is a no-op cleanup
     assert ctl.stop()["running"] is False
 
@@ -395,8 +397,7 @@ def test_http_start_normalizes_inputs_and_stop_cleans_up(tmp_path):
         assert after["pid"] is None
         assert after["warnings"] == []
     if pid is not None:
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
+        assert not RecorderControl._pid_exists(pid)
 
 
 def test_http_start_uses_the_record_only_command(tmp_path, monkeypatch):
@@ -586,7 +587,7 @@ def test_signal_permission_error_falls_back_to_os_kill(monkeypatch, tmp_path):
         raise PermissionError("not the session leader")
 
     monkeypatch.setattr(rc.os, "kill", kill)
-    monkeypatch.setattr(rc.os, "killpg", killpg)
+    monkeypatch.setattr(rc.os, "killpg", killpg, raising=False)
     RecorderControl(tmp_path)._signal(77, signal.SIGTERM)
     assert calls == [(77, signal.SIGTERM)]
 
@@ -698,12 +699,13 @@ def test_stop_on_windows_clears_meta_without_killpg(monkeypatch, tmp_path):
 
     ctl = RecorderControl(tmp_path)
     # Real win32 locking needs msvcrt, which this Linux process did not import.
+    monkeypatch.setattr(ctl, "_identity", lambda pid: "fake-creation")
     monkeypatch.setattr(ctl, "_locked", lambda: nullcontext())
     ctl.dir.mkdir(parents=True)
     ctl.pid_path.write_text("4321\n")
     ctl.meta_path.write_text(
         '{"pid": 4321, "started_at": 1, "symbol": "SNDK",'
-        ' "hedge": "lighter", "argv": ["python3", "main.py"]}\n')
+        ' "hedge": "lighter", "creation_id": "fake-creation", "argv": ["python3", "main.py"]}\n')
     stopped = ctl.stop()
     assert stopped["stopped"] is True
     assert stopped["pid"] == 4321

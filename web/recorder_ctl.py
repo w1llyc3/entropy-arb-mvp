@@ -38,6 +38,7 @@ def record_only_argv(symbol: str, hedge: str,
         "--no-dashboard",
         "--symbol", symbol,
         "--hedge", hedge,
+        "--record-control-dir", ".web",
     ]
 
 
@@ -159,7 +160,7 @@ class RecorderControl:
 
     @staticmethod
     def _reap(pid: int) -> None:
-        # Windows has no WNOHANG / waitpid reap. Liveness is os.kill(pid, 0).
+        # Windows has no WNOHANG reap. Liveness uses a process handle below.
         if sys.platform == "win32":
             return
         try:
@@ -168,9 +169,53 @@ class RecorderControl:
             pass
 
     @staticmethod
+    def _identity(pid: int):
+        """Windows creation time distinguishes recycled PIDs; no signals."""
+        if sys.platform != "win32":
+            return None
+        import ctypes
+        from ctypes import wintypes
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        api.OpenProcess.restype = wintypes.HANDLE
+        api.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        api.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = api.OpenProcess(0x1000, False, pid)
+        if not handle:
+            raise RecorderError("cannot verify process creation identity")
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not api.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                raise RecorderError("cannot read process creation identity")
+            return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+        finally:
+            api.CloseHandle(handle)
+
+    @staticmethod
     def _pid_exists(pid: int) -> bool:
         if pid <= 0:
             return False
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            api = ctypes.WinDLL("kernel32", use_last_error=True)
+            api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            api.OpenProcess.restype = wintypes.HANDLE
+            api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            api.WaitForSingleObject.restype = wintypes.DWORD
+            api.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = api.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if not handle:
+                if ctypes.get_last_error() == 5:
+                    raise RecorderError("process identity unavailable: access denied")
+                return False
+            try:
+                result = api.WaitForSingleObject(handle, 0)
+                if result not in (0, 258):
+                    raise RecorderError("process liveness query failed")
+                return result == 258  # WAIT_TIMEOUT
+            finally:
+                api.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -209,6 +254,10 @@ class RecorderControl:
         self._reap(pid)
         if not self._pid_exists(pid):
             return False
+        if sys.platform == "win32":
+            if not meta.get("creation_id"):
+                raise RecorderError("legacy PID cannot be safely adopted; verify it manually")
+            return meta["creation_id"] == self._identity(pid)
         argv = meta.get("argv") or []
         if argv and not self._matches(pid, argv):
             return False
@@ -341,6 +390,8 @@ class RecorderControl:
                     status_code=409)
             self._clear_meta()
             self._ensure_dir()
+            for name in ("recorder.pause", "recorder.stop"):
+                (self.dir / name).unlink(missing_ok=True)
             with open(self.log_path, "ab") as logf:
                 logf.write(
                     f"\n# panel start {' '.join(argv)}\n".encode())
@@ -360,6 +411,13 @@ class RecorderControl:
                 "hedge": hedge,
                 "argv": argv,
             }
+            if sys.platform == "win32":
+                try:
+                    meta["creation_id"] = self._identity(proc.pid)
+                except Exception:
+                    proc.terminate()  # This Popen handle is owned, not an arbitrary PID.
+                    proc.wait(timeout=5)
+                    raise
             try:
                 self._write_meta(meta)
             except Exception:
@@ -384,18 +442,25 @@ class RecorderControl:
                 except (TypeError, ValueError):
                     pid = None
             if pid:
-                self._terminate(pid)
+                if self._alive(meta):
+                    (self.dir / "recorder.stop").touch()
+                    # Give the credential-free recorder time to flush and close.
+                    deadline = time.monotonic() + 2.0
+                    while self._pid_exists(pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if self._alive(meta):
+                        self._terminate(pid)
             self._clear_meta()
         return {"running": False, "stopped": True, "paused": False, "pid": pid}
 
     def pause(self) -> dict:
-        """Freeze the record-only process. Does not send an order."""
+        """Pause sampling cooperatively; do not suspend websocket feeds."""
         with self._locked():
             meta = self._read_meta()
             if not self._alive(meta):
                 raise RecorderError("nothing is running to pause", status_code=409)
             pid = int(meta["pid"])
-            self._signal(pid, signal.SIGSTOP)
+            (self.dir / "recorder.pause").touch()
             meta["paused"] = True
             self._write_meta(meta)
         return {"running": True, "paused": True, "pid": pid}
@@ -409,7 +474,7 @@ class RecorderControl:
             if not meta.get("paused"):
                 raise RecorderError("recorder is not paused", status_code=409)
             pid = int(meta["pid"])
-            self._signal(pid, signal.SIGCONT)
+            (self.dir / "recorder.pause").unlink(missing_ok=True)
             meta["paused"] = False
             self._write_meta(meta)
         return {"running": True, "paused": False, "pid": pid}

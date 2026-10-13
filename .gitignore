@@ -11,6 +11,7 @@ logs/
 __pycache__/
 *.pyc
 .venv/
+.venv-audit/
 venv/
 .pytest_cache/
 *.egg-info/

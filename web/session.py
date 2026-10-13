@@ -414,6 +414,7 @@ class ProbeSession:
             "--symbol", symbol,
             "--hedge", hedge,
             "--config", ".web/probe.yaml",
+            "--record-control-dir", ".web",
         ]
         if "--record-only" not in argv:
             raise ProbeError("refusing to start without --record-only",
