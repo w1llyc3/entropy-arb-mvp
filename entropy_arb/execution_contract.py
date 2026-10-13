@@ -1,7 +1,7 @@
 """P1 transport-independent contract; not a durable execution service.
 
 UNKNOWN preserves any known cumulative fill. A submission exception does
-not prove rejection. P2 will adapt real venues to this contract.
+not prove rejection. P2 uses fake-only dispatch; production adapter migration is P3.
 """
 from dataclasses import dataclass
 from decimal import Decimal
