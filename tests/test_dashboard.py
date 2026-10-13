@@ -58,7 +58,7 @@ def render(eng, lang="en") -> str:
 
 
 def make_engine():
-    eng = Engine(make_cfg())
+    eng = Engine(make_cfg(), record_only=False)  # Fake LIVE rendering only.
     eng.entropy = StubVenue("entropy", "ENTROPY")
     eng.hedge = StubVenue("hedge", "RH")
     eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}

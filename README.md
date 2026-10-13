@@ -1,5 +1,10 @@
 # entropy-arb
 
+> P1 reliability work: CLI defaults to RECORD_ONLY; `--live` and the default web executor
+> refuse real submission until durable execution/recovery are accepted. Historical live
+> commands below are not active. Trading code remains available for offline fake tests.
+> Pause suspends sampling, not feeds. Stop requests cooperative shutdown before termination.
+
 **[中文文档 / Chinese documentation → README.zh-CN.md](README.zh-CN.md)**
 
 **Measurement fork.** MIT-licensed fork of

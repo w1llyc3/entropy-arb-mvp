@@ -297,12 +297,14 @@ class _MinuteAgg:
 
 class MinuteRecorder:
     def __init__(self, path: str, entropy_book: OrderBook, hedge_book: OrderBook,
-                 staleness_sec: float, interval_sec: float = 1.0) -> None:
+                 staleness_sec: float, interval_sec: float = 1.0,
+                 pause_file=None) -> None:
         self.path = path
         self.entropy_book = entropy_book
         self.hedge_book = hedge_book
         self.staleness_sec = staleness_sec
         self.interval_sec = interval_sec
+        self.pause_file = pause_file
         self.rows_written = 0
         self._agg: Optional[_MinuteAgg] = None
         self._fh = None
@@ -315,10 +317,11 @@ class MinuteRecorder:
         if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
             # never append rows under a different schema's header
             with open(self.path, encoding="utf-8") as fh0:
-                if fh0.readline().strip() != ",".join(HEADER):
-                    log.warning("%s has an old header — rotated to %s.old",
-                                self.path, self.path)
-                    os.replace(self.path, self.path + ".old")
+                old_header = fh0.readline().strip() != ",".join(HEADER)
+            if old_header:
+                log.warning("%s has an old header — rotated to %s.old",
+                            self.path, self.path)
+                os.replace(self.path, self.path + ".old")
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
         self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
@@ -344,6 +347,8 @@ class MinuteRecorder:
         minute = int(now // 60)
         if self._agg is not None and self._agg.minute != minute:
             self._flush_agg()
+        if self.pause_file and os.path.exists(self.pause_file):
+            return
         if not (self.entropy_book.is_fresh(self.staleness_sec)
                 and self.hedge_book.is_fresh(self.staleness_sec)):
             return

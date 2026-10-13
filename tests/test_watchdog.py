@@ -106,8 +106,13 @@ def test_second_watchdog_does_not_take_the_lock(tmp_path):
     try:
         start = time.time()
         while time.time() - start < 5:
-            if lock_path.is_file() and lock_path.read_text().strip().isdigit():
-                break
+            if lock_path.is_file():
+                # Windows byte-range locking forbids reading the locked PID.
+                # Readiness means exclusion works, not that its contents can be read.
+                contender = WatchdogLock(lock_path)
+                if not contender.acquire():
+                    break
+                contender.release()
             if holder.poll() is not None:
                 raise AssertionError("holder exited before locking")
             time.sleep(0.02)

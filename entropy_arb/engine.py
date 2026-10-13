@@ -75,9 +75,10 @@ BALANCE_POLL_SEC = 30.0
 
 
 class Engine:
-    def __init__(self, cfg: Config, record_only: bool = False) -> None:
+    def __init__(self, cfg: Config, record_only: bool = True) -> None:
         self.cfg = cfg
         self.record_only = record_only
+        self.record_control_dir = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.entropy = None
         self.hedge = None
@@ -223,7 +224,9 @@ class Engine:
             tasks += v.start_tasks(self.stop, self._update_evt.set, live)
         if cfg.recorder_enabled or self.record_only:
             self.recorder = MinuteRecorder(cfg.recorder_csv, self.entropy.book,
-                                           self.hedge.book, cfg.staleness_sec)
+                                           self.hedge.book, cfg.staleness_sec,
+                                           pause_file=(os.path.join(self.record_control_dir, "recorder.pause")
+                                                       if self.record_control_dir else None))
             tasks.append(asyncio.create_task(self.recorder.run(self.stop),
                                              name="recorder"))
             # Public REST only. Fills entropy_funding / hedge_funding when the
@@ -242,6 +245,8 @@ class Engine:
         if live:
             tasks.append(asyncio.create_task(self._reconcile_loop(),
                                              name="reconcile"))
+        if self.record_only and self.record_control_dir:
+            tasks.append(asyncio.create_task(self._record_control_loop()))
 
         await self.stop.wait()
         if self._exec_tasks:  # let in-flight executions settle, never cancel
@@ -898,6 +903,14 @@ class Engine:
             "exp": plan.exp_edge_usd, "fill": fill_edge, "status": status,
             "ok": ok})
 
+    async def _record_control_loop(self) -> None:
+        """Cooperative shutdown; keep websocket feeds alive while paused."""
+        while not self.stop.is_set():
+            if os.path.exists(os.path.join(self.record_control_dir, "recorder.stop")):
+                self.request_stop()
+                return
+            await asyncio.sleep(0.1)
+
     async def _maybe_hedge(self) -> None:
         net = sum(v.position for v in self.venues.values())
         if abs(net) > self.cfg.net_tolerance_base:
@@ -1150,8 +1163,9 @@ class Engine:
                 os.makedirs(d, exist_ok=True)
             if os.path.exists(path):
                 with open(path, encoding="utf-8") as fh0:
-                    if fh0.readline().strip() != ",".join(CSV_HEADER):
-                        os.replace(path, path + ".old")
+                    old_header = fh0.readline().strip() != ",".join(CSV_HEADER)
+                if old_header:
+                    os.replace(path, path + ".old")
             new = not os.path.exists(path)
             with open(path, "a", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)

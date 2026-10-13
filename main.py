@@ -76,6 +76,7 @@ def install_stop_handlers(loop, stop) -> None:
 async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
                 log_buffer, lang: str) -> None:
     eng = Engine(cfg, record_only=record_only)
+    eng.record_control_dir = getattr(cfg, "record_control_dir", None)
     loop = asyncio.get_running_loop()
     install_stop_handlers(loop, eng.request_stop)
     if not use_dashboard:
@@ -97,9 +98,7 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Two-venue LIVE arbitrage: Entropy vs Lighter mainnet / "
-                    "Lighter Robinhood / trade.xyz. Without --record-only, "
-                    "real orders are sent.")
+        description="Entropy data collector. Default RECORD_ONLY; LIVE disabled during P1.")
     p.add_argument("--symbol", required=True,
                    help="symbol traded on both venues, e.g. SNDK / "
                         "两个交易所共同交易的品种")
@@ -111,9 +110,14 @@ def main() -> None:
                    help="strategy config (default: config.yaml)")
     p.add_argument("--env-file", default=".env",
                    help="credentials file (default: .env)")
-    p.add_argument("--record-only", action="store_true",
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--record-only", action="store_true",
                    help="only collect minute data, run no strategy, send no "
                         "orders (needs no credentials)")
+    mode.add_argument("--live", action="store_true",
+                      help="explicit legacy live mode (disabled during P1)")
+    p.add_argument("--record-control-dir", default=None,
+                   help="panel-owned cooperative pause/stop directory")
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()
@@ -122,10 +126,14 @@ def main() -> None:
     disp.add_argument("--no-dashboard", action="store_true",
                       help="plain console logs instead of the dashboard")
     args = p.parse_args()
+    if args.live:
+        p.error("LIVE disabled during P1; durable execution and recovery are not implemented")
 
     try:
-        cfg = load_config(args.config, args.env_file,
+        cfg = load_config(args.config, None,
                           symbol=args.symbol, hedge_venue=args.hedge)
+        cfg.record_control_dir = (os.path.abspath(args.record_control_dir)
+                                  if args.record_control_dir else None)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         sys.exit(2)
@@ -151,7 +159,7 @@ def main() -> None:
         setup_logging(cfg.log_level)
 
     try:
-        asyncio.run(amain(cfg, record_only=args.record_only,
+        asyncio.run(amain(cfg, record_only=True,
                           use_dashboard=use_dashboard, force_tty=force_tty,
                           log_buffer=log_buffer,
                           lang="zh" if args.cn else "en"))

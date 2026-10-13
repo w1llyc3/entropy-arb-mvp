@@ -1,5 +1,28 @@
 # Implementation Plan — Approval Required
 
+## P1 实施记录（2026-10-13）
+
+用户已批准 P1；分支 `impl/p1-reliability`。原审计基线与未来 P2–P5 设计仍保留，下面的实现不是完整可靠交易系统。
+
+- 新增 `tests/test_p1.py`：默认 executor 的 open/close/不对称 reduce 路由与异常清理完全模拟；Windows 无信号存活检测、创建时间身份/PID 复用拒绝、合作式 pause/resume/stop、RECORD_ONLY 不读 dotenv/继承密钥、默认网页 executor 不访问凭据。四个初始回归先 RED，再修复。
+- 修复 `web/live_exec._route` 的局部变量 scope；默认 executor 在读取任何凭据前拒绝真实发送。`allow_legacy_live=True` 仅供隔离 fake 测试显式调用，无 HTTP 参数或环境开关连接它；持久化恢复验收前不开放实际 legacy 下单。
+- CLI/Engine 默认 RECORD_ONLY；CLI `--live` 在 P1 拒绝。config 的 env_file=None 不读 .env，也不读取继承环境中的密钥。原交易代码保留，不删除功能；旧实盘命令已加 README 顶部提示。
+- Windows 进程存活用 OpenProcess/WaitForSingleObject，关闭 handle；创建时间持久化用于拒绝 PID 复用。旧元数据缺身份拒绝自动接管。pause 使用 marker 只停采样，WS 继续；stop 先请求控制 loop 正常退出，再必要时终止测试/采集进程。控制目录只在面板 CLI 显式传入；不是 SQLite 或跨请求交易锁。
+- recorder 与 trades CSV 轮转移出 header 文件句柄作用域；测试 fixture 不再要求 Windows symlink 权限。暂停/恢复同分钟保留聚合，避免重复 minute。
+- `execution_contract.py` 定义稳定 ID intent、可信报告与 Unknown 分类；`tests/fakes/venues.py` 模拟 accepted-but-ACK-lost、延迟查询、IOC partial、重复回报、reduce-only 与 reject。fake 状态只在测试内存中，不是进程崩溃持久化，也不证明真实交易所支持 ID 去重。
+
+测试环境 Windows / Python 3.12.10 / 隔离 `.venv-audit`，无实盘 SDK。
+
+```powershell
+.\.venv-audit\Scripts\python.exe -m pytest tests --basetemp=.venv-audit/p1-final -q --tb=short
+```
+
+结果：165 passed, 1 skipped（POSIX flock）, 1 warning（现有 Starlette/httpx 弃用提示），16.21 秒。最终暂停同分钟聚合改动后补跑 `tests/test_p1.py tests/test_recorder.py`：19 passed，0.23 秒。此后仅文档/审查记录变化。
+
+未实现：SQLite durable intent、真实适配器规范结果/Unknown 修复、稳定外部订单 ID、交易请求全局幂等、长期单一 trading service 与 crash recovery、权威仓位恢复/资金费周期统一。上述仍属 P2/P3，不能用本轮全绿宣称实盘可靠。当前没有读取真实私钥、下实盘订单或清仓。
+
+PR 审查正文、测试与限制已准备；GitHub 认证/发布结果在最终交付说明。不得合并 main 或启用 live 后再补恢复。
+
 基线 `45d1d1f`；本轮只文档。顺序遵循 Specification → Architecture → Rules → Implementation → Test → Monitoring；每个阶段包含测试与监控，不把它们推迟到最后。Reliability 优先，保留已经工作的模块。
 
 ## P0：文档与基线（本轮）

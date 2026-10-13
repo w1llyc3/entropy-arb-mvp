@@ -23,13 +23,15 @@ from web.probe import MIN_ORDER_USD
 _BOOK_WAIT_SEC = 12.0
 
 
-def execute_admitted(req: dict) -> dict:
+def execute_admitted(req: dict, *, allow_legacy_live: bool = False) -> dict:
     """Synchronous entry used by the panel. Refuses before any network if
     the confirm id is missing. Opens must clear the $10.50 venue floor;
     a reduce-only close or flatten is not ceiled up to that floor."""
     confirm_id = str((req or {}).get("confirm_id") or "").strip()
     if not confirm_id:
         raise RuntimeError("refusing order without an admitted confirm id")
+    if not allow_legacy_live:
+        return _idle(confirm_id, "RECORD_ONLY: legacy execution disabled until durable recovery")
     order = float(req.get("order_notional_usd") or 0.0)
     position = float(req.get("max_position_usd") or 0.0)
     reduce_only = bool(req.get("reduce_only"))
@@ -63,6 +65,8 @@ def execute_admitted(req: dict) -> dict:
 
 
 async def _route(req: dict, confirm_id: str) -> dict:
+    order = float(req["order_notional_usd"])
+    position = float(req["max_position_usd"])
     root = Path(req["root"])
     if missing_live_env(root):
         return _idle(confirm_id, "credentials incomplete")

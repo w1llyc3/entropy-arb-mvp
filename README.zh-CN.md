@@ -1,5 +1,9 @@
 # entropy-arb
 
+> P1 可靠性开发：CLI 默认 RECORD_ONLY，`--live` 暂时拒绝；网页默认执行器也拒绝真实发送。
+> 旧文档中的实盘命令暂不适用，直到持久化订单与恢复验收完成。交易实现保留用于离线模拟验证。
+> 采集器暂停只暂停采样，行情连接继续运行；停止优先合作式退出。旧 Windows PID 文件缺少创建时间身份时拒绝接管，请人工核查，不要自动清理未知进程。
+
 **[English documentation / 英文文档 → README.md](README.md)**
 
 本仓库是 [your-quantguy/entropy-arb](https://github.com/your-quantguy/entropy-arb)
