@@ -424,6 +424,10 @@
         <div>
           <div class="eyebrow">BASIS</div>
           <h2 style="margin:6px 0 0;font-size:15px">Price (USD) &amp; Basis (bps)</h2>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+            <label>研究资产 <select id="research-symbol" aria-label="研究资产"></select></label>
+            <label>时间 <select id="research-hours" aria-label="图表时间范围"><option value="24">24 小时</option><option value="72">3 天</option><option value="168">7 天</option><option value="0">全部</option></select></label>
+          </div>
           <div class="idline" id="basis-sub">正在读取 logs/minutes.csv</div>
         </div>
       </div>
@@ -431,7 +435,14 @@
         <canvas id="basis-chart" role="img" aria-label="Entropy and Lighter prices with basis in basis points"></canvas>
         <div class="basis-tip" id="basis-tip" hidden></div>
       </div>
-      <p class="hint" id="basis-hint">历史分钟只读 <span class="mono">logs/minutes.csv</span>，大约每 45 秒重读一次，不是逐笔推送。左轴是 Entropy 与 Lighter 的分钟收盘价（bid/ask 都有时取中间价），右轴是 <span class="mono">premium_close_bps</span>（相对 0 绿正红负）。横线是任务中枢和上下沿，没有任务时用 -1.7 和 ±1。开仓/平仓竖线只在 <span class="mono">logs/trades.csv</span> 已有成交时间时出现。需要的列：minute_ts、entropy_bid、entropy_ask、hedge_bid、hedge_ask、premium_close_bps。静态图：<span class="mono">python3 tools/plot_basis.py</span> 写到 <span class="mono">.web/basis.png</span>。</p>
+      <p class="hint" id="basis-hint">只读分钟数据，每 45 秒更新。左轴：双边 USD 中间价；右轴：(Entropy / 对冲 − 1) × 10000，绿正红负。数据断档保留真实时间，超过 2 分钟不连线。价格差不等于套利净收益：未扣费用、资金费与滑点，合约标的与结算条款尚未核验。无对应市场只画 Entropy 单边价格，不生成 bp。研究图不沿用 SNDK 交易阈值。</p>
+    </div>
+
+    <div class="panel">
+      <div class="eyebrow">RECORD ONLY · WATCHLIST</div>
+      <h2 style="font-size:16px">全部资产价格与 bp 区间</h2>
+      <p class="hint" id="research-status">启动只记录采集后，将自动核对固定资产清单。新增资产不能下单。</p>
+      <div id="research-charts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px"></div>
     </div>
 
     <div class="panel">
@@ -1347,11 +1358,25 @@ $("analyze").addEventListener("click", async () => {
 const BASIS_POLL_MS = 45000;
 let basisPayload = null;
 let basisLayout = null;
+let researchSymbol = "SNDK";
+let researchHours = 24;
+let researchCharts = [];
 
 function describeBasis(data) {
   if (!data) return "分钟数据未就绪";
   if (data.error) return data.error;
   const n = (data.points || []).length;
+  if (data.symbol) {
+    const s = data.summary || {};
+    const range = s.p05_bps == null ? "无双边 bp 数据" :
+      "P05 / 中位 / P95 " + fmtBps(s.p05_bps) + " / " + fmtBps(s.p50_bps) + " / " + fmtBps(s.p95_bps);
+    const coverage = s.coverage_fraction == null ? "—" : (s.coverage_fraction * 100).toFixed(1) + "%";
+    const age = s.data_age_sec == null ? "尚无数据" : Math.round(s.data_age_sec / 60) + " 分钟前";
+    return data.entropy_label + (data.paired ? " ↔ " + data.hedge_label : " · 无对冲市场，只记录单边")
+      + " · " + n + " 根分钟 · " + range + " · 观测段采样覆盖 " + coverage
+      + (s.requested_window_coverage_fraction == null ? "" : " · 所选窗口覆盖 " + (s.requested_window_coverage_fraction * 100).toFixed(2) + "%")
+      + " · 最新 " + age;
+  }
   const bands = data.bands || {};
   const marks = (data.markers || []).length;
   if (!n) return "还没有可画的分钟 · " + (data.csv_path || "logs/minutes.csv");
@@ -1426,9 +1451,10 @@ function wrapFill(ctx, text, x, y, maxW, lineH) {
   if (line) ctx.fillText(line, x, yy);
 }
 
-function drawBasis() {
-  const canvas = $("basis-chart");
-  if (!canvas || !basisPayload) return;
+function drawBasis(canvasId = "basis-chart", payload = basisPayload) {
+  const canvas = $(canvasId);
+  if (!canvas || !payload) return;
+  const primary = canvasId === "basis-chart";
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -1440,11 +1466,10 @@ function drawBasis() {
   ctx.fillStyle = "#f4f1ea";
   ctx.fillRect(0, 0, w, h);
 
-  const data = basisPayload || {points: []};
+  const data = payload || {points: []};
   const points = (data.points || []).filter((p) =>
     Number.isFinite(Number(p.entropy_usd)) &&
-    Number.isFinite(Number(p.hedge_usd)) &&
-    Number.isFinite(Number(p.basis_bps)) &&
+    Number(p.entropy_usd) > 0 &&
     Number.isFinite(Number(p.minute_ts)));
   const bands = data.bands || {};
   const mid = Number(bands.midline_bps);
@@ -1464,10 +1489,12 @@ function drawBasis() {
     ctx.fillText(label, legendX + 12, 20);
     legendX += 12 + ctx.measureText(label).width + 14;
   }
-  legendItem("#2f6fe0", "Entropy");
-  legendItem("#1f9a4a", "Lighter");
-  legendItem("#3d9a62", "basis > 0");
-  legendItem("#c45c5c", "basis < 0");
+  legendItem("#2f6fe0", data.symbol ? data.symbol + " @ io" : "Entropy");
+  if (data.paired !== false) {
+    legendItem("#1f9a4a", "Lighter");
+    legendItem("#3d9a62", "bp +");
+    legendItem("#c45c5c", "bp −");
+  }
   if (Number.isFinite(mid)) legendItem("#475569", "mid " + fmtBps(mid));
 
   if (!points.length) {
@@ -1477,7 +1504,7 @@ function drawBasis() {
       ? String(data.error)
       : "还没有可画的分钟。记录器写入 logs/minutes.csv 之后，这里会画出两条价格和溢价。需要列：minute_ts, entropy_bid, entropy_ask, hedge_bid, hedge_ask, premium_close_bps。";
     wrapFill(ctx, msg, 24, 80, w - 48, 20);
-    basisLayout = null;
+    if (primary) basisLayout = null;
     return;
   }
 
@@ -1489,8 +1516,9 @@ function drawBasis() {
   const basisVals = [0];
   if (Number.isFinite(mid)) basisVals.push(mid, upLine, loLine);
   for (const p of points) {
-    prices.push(Number(p.entropy_usd), Number(p.hedge_usd));
-    basisVals.push(Number(p.basis_bps));
+    prices.push(Number(p.entropy_usd));
+    if (p.hedge_usd != null && Number(p.hedge_usd) > 0) prices.push(Number(p.hedge_usd));
+    if (p.basis_bps != null) basisVals.push(Number(p.basis_bps));
   }
   let pLo = Math.min.apply(null, prices);
   let pHi = Math.max.apply(null, prices);
@@ -1523,6 +1551,8 @@ function drawBasis() {
   ctx.rect(plotL, plotT, plotR - plotL, plotB - plotT);
   ctx.clip();
   for (let i = 1; i < points.length; i += 1) {
+    if (points[i - 1].basis_bps == null || points[i].basis_bps == null ||
+        Number(points[i].minute_ts) - Number(points[i - 1].minute_ts) > 120) continue;
     const v0 = Number(points[i - 1].basis_bps);
     const v1 = Number(points[i].basis_bps);
     const x0 = xOf(Number(points[i - 1].minute_ts));
@@ -1547,7 +1577,7 @@ function drawBasis() {
       ctx.fill();
     }
   }
-  if (points.length === 1) {
+  if (points.length === 1 && points[0].basis_bps != null) {
     const v = Number(points[0].basis_bps);
     ctx.fillStyle = v >= 0 ? "rgba(126, 196, 150, 0.72)" : "rgba(224, 150, 150, 0.78)";
     const x = xOf(Number(points[0].minute_ts));
@@ -1569,7 +1599,7 @@ function drawBasis() {
     const y = yBps(v);
     if (y > plotT + 2 && y < plotB - 2) hline(y, "rgba(190, 184, 172, 0.45)", []);
   }
-  hline(yZero, "#a8a298", [4, 4]);
+  if (data.paired !== false) hline(yZero, "#a8a298", [4, 4]);
   if (Number.isFinite(mid)) {
     hline(yBps(mid), "#475569", [6, 4]);
     hline(yBps(upLine), "#b49454", [2, 3]);
@@ -1581,11 +1611,14 @@ function drawBasis() {
   function stroke(key, color) {
     ctx.beginPath();
     ctx.strokeStyle = color;
-    points.forEach((p, i) => {
+    let previous = null;
+    points.forEach((p) => {
+      if (p[key] == null || !Number.isFinite(Number(p[key]))) { previous = null; return; }
       const x = xOf(Number(p.minute_ts));
       const y = yPx(Number(p[key]));
-      if (i === 0) ctx.moveTo(x, y);
+      if (previous == null || Number(p.minute_ts) - previous > 120) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
+      previous = Number(p.minute_ts);
     });
     ctx.stroke();
   }
@@ -1596,10 +1629,12 @@ function drawBasis() {
     ctx.beginPath();
     ctx.arc(xOf(Number(points[0].minute_ts)), yPx(Number(points[0].entropy_usd)), 3.5, 0, Math.PI * 2);
     ctx.fill();
+    if (points[0].hedge_usd != null) {
     ctx.fillStyle = "#1f9a4a";
     ctx.beginPath();
     ctx.arc(xOf(Number(points[0].minute_ts)), yPx(Number(points[0].hedge_usd)), 3, 0, Math.PI * 2);
     ctx.fill();
+    }
   }
 
   let labelX = -1000;
@@ -1642,8 +1677,8 @@ function drawBasis() {
     const label = fmtUsd(v);
     ctx.fillText(label, Math.max(2, plotL - ctx.measureText(label).width - 6), y + 3);
   }
-  ctx.fillText("bps", plotR + 6, plotT - 6);
-  for (const v of axisTicks(bLo, bHi, 4)) {
+  if (data.paired !== false) ctx.fillText("bps", plotR + 6, plotT - 6);
+  for (const v of (data.paired === false ? [] : axisTicks(bLo, bHi, 4))) {
     const y = yBps(v);
     if (y < plotT || y > plotB) continue;
     ctx.fillText(fmtBps(v), plotR + 6, y + 3);
@@ -1668,7 +1703,7 @@ function drawBasis() {
     lastLab = x + width;
   }
 
-  basisLayout = {plotL, plotR, plotT, plotB, t0, t1, xOf, points, yPx, yBps};
+  if (primary) basisLayout = {plotL, plotR, plotT, plotB, t0, t1, xOf, points, yPx, yBps};
 }
 
 function basisTip(ev) {
@@ -1697,8 +1732,8 @@ function basisTip(ev) {
   const lines = [
     fmtClock(Number(best.minute_ts)) + " UTC",
     "Entropy " + fmtUsd(best.entropy_usd),
-    "Lighter " + fmtUsd(best.hedge_usd),
-    "basis " + fmtBps(best.basis_bps) + " · " + kind,
+    best.hedge_usd == null ? "无对冲价格" : "Lighter " + fmtUsd(best.hedge_usd),
+    best.basis_bps == null ? "无双边 bp" : "basis " + fmtBps(best.basis_bps) + " · " + kind,
   ];
   for (const line of lines) {
     const div = document.createElement("div");
@@ -1716,10 +1751,14 @@ function basisTip(ev) {
 }
 
 async function refreshBasis() {
+  const symbol = researchSymbol;
+  const hours = researchHours;
   try {
-    const res = await fetch("/api/basis", {cache: "no-store"});
+    const res = await fetch("/api/basis?symbol=" + encodeURIComponent(symbol) + "&hours=" + hours, {cache: "no-store"});
     if (!res.ok) throw new Error("basis " + res.status);
-    basisPayload = await res.json();
+    const payload = await res.json();
+    if (symbol !== researchSymbol || hours !== researchHours) return;
+    basisPayload = payload;
     $("basis-sub").textContent = describeBasis(basisPayload);
   } catch (err) {
     basisPayload = {points: [], error: "basis 图暂时不可用"};
@@ -1735,14 +1774,92 @@ if (basisCanvas) {
   if (window.ResizeObserver) {
     new ResizeObserver(() => drawBasis()).observe(basisCanvas.parentElement);
   } else {
-    window.addEventListener("resize", drawBasis);
+    window.addEventListener("resize", () => drawBasis());
   }
 }
 
+function researchMetrics(data) {
+  const s = data.summary || {};
+  const bp = (v) => v == null ? "—" : fmtBps(v);
+  return "分钟收盘 min / max " + bp(s.min_bps) + " / " + bp(s.max_bps)
+    + " · 卖 Entropy 买 Lighter：P50 / P95 " + bp(s.sell_edge_p50_bps) + " / " + bp(s.sell_edge_p95_bps)
+    + " · 买 Entropy 卖 Lighter：P50 / P95 " + bp(s.buy_edge_p50_bps) + " / " + bp(s.buy_edge_p95_bps)
+    + " · $100 深度边际中位：卖 " + bp(s.fill_sell_100_p50_bps) + " / 买 " + bp(s.fill_buy_100_p50_bps)
+    + "（税费、资金费、滑点未扣；bp 统计按分钟等权）";
+}
+
+let researchRefreshing = false;
+async function refreshResearch() {
+  if (researchRefreshing) return;
+  researchRefreshing = true;
+  const hours = researchHours;
+  try {
+    const response = await fetch("/api/research/assets", {cache:"no-store"});
+    if (!response.ok) throw new Error("catalog");
+    const catalog = await response.json();
+    const assets = catalog.assets || [];
+    const select = $("research-symbol");
+    if (!select.options.length) for (const asset of assets) {
+      const option = document.createElement("option");
+      option.value = asset.symbol; option.textContent = asset.label + " · " + asset.symbol;
+      select.appendChild(option);
+    }
+    select.value = researchSymbol;
+    const collector = catalog.collector || {};
+    $("research-status").textContent =
+      "仅行情采集 · " + assets.length + " 个资产 · " +
+      (collector.running ? "采集进程运行中" : "采集未运行，显示已保存数据") +
+      (collector.error ? " · 采集重试 " + collector.error : "") +
+      " · IONQ/GPRO 若无对应市场，仅保留 Entropy 单边图。所有新增资产禁止下单。";
+    const charts = await Promise.all(assets.map(async (asset) => {
+      const res = await fetch("/api/basis?symbol=" + encodeURIComponent(asset.symbol) + "&hours=" + hours, {cache:"no-store"});
+      if (!res.ok) throw new Error(asset.symbol);
+      return res.json();
+    }));
+    if (hours !== researchHours) return;
+    researchCharts = charts;
+    const container = $("research-charts");
+    if (!container.children.length) for (const asset of assets) {
+      const card = document.createElement("article");
+      card.style.cssText = "border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0";
+      const title = document.createElement("h3"); title.textContent = asset.label + " · " + asset.symbol;
+      const subtitle = document.createElement("p"); subtitle.className = "hint"; subtitle.id = "research-sub-" + asset.symbol;
+      const frame = document.createElement("div"); frame.className = "basis-frame"; frame.style.height = "300px";
+      const canvas = document.createElement("canvas"); canvas.id = "research-chart-" + asset.symbol;
+      canvas.setAttribute("role","img"); canvas.setAttribute("aria-label",asset.label + " USD prices and basis bps");
+      frame.appendChild(canvas);
+      const metrics = document.createElement("p"); metrics.className = "hint"; metrics.id = "research-metrics-" + asset.symbol;
+      card.append(title,subtitle,frame,metrics); container.appendChild(card);
+    }
+    for (const chart of charts) {
+      $("research-sub-" + chart.symbol).textContent = describeBasis(chart);
+      $("research-metrics-" + chart.symbol).textContent = chart.paired ? researchMetrics(chart) : "无对冲市场，bp 不可计算；不使用零值或其他标的替代。";
+      drawBasis("research-chart-" + chart.symbol,chart);
+    }
+  } catch (err) {
+    $("research-status").textContent = "研究图表读取失败，保留已有图表；等待下次刷新。";
+  } finally {
+    researchRefreshing = false;
+    if (hours !== researchHours) refreshResearch();
+  }
+}
+
+$("research-symbol").addEventListener("change", () => {
+  researchSymbol = $("research-symbol").value; refreshBasis();
+});
+$("research-hours").addEventListener("change", () => {
+  researchHours = Number($("research-hours").value); refreshBasis(); refreshResearch();
+});
+if (window.ResizeObserver) new ResizeObserver(() => {
+  for (const chart of researchCharts) drawBasis("research-chart-" + chart.symbol,chart);
+}).observe($("research-charts"));
+
 refresh();
 refreshBasis();
+refreshResearch();
 setInterval(refresh, 2000);
 setInterval(refreshBasis, BASIS_POLL_MS);
+setInterval(refreshResearch, BASIS_POLL_MS);
 </script>
 </body>
 </html>

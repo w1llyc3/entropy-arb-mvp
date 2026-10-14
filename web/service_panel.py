@@ -13,6 +13,7 @@ from entropy_arb.storage import IdempotencyConflict,RecoveryRequired,EvidenceCon
 from web.basis import build_basis
 from web.report import assemble_status,run_analyze
 from web.probe import decision_defaults
+from web.research_basis import build_research_basis,catalog
 
 
 def create_app(root=None, *, public_accounts=None, service=None):
@@ -93,7 +94,14 @@ def create_app(root=None, *, public_accounts=None, service=None):
     @app.post("/api/analyze")
     async def analyze(): return await asyncio.to_thread(run_analyze,root)
     @app.get("/api/basis")
-    async def basis(hours:float=0):
+    async def basis(hours:float=0,symbol:str="SNDK"):
         if not 0<=hours<=24*366: hours=0
-        return JSONResponse(await asyncio.to_thread(build_basis,root,hours=hours),headers={"Cache-Control":"no-store"})
+        try: payload=await asyncio.to_thread(build_research_basis,root,symbol=symbol,hours=hours)
+        except ValueError: raise HTTPException(400,"unknown research asset") from None
+        return JSONResponse(payload,headers={"Cache-Control":"no-store"})
+    @app.get("/api/research/assets")
+    async def research_assets():
+        payload=await asyncio.to_thread(catalog,root)
+        payload["collector"]=service.snapshot().get("research")
+        return payload
     return app
