@@ -9,8 +9,8 @@ HLBookFeed: the official Hyperliquid websocket (wss://api.hyperliquid.xyz/ws)
     l2Book channel with fast snapshots and client app-pings. Every price this
     bot trades on comes straight from the exchange that will fill the order.
 
-Both touch the book on any inbound frame (connection-based freshness: a quiet
-market is not stale, only a dead feed is) and reconnect with backoff.
+Both touch connection liveness on inbound frames and reconnect with backoff.
+Execution freshness also requires a recent order-book update.
 """
 from __future__ import annotations
 
@@ -74,6 +74,8 @@ class LighterBookFeed:
         if not self._synced:
             return  # no snapshot yet (fresh connection, or one pending after a gap)
         prev, begin, end = self._nonce, ob.get("begin_nonce"), ob.get("nonce")
+        if prev is not None and end is not None and end <= prev:
+            return  # duplicate/old diff must not roll the local book backward
         if prev is not None and begin is not None and begin > prev + 1:
             log.warning("[%s] diff gap (had %s, got %s) — resubscribing",
                         self.name, prev, begin)

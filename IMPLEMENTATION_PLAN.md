@@ -1,4 +1,15 @@
-# Implementation Plan — Approval Required
+# Implementation Plan
+
+## P3/P4 实施记录（2026-10-14）
+
+用户已批准直接开发至 P4；分支 `impl/p3-p4-service` 基于 P2。当前实现和限制见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)，原始分阶段设计保留如下。实际落地采用增量迁移，保留旧模块为显式 legacy 测试入口，默认 CLI/Web 切换到新服务。
+
+- P3：新增 account_state/ownership/read_only/recovery/risk/strategy/service；SQLite v2 增加任务、提案、账户快照、发送前基线和对账任务。单 owner、串行命令、后台调度、查询恢复、逐笔成交关联、对账后 SETTLED、未知闭锁及人工模拟 reduce-only。
+- P4：新增 `web/service_panel.py`，默认 `web.panel.create_app` 转接服务，GET 无交易副作用；现有网页小改状态、确认幂等、禁用 live 与更正提示。CLI 共用 service 或向 loopback API 发命令。pause/stop 不清仓，重启恢复采集，对账不依赖浏览器。
+- 保留 engine/venue/feed/recorder 分析能力；production collector 只以 record_only=True 创建 Engine。旧 JSON、旧 ProbeSession 与旧 executor 不再作为默认交易状态所有者，未删除其回归代码。
+- 真正的签名发送、Lighter 完整查询/结算契约、真实精度/杠杆、24h soak 与硬件断电验收不属于本次已完成项；不应将服务骨架离线通过等同于实盘可靠。
+
+新增测试见 test_service/test_service_api/test_read_only/test_ownership；原 P2 子进程 crash 测试继续运行。最终测试结果记录在 ACCEPTANCE_CRITERIA.md 和 PR。
 
 ## P1 实施记录（2026-10-13）
 

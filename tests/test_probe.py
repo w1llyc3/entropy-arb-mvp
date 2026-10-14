@@ -384,7 +384,7 @@ def test_inside_rth_and_record_skip_force_start(tmp_path, monkeypatch):
 def test_http_force_start_outside_rth(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     _write_env(tmp_path)
 
@@ -678,7 +678,7 @@ def test_accounts_do_not_leak_secrets(tmp_path):
 def test_http_confirm_gate(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     clock = {"t": INSIDE}
 
@@ -792,7 +792,7 @@ def test_http_confirm_gate(tmp_path):
 def test_pause_resume_and_reconcile_do_not_route(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     def _sleep(symbol, hedge):
         return [sys.executable, "-c", "import time; time.sleep(30)"]
@@ -1341,7 +1341,7 @@ def test_flatten_one_leg_halts_and_one_sided_does_not_open_the_flat_venue(tmp_pa
 def test_http_flatten_button_and_route(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     calls = []
 

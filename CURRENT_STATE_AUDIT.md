@@ -1,3 +1,15 @@
+# P3/P4 实施后状态（2026-10-14）
+
+本文件后续原始审计内容描述重构前基线，不代表下列缺陷仍存在于当前默认入口。
+
+**Confirmed by Code**：默认 CLI/Web 使用长期 TradingService + SQLite v2；命令共用串行队列与 OS owner lock。默认确认不新建 Engine，GET 不驱动交易；订单/成交/仓位查询通过后才 SETTLED。旧 session/JSON/executor 仍保留为 legacy 回归参考，默认 factory 不使用。新服务真实发送禁用，模拟 adapter 只能测试注入。
+
+**Suspected Risk**：长期全量历史对账/快照保留的性能、磁盘增长，以及实际接口分页和非原子快照带来的持续闭锁，需长期运行量化。
+
+**Requires Runtime Validation**：真实 client ID/最终性、Lighter 完整历史/挂单/结算水位、账户精度/保证金/资金费周期、Windows 睡眠唤醒、断电与 24h soak。当前只读 Lighter 快照明确 incomplete，不能触发真实交易。
+
+具体改动与安全启动见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)。以下保留原审计证据。
+
 # Current State Audit — Phase 1
 
 审计日期：2026-10-11（Asia/Shanghai）。仅审计与设计，未实施修复。

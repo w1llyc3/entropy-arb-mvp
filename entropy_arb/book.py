@@ -2,8 +2,8 @@
 
 One book class serves both feed protocols: zkLighter sends a snapshot plus
 diffs (dict maintenance), Hyperliquid's l2Book sends full snapshots.
-Freshness is connection-based (any inbound ws frame touches alive_ts): a quiet
-market is not stale, only a dead feed is.
+Freshness requires both a recent connection frame and a recent book update.
+Heartbeats alone cannot authorize execution against old quotes.
 """
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ class OrderBook:
         # Last funding rate fetched from a documented REST poll, or None.
         # clear() does not wipe it: a book resync is not a new funding print.
         self.funding: Optional[float] = None
+        self.funding_observed_ts = None
+        self.funding_period_sec = None
 
     def touch(self) -> None:
         self.alive_ts = time.time()
@@ -80,7 +82,8 @@ class OrderBook:
 
     def is_fresh(self, max_age_sec: float) -> bool:
         return self.ready and bool(self.bids) and bool(self.asks) and (
-            time.time() - self.alive_ts <= max_age_sec)
+            0 <= time.time() - self.alive_ts <= max_age_sec
+            and 0 <= time.time() - self.last_update_ts <= max_age_sec)
 
 
 def floor_step(x: float, step: float) -> float:

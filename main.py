@@ -96,9 +96,42 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
             dash_task.cancel()
 
 
+async def run_service(cfg, *, root, public_accounts=None, **display):
+    """CLI and web use the same owner, ledger and command dispatcher."""
+    from pathlib import Path
+    from entropy_arb.service import TradingService,PublicCollector
+    service=TradingService(Path(root),public_accounts=public_accounts,
+                           collector=PublicCollector(root,config=cfg))
+    stop=asyncio.Event()
+    install_stop_handlers(asyncio.get_running_loop(),stop.set)
+    await service.start()
+    try:
+        if service.task_spec is None:
+            await service.call("task",dict(mode="record",midline_bps=cfg.midline_bps,
+                upper_bps=cfg.upper_bps,lower_bps=cfg.lower_bps,
+                order_notional_usd=cfg.max_order_notional,
+                max_position_usd=min(cfg.entropy.cap_usd,cfg.hedge.cap_usd)))
+        if not service.recording:
+            await service.call("start")
+        # Existing terminal dashboard can render the service-owned collector.
+        dashboard=None; dash_task=None
+        if display.get("use_dashboard"):
+            from entropy_arb.dashboard import Dashboard
+            while service.collector.engine is None: await asyncio.sleep(.05)
+            dashboard=Dashboard(service.collector.engine,display.get("log_buffer"),cfg.log_file,
+                                force_terminal=display.get("force_tty",False),lang=display.get("lang","en"))
+            dash_task=asyncio.create_task(dashboard.run())
+        try: await stop.wait()
+        finally:
+            await service.call("stop")
+            if dash_task:
+                dash_task.cancel(); await asyncio.gather(dash_task,return_exceptions=True)
+    finally: await service.close()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Entropy data collector. Default RECORD_ONLY; LIVE disabled during P1.")
+        description="Entropy persistent data service. Default RECORD_ONLY; real sending disabled.")
     p.add_argument("--symbol", required=True,
                    help="symbol traded on both venues, e.g. SNDK / "
                         "两个交易所共同交易的品种")
@@ -118,6 +151,11 @@ def main() -> None:
                       help="explicit legacy live mode (disabled during P1)")
     p.add_argument("--record-control-dir", default=None,
                    help="panel-owned cooperative pause/stop directory")
+    p.add_argument("--hl-account",default=None,help="public master address only")
+    p.add_argument("--lighter-account-index",default=None,help="public account index only")
+    p.add_argument("--command",choices=("status","pause","resume","stop","reconcile"),default=None,
+                   help="send command to the running loopback web service")
+    p.add_argument("--port",type=int,default=8765)
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()
@@ -127,7 +165,19 @@ def main() -> None:
                       help="plain console logs instead of the dashboard")
     args = p.parse_args()
     if args.live:
-        p.error("LIVE disabled during P1; durable execution and recovery are not implemented")
+        p.error("LIVE disabled: real venue execution/recovery contracts are not validated")
+    if args.symbol!="SNDK" or args.hedge!="lighter":
+        p.error("persistent service supports only SNDK Entropy/Lighter mainnet")
+    if args.command:
+        if not 1<=args.port<=65535: p.error("invalid local port")
+        import urllib.request,json
+        path={"resume":"session/start","status":"status"}.get(args.command,args.command)
+        request=urllib.request.Request(f"http://127.0.0.1:{args.port}/api/{path}",
+            data=None if args.command=="status" else b"{}",
+            headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(request,timeout=30) as response:
+            print(json.dumps(json.load(response),ensure_ascii=False))
+        return
 
     try:
         cfg = load_config(args.config, None,
@@ -159,7 +209,8 @@ def main() -> None:
         setup_logging(cfg.log_level)
 
     try:
-        asyncio.run(amain(cfg, record_only=True,
+        asyncio.run(run_service(cfg, record_only=True,root=os.path.dirname(os.path.abspath(args.config)),
+                          public_accounts=dict(entropy=args.hl_account,lighter=args.lighter_account_index),
                           use_dashboard=use_dashboard, force_tty=force_tty,
                           log_buffer=log_buffer,
                           lang="zh" if args.cn else "en"))

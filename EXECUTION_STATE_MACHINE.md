@@ -1,3 +1,11 @@
+# P3/P4 已实现状态机说明（2026-10-14）
+
+当前实现路径：`INTENT_COMMITTED → claim/SUBMITTING → EXECUTING/UNKNOWN/NEEDS_REDUCTION/RECONCILING → SETTLED`。terminal 订单不是交易完成；RecoveryCoordinator 必须关联逐笔成交、发送前账户基线、完整新鲜且未倒退的账户快照、发送后结算水位、无未知挂单及净敞口后，才以 leg version CAS 设置 SETTLED 并释放预留。
+
+PREPARED 且未跨发送边界的恢复操作记 `RECOVERY_ABORT_PROVEN_UNSUBMITTED`，落 NOT_SENT；未来重启不查询未使用 ID。其他 Unknown 只查询，不换 ID 重发。外部仓位不接管。部分成交的已证实系统仓位可人工模拟 reduce-only；结果未知/水位缺失不得减仓推断。
+
+服务经历 BOOTING、RECOVERING/RECONCILING、RECORD_ONLY 或 SIMULATION_READY、PAUSED、EXECUTING、HALTED、DRAINING、STOPPED。只有显式 fake 测试可进入 SIMULATION_READY，生产不能通过 HTTP 参数启用真实发送。完整边界见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)。以下保留原状态机设计。
+
 # Execution State Machine — Proposed
 
 待审批设计，尚未实现。参照 CURRENT_STATE_AUDIT.md 的 A02–A06，Unknown 永不等价 Failed。

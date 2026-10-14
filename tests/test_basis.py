@@ -337,7 +337,7 @@ def test_plot_cli_writes_png_and_refuses_outside_csv(tmp_path):
 def test_panel_serves_the_chart(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     _minutes(tmp_path, [_minute(1_700_000_000, prem="-1.2")])
     app = create_app(tmp_path)

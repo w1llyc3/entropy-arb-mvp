@@ -79,6 +79,7 @@ class Engine:
         self.cfg = cfg
         self.record_only = record_only
         self.record_control_dir = None
+        self.record_pause_file = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.entropy = None
         self.hedge = None
@@ -225,8 +226,8 @@ class Engine:
         if cfg.recorder_enabled or self.record_only:
             self.recorder = MinuteRecorder(cfg.recorder_csv, self.entropy.book,
                                            self.hedge.book, cfg.staleness_sec,
-                                           pause_file=(os.path.join(self.record_control_dir, "recorder.pause")
-                                                       if self.record_control_dir else None))
+                                           pause_file=(self.record_pause_file or (os.path.join(self.record_control_dir, "recorder.pause")
+                                                       if self.record_control_dir else None)))
             tasks.append(asyncio.create_task(self.recorder.run(self.stop),
                                              name="recorder"))
             # Public REST only. Fills entropy_funding / hedge_funding when the
@@ -248,17 +249,20 @@ class Engine:
         if self.record_only and self.record_control_dir:
             tasks.append(asyncio.create_task(self._record_control_loop()))
 
-        await self.stop.wait()
-        if self._exec_tasks:  # let in-flight executions settle, never cancel
-            log.info("waiting for %d in-flight execution(s) to settle",
-                     len(self._exec_tasks))
-            await asyncio.wait(self._exec_tasks,
-                               timeout=cfg.settle_timeout_sec + 2.0)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for v in self.venues.values():
-            await v.close()
+        try:
+            await self.stop.wait()
+        finally:
+            self.stop.set()
+            if self._exec_tasks:  # let in-flight executions settle, never cancel
+                log.info("waiting for %d in-flight execution(s) to settle",
+                         len(self._exec_tasks))
+                await asyncio.wait(self._exec_tasks,
+                                   timeout=cfg.settle_timeout_sec + 2.0)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*(v.close() for v in self.venues.values()),
+                                 return_exceptions=True)
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
                  self.total_exp_edge, self.total_fill_edge)

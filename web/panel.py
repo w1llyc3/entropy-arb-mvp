@@ -90,7 +90,7 @@ def _recorder(exc: RecorderError) -> None:
     raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
 
-def create_app(root: Optional[Path] = None, command_builder=None,
+def create_legacy_test_app(root: Optional[Path] = None, command_builder=None,
                now=None, account_reader=None, executor=None) -> FastAPI:
     root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
     ctl = RecorderControl(root, command_builder=command_builder)
@@ -238,5 +238,8 @@ def create_app(root: Optional[Path] = None, command_builder=None,
 
     return app
 
+
+# Archived regression harness above is never selected by the production entrypoint.
+from web.service_panel import create_app
 
 app = create_app()

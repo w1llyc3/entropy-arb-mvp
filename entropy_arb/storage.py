@@ -56,7 +56,7 @@ class Ledger:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RecoveryRequired("unsupported ledger schema")
             if version == 0:
                 if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").fetchone():
@@ -94,6 +94,25 @@ class Ledger:
             present = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not required <= present:
                 raise RecoveryRequired("incomplete ledger schema")
+            if version in (0, 1):
+                self.db.executescript("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                    CREATE TABLE snapshots(id INTEGER PRIMARY KEY,venue TEXT NOT NULL,
+                        account TEXT NOT NULL,observed REAL NOT NULL,payload TEXT NOT NULL);
+                    CREATE TABLE baselines(operation_id TEXT NOT NULL REFERENCES operations(id),
+                        venue TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(operation_id,venue));
+                    CREATE TABLE proposals(id TEXT PRIMARY KEY,payload TEXT NOT NULL,
+                        state TEXT NOT NULL,operation_id TEXT REFERENCES operations(id));
+                    CREATE TABLE reconcile_jobs(id TEXT PRIMARY KEY,created REAL NOT NULL,
+                        status TEXT NOT NULL,result TEXT);
+                    PRAGMA user_version=2;
+                    COMMIT;
+                """)
+            extra = {"settings", "snapshots", "baselines", "proposals", "reconcile_jobs"}
+            present = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not extra <= present:
+                raise RecoveryRequired("incomplete service schema")
             if self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RecoveryRequired("ledger integrity failure")
         except BaseException:
@@ -119,7 +138,7 @@ class Ledger:
         db.execute("INSERT INTO events(operation_id,leg_id,kind,created) VALUES(?,?,?,?)",
                    (op, leg, kind, time.time()))
 
-    def create_intent(self, key, proposal, intent, legs):
+    def create_intent(self, key, proposal, intent, legs, *, baselines=None):
         if not key or not proposal or intent not in ("open", "close", "reduce"):
             raise ValueError("command/proposal/intent required")
         specs = sorted([leg.payload() for leg in legs], key=lambda p: p["venue"])
@@ -147,7 +166,10 @@ class Ledger:
                 db.execute("INSERT INTO commands VALUES(?,?,?)", (key, digest, prior["id"]))
                 return prior["id"]
             # No release on local terminal outcomes: P3 must query positions first.
-            if db.execute("SELECT 1 FROM operations LIMIT 1").fetchone():
+            active = list(db.execute("SELECT id,state FROM operations WHERE state NOT IN ('SETTLED','ABORTED')"))
+            reduction = (intent == "reduce" and active
+                         and all(r["state"] == "NEEDS_REDUCTION" for r in active))
+            if active and not reduction:
                 raise RecoveryRequired("position reconciliation required before another operation")
             op = uuid.uuid4().hex
             now = time.time()
@@ -162,6 +184,13 @@ class Ledger:
                      int(p["is_buy"]), int(p["reduce_only"]), client_id, "PREPARED", "unknown",
                      str(Decimal(p["qty"]) * Decimal(p["limit_px"]))))
             db.execute("INSERT INTO commands VALUES(?,?,?)", (key, digest, op))
+            if baselines is not None:
+                for p in specs:
+                    snapshot = baselines[p["venue"]]
+                    if snapshot.account != p["account"]:
+                        raise ValueError("baseline account mismatch")
+                    db.execute("INSERT INTO baselines VALUES(?,?,?)", (op,p["venue"],json.dumps(snapshot.payload())))
+            db.execute("UPDATE proposals SET state='CONSUMED',operation_id=? WHERE id=?", (op,proposal))
             self._event(db, op, None, "INTENT_COMMITTED")
             return op
 
@@ -267,7 +296,7 @@ class Ledger:
 
     def pending_operations(self):
         with self.lock:
-            return [r[0] for r in self.db.execute("SELECT id FROM operations ORDER BY created")]
+            return [r[0] for r in self.db.execute("SELECT id FROM operations WHERE state NOT IN ('SETTLED','ABORTED') ORDER BY created")]
 
     def metrics(self):
         with self.transaction(immediate=False):
@@ -288,3 +317,83 @@ class Ledger:
             db.execute("UPDATE operations SET state='RECONCILING',updated=? WHERE id=?", (time.time(), op))
             self._event(db, op, None, "RECOVERY_ABORT_PROVEN_UNSUBMITTED")
             return True
+
+    def get_setting(self, key, default=None):
+        with self.lock:
+            row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else default
+
+    def set_setting(self, key, value):
+        with self.transaction() as db:
+            db.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (key,json.dumps(value)))
+
+    def proposal(self, proposal_id=None):
+        with self.lock:
+            if proposal_id:
+                row = self.db.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+            else:
+                row = self.db.execute("SELECT * FROM proposals WHERE state='PENDING' ORDER BY rowid DESC LIMIT 1").fetchone()
+            return (dict(json.loads(row["payload"]), status=row["state"], operation_id=row["operation_id"])
+                    if row else None)
+
+    def put_proposal(self, payload):
+        with self.transaction() as db:
+            db.execute("UPDATE proposals SET state='EXPIRED' WHERE state='PENDING'")
+            db.execute("INSERT INTO proposals(id,payload,state) VALUES(?,?,'PENDING')",
+                       (payload["proposal_id"],json.dumps(payload)))
+
+    def cancel_proposal(self):
+        with self.transaction() as db:
+            db.execute("UPDATE proposals SET state='CANCELED' WHERE state='PENDING'")
+
+    def save_snapshots(self, snapshots):
+        with self.transaction() as db:
+            for snapshot in snapshots.values():
+                db.execute("INSERT INTO snapshots(venue,account,observed,payload) VALUES(?,?,?,?)",
+                           (snapshot.venue,snapshot.account,snapshot.observed_at,json.dumps(snapshot.payload())))
+
+    def latest_snapshot(self, venue, account):
+        with self.lock:
+            row = self.db.execute("SELECT payload FROM snapshots WHERE venue=? AND account=? ORDER BY id DESC LIMIT 1",
+                                  (venue,account)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def all_operations(self):
+        with self.lock:
+            ids = [r[0] for r in self.db.execute("SELECT id FROM operations ORDER BY created")]
+        return [self.operation(op) for op in ids]
+
+    def baseline_count(self, op):
+        with self.lock:
+            return self.db.execute("SELECT count(*) FROM baselines WHERE operation_id=?", (op,)).fetchone()[0]
+
+    def fill_total(self, leg_id):
+        with self.lock:
+            return sum((Decimal(r[0]) for r in self.db.execute("SELECT qty FROM fills WHERE leg_id=?", (leg_id,))),Decimal(0))
+
+    def start_reconcile(self):
+        job = uuid.uuid4().hex
+        with self.transaction() as db:
+            db.execute("INSERT INTO reconcile_jobs(id,created,status) VALUES(?,?,'RUNNING')", (job,time.time()))
+        return job
+
+    def finish_reconcile(self, job, result):
+        with self.transaction() as db:
+            db.execute("UPDATE reconcile_jobs SET status=?,result=? WHERE id=?",
+                       ("COMPLETE" if result["ok"] else "BLOCKED",json.dumps(result),job))
+
+    def settle_verified(self, versions):
+        """Recovery coordinator supplies evidence; CAS rejects interleaved changes."""
+        with self.transaction() as db:
+            for leg_id, version in versions.items():
+                row = db.execute("SELECT version,outcome FROM legs WHERE id=?", (leg_id,)).fetchone()
+                if not row or row["version"] != version or row["outcome"] not in TERMINAL:
+                    raise EvidenceConflict("order changed during position reconciliation")
+            rows = list(db.execute("SELECT id FROM operations WHERE state NOT IN ('SETTLED','ABORTED')"))
+            for row in rows:
+                actual = {r[0] for r in db.execute("SELECT id FROM legs WHERE operation_id=?", (row[0],))}
+                if not actual <= versions.keys(): raise EvidenceConflict("missing reconciliation legs")
+                db.execute("UPDATE operations SET state='SETTLED',updated=? WHERE id=?", (time.time(),row[0]))
+                db.execute("UPDATE legs SET reservation='0' WHERE operation_id=?", (row[0],))
+                self._event(db,row[0],None,"POSITIONS_AND_FILLS_RECONCILED")

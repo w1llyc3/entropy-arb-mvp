@@ -21,7 +21,8 @@ class ExchangeState:
 class FakeVenue:
     is_simulation = True
     def __init__(self, state=None, *, fault=None, fill_fraction=Decimal(1),
-                 query_lag=0):
+                 query_lag=0, venue="entropy", account="fake-account-e"):
+        self.venue,self.account=venue,account
         self.state = state if state is not None else ExchangeState()
         self.fault = fault
         self.fill_fraction = fill_fraction
@@ -68,3 +69,16 @@ class FakeVenue:
 
     def repeated_events(self):
         return self.state.events + self.state.events[::-1] + self.state.events
+
+    async def fetch_snapshot(self):
+        import time
+        from entropy_arb.account_state import AccountSnapshot
+        return AccountSnapshot(self.venue,self.account,self.state.position,Decimal(1000),time.time(),True,
+                               settled_through=time.time(),sequence=self.state.accepted)
+
+    async def query_fills(self, client_id):
+        from entropy_arb.account_state import TradeFill
+        intent=self.state.intents.get(client_id)
+        fee_bps=Decimal(".9") if self.venue=="entropy" else Decimal(0)
+        return [TradeFill(client_id,key,report.filled,intent.limit_px,report.filled*intent.limit_px*fee_bps/10000)
+                for key,report in self.state.events if report.client_id==client_id]
