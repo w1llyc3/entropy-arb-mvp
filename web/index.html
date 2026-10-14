@@ -427,7 +427,10 @@
           <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
             <label>研究资产 <select id="research-symbol" aria-label="研究资产"></select></label>
             <label>时间 <select id="research-hours" aria-label="图表时间范围"><option value="24">24 小时</option><option value="72">3 天</option><option value="168">7 天</option><option value="0">全部</option></select></label>
+            <label>时区 <select id="chart-timezone" aria-label="图表时区"><option value="Asia/Shanghai">北京时间 UTC+8</option><option value="America/New_York">美股时间（美东 ET）</option></select></label>
           </div>
+          <p class="hint" id="chart-session-legend">美股参考时段（NYSE/Arca）：<span style="color:#d2af64">■ 盘前</span> · <span style="color:#55a883">■ 常规交易</span> · <span style="color:#7fa1db">■ 盘后</span> · <span style="color:#a1a1aa">■ 隔夜 / 周末 / 节假日</span>。美东自动处理夏令时；时段不代表永续合约开闭市。</p>
+          <p class="hint">标准美东时段：盘前 04:00–09:30 · 常规 09:30–16:00 · 盘后 16:00–20:00。2026–2028 节假日与提前收盘按已核对日历标注，其他年份显示“日历未验证”；临时休市、个股停牌不在此参考日历内。</p>
           <div class="idline" id="basis-sub">正在读取 logs/minutes.csv</div>
         </div>
       </div>
@@ -716,6 +719,7 @@
   </div>
 </div>
 
+<script src="/assets/chart-time.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 let lastProposalId = null;
@@ -959,8 +963,8 @@ function render(s) {
   $("open-create").textContent = task ? "修改参数" : "创建套利任务";
 
   const rth = $("rth-pill");
-  rth.textContent = s.rth ? "RTH 交易时段" : "非 RTH";
-  rth.className = "pill " + (s.rth ? "ok" : "warn");
+  rth.textContent = s.display_session ? "美股参考 · " + s.display_session.label : (s.rth ? "RTH 交易时段" : "非 RTH");
+  rth.className = "pill " + ((s.display_session ? s.display_session.key === "regular" : s.rth) ? "ok" : "warn");
 
   const rec = s.reconcile;
   $("stat-rec").textContent = rec ? "1" : "0";
@@ -1361,6 +1365,14 @@ let basisLayout = null;
 let researchSymbol = "SNDK";
 let researchHours = 24;
 let researchCharts = [];
+let chartTimezone = "Asia/Shanghai";
+try {
+  const saved = localStorage.getItem("entropy.chart.timezone");
+  if (ChartTime.ZONES.includes(saved)) chartTimezone = saved;
+} catch (_) { /* Storage-disabled browsers still support switching. */ }
+$("chart-timezone").value = chartTimezone;
+const SESSION_COLORS = {pre:"#e6d1a5",regular:"#a9d6c2",post:"#b8cbef",overnight:"#e4e4e7",
+  weekend:"#cbd5e1",holiday:"#fecaca",unknown:"#edc9ee"};
 
 function describeBasis(data) {
   if (!data) return "分钟数据未就绪";
@@ -1375,7 +1387,7 @@ function describeBasis(data) {
     return data.entropy_label + (data.paired ? " ↔ " + data.hedge_label : " · 无对冲市场，只记录单边")
       + " · " + n + " 根分钟 · " + range + " · 观测段采样覆盖 " + coverage
       + (s.requested_window_coverage_fraction == null ? "" : " · 所选窗口覆盖 " + (s.requested_window_coverage_fraction * 100).toFixed(2) + "%")
-      + " · 最新 " + age;
+      + " · 最新 " + age + " · " + ChartTime.zoneLabel(chartTimezone);
   }
   const bands = data.bands || {};
   const marks = (data.markers || []).length;
@@ -1424,14 +1436,8 @@ function fmtBps(v) {
   return sign + n.toFixed(digits);
 }
 
-const BASIS_WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 function fmtClock(ts) {
-  const d = new Date(ts * 1000);
-  let h = d.getUTCHours();
-  const am = h < 12 ? "AM" : "PM";
-  h = h % 12 || 12;
-  const m = String(d.getUTCMinutes()).padStart(2, "0");
-  return BASIS_WD[d.getUTCDay()] + " " + h + ":" + m + " " + am;
+  return ChartTime.format(ts,chartTimezone);
 }
 
 function wrapFill(ctx, text, x, y, maxW, lineH) {
@@ -1510,7 +1516,7 @@ function drawBasis(canvasId = "basis-chart", payload = basisPayload) {
 
   const plotL = 64;
   const plotR = w - 58;
-  const plotT = 34;
+  const plotT = 54;
   const plotB = h - 28;
   const prices = [];
   const basisVals = [0];
@@ -1545,6 +1551,22 @@ function drawBasis(canvasId = "basis-chart", payload = basisPayload) {
   const yPx = (v) => plotT + ((pHi - v) / (pHi - pLo)) * (plotB - plotT);
   const yBps = (v) => plotT + ((bHi - v) / (bHi - bLo)) * (plotB - plotT);
   const yZero = yBps(0);
+
+  // A separate strip keeps market sessions visible behind either sign of
+  // the basis shading. Epoch positions stay identical when zones change.
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  for (const segment of data.session_segments || []) {
+    const x0 = Math.max(plotL,xOf(Number(segment.start)));
+    const x1 = Math.min(plotR,xOf(Number(segment.end)));
+    if (x1 <= x0) continue;
+    ctx.fillStyle = SESSION_COLORS[segment.key] || SESSION_COLORS.unknown;
+    ctx.fillRect(x0,30,x1-x0,13);
+    const label = segment.label || "";
+    if (ctx.measureText(label).width + 8 < x1-x0) {
+      ctx.fillStyle = "#394150";
+      ctx.fillText(label,(x0+x1-ctx.measureText(label).width)/2,40);
+    }
+  }
 
   ctx.save();
   ctx.beginPath();
@@ -1730,7 +1752,9 @@ function basisTip(ev) {
   const kind = best.basis_bps >= 0 ? "basis ≥ 0" : "basis < 0";
   tip.replaceChildren();
   const lines = [
-    fmtClock(Number(best.minute_ts)) + " UTC",
+    ChartTime.format(Number(best.minute_ts),chartTimezone,true),
+    ChartTime.format(Number(best.minute_ts),chartTimezone === "Asia/Shanghai" ? "America/New_York" : "Asia/Shanghai",true),
+    "美股参考：" + ((best.session || {}).label || "日历未验证"),
     "Entropy " + fmtUsd(best.entropy_usd),
     best.hedge_usd == null ? "无对冲价格" : "Lighter " + fmtUsd(best.hedge_usd),
     best.basis_bps == null ? "无双边 bp" : "basis " + fmtBps(best.basis_bps) + " · " + kind,
@@ -1849,6 +1873,17 @@ $("research-symbol").addEventListener("change", () => {
 });
 $("research-hours").addEventListener("change", () => {
   researchHours = Number($("research-hours").value); refreshBasis(); refreshResearch();
+});
+$("chart-timezone").addEventListener("change", () => {
+  chartTimezone = $("chart-timezone").value;
+  try { localStorage.setItem("entropy.chart.timezone",chartTimezone); } catch (_) {}
+  $("basis-tip").hidden = true;
+  $("basis-sub").textContent = describeBasis(basisPayload);
+  drawBasis();
+  for (const chart of researchCharts) {
+    $("research-sub-" + chart.symbol).textContent = describeBasis(chart);
+    drawBasis("research-chart-" + chart.symbol,chart);
+  }
 });
 if (window.ResizeObserver) new ResizeObserver(() => {
   for (const chart of researchCharts) drawBasis("research-chart-" + chart.symbol,chart);

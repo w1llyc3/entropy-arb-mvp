@@ -4,6 +4,7 @@
 > [当前交付、运行方法和未验证边界](P3_P4_DELIVERY.md)。旧文档中的实盘命令暂不适用。
 > 暂停只停采样与提案，行情和对账继续；停止不清仓。旧采集元数据需人工核查，服务不自动接管。
 > 新增十个 Entropy 资产的固定清单行情采集及价格/bp 图，交易范围仍仅 SNDK，实盘关闭。见[多资产研究说明](MULTI_ASSET_RECORD_ONLY.md)。
+> 图表支持[北京时间 / 美东时间切换及参考盘段](CHART_TIMEZONES.md)，自动处理夏令时。
 
 **[English documentation / 英文文档 → README.md](README.md)**
 
