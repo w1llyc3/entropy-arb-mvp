@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 
-from web.panel import app
+from web.panel import app,create_app
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -21,11 +21,15 @@ def main(argv=None) -> None:
         description="Localhost panel for the SNDK Entropy ↔ Lighter probe")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"loopback port (default {DEFAULT_PORT})")
+    parser.add_argument("--hl-account",default=None,help="public master account address; no private key")
+    parser.add_argument("--lighter-account-index",default=None,help="public account index; no API key")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     import uvicorn
-    uvicorn.run(app, host=HOST, port=args.port, log_level="info")
+    target=(create_app(public_accounts=dict(entropy=args.hl_account,lighter=args.lighter_account_index))
+            if args.hl_account or args.lighter_account_index else app)
+    uvicorn.run(target, host=HOST, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

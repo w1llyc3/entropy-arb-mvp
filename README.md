@@ -1,9 +1,9 @@
 # entropy-arb
 
-> P1 reliability work: CLI defaults to RECORD_ONLY; `--live` and the default web executor
-> refuse real submission until durable execution/recovery are accepted. Historical live
-> commands below are not active. Trading code remains available for offline fake tests.
-> Pause suspends sampling, not feeds. Stop requests cooperative shutdown before termination.
+> P3/P4: CLI and web now share a persistent SQLite service. Default RECORD_ONLY;
+> real submission stays disabled. Historical live commands below are not active.
+> [Current delivery, safe startup and validation limits](P3_P4_DELIVERY.md).
+> Pause suspends sampling, not feeds or reconciliation; stop never liquidates positions.
 
 **[中文文档 / Chinese documentation → README.zh-CN.md](README.zh-CN.md)**
 

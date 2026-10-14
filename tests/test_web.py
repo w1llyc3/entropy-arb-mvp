@@ -300,7 +300,7 @@ BUY entropy net p50: +3.10 bps
 def test_panel_pages_and_routes(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     app = create_app(tmp_path)
     paths = {getattr(route, "path", None) for route in app.routes}
@@ -363,7 +363,7 @@ def test_panel_pages_and_routes(tmp_path):
 def test_http_start_normalizes_inputs_and_stop_cleans_up(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     app = create_app(tmp_path, command_builder=_sleep_builder)
     pid = None
@@ -403,7 +403,7 @@ def test_http_start_normalizes_inputs_and_stop_cleans_up(tmp_path):
 def test_http_start_uses_the_record_only_command(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     app = create_app(tmp_path)
     captured = {}
@@ -433,7 +433,7 @@ def test_http_start_uses_the_record_only_command(tmp_path, monkeypatch):
 def test_http_analyze_shows_labeled_gates(tmp_path):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     root = _linked_repo(tmp_path)
     app = create_app(root)
@@ -717,7 +717,7 @@ def test_stop_on_windows_clears_meta_without_killpg(monkeypatch, tmp_path):
 def test_status_survives_recorder_snapshot_failure(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from web.panel import create_app
+    from web.panel import create_legacy_test_app as create_app
 
     app = create_app(tmp_path)
 

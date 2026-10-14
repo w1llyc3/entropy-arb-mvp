@@ -333,6 +333,7 @@
   </div>
 </header>
 <main>
+  <p class="hint" id="service-line">服务正在连接；真实交易保持关闭。</p>
   <section class="stats">
     <article class="stat">
       <div class="k">任务状态</div>
@@ -512,7 +513,7 @@
       </div>
       <p class="hint" id="contrast-line">Contrast (not Gate ids): SELL entropy net p50 — · BUY entropy net p50 —</p>
       <pre id="analyze-out" hidden></pre>
-      <p class="hint">确认入队不会向交易所发单。自动确认默认关闭；打开后门槛是往返约 1.8 bps，不是单边 0.9，且非 RTH 不会自动强制发单。对账只记请求。RTH 为美东周一至周五 09:30–16:00，不含假日。CLI 实盘仍是 <span class="mono">python main.py --symbol SNDK --hedge lighter</span>。</p>
+      <p class="hint">当前服务为 RECORD_ONLY，真实下单未开放。自动确认仅在离线模拟测试中运行，默认关闭；往返费用假设约 1.8 bps，非 RTH 不自动强制确认。对账查询订单、成交和仓位，证据不完整会保持闭锁。RTH 为美东周一至周五 09:30–16:00，尚未接入节假日日历。CLI 同样只记录。</p>
     </div>
   </section>
 </main>
@@ -587,7 +588,7 @@
       </div>
       <div class="modes" role="group" aria-label="模式">
         <button type="button" class="on" id="mode-record" data-mode="record">只记录</button>
-        <button type="button" id="mode-live" data-mode="live">探针实盘</button>
+        <button type="button" id="mode-live" data-mode="live" disabled title="真实交易尚未开放">探针实盘（未开放）</button>
       </div>
       <div class="checks">
         <label><input id="f-confirm" type="checkbox" checked> 需要人工确认</label>
@@ -622,7 +623,7 @@
           <input id="f-safety" type="number" step="0.05" min="0.05" max="1" value="0.8">
         </div>
       </div>
-      <p class="hint">现金模式单笔至少 $10.50，动态上限是较小可用 × 0.9。余额未读到不发明上限。保证金模式用可用保证金 × 杠杆 × 安全系数，再被单笔硬顶截断。10× 逐仓时，约 $11 名义锁约 $1.11 保证金。杠杆或保证金读不到就拒绝，不会改用现金名义。Entropy 可用取现货 USDC。实盘武装后，时段边界且两边空仓才会切换中枢。</p>
+      <p class="hint">当前仅支持 SNDK Entropy/Lighter 的只读采集。缺失账户数据不会当作零仓位。旧保证金、杠杆与时段中枢设置保留供后续迁移，本阶段服务不使用这些设置授权真实交易；离线模拟使用保守现金上限。</p>
       <div class="warn-line" id="form-warn" hidden>会偏离 Decision Card</div>
     </section>
     <div class="foot">
@@ -667,7 +668,7 @@
     </div>
     <div class="warn-line" id="c-auto" hidden></div>
     <p class="hint" id="c-block" hidden></p>
-    <p class="hint" id="c-foot">确认会通过实盘引擎同时发送两腿。平仓为两边只减仓。非 RTH 必须再点一次「强制确认」，自动确认不会代点。取消则不下单。中枢不会随时段自动改变。平仓规则：溢价回到带宽内（含边界）并持续 3 秒，不是碰到中枢才平。</p>
+    <p class="hint" id="c-foot">真实确认未开放。离线模拟中，两腿共享持久化操作与稳定 ID，平仓只减仓；非 RTH 必须再次「强制确认」。取消则不下单。中枢不会随时段自动改变。回归平仓需溢价回到带宽内（含边界）并持续 3 秒。</p>
     <div class="foot">
       <button class="ghost" type="button" id="c-cancel">取消</button>
       <button class="primary" type="button" id="c-ok">确认</button>
@@ -696,7 +697,7 @@
       <tbody id="flatten-legs"></tbody>
     </table>
     <p class="hint" id="flatten-partial" hidden>另一边持仓没有读到，不会替它编一个数量。</p>
-    <p class="hint" id="flatten-foot">确认后走实盘引擎，reduce-only。单腿失败会 HALT。两边都平掉才会解除已有的 HALT。取消则不下单。</p>
+    <p class="hint" id="flatten-foot">真实清仓未开放。离线模拟仅允许减少经过订单、成交与仓位对账确认的系统仓位，不接管外部仓位。结果未知会闭锁，只有重新查询验证成功才恢复。</p>
     <div class="foot">
       <button class="ghost" type="button" id="flatten-cancel">取消</button>
       <button class="danger" type="button" id="flatten-ok">确认清仓</button>
@@ -898,6 +899,10 @@ function showConfirm(payload) {
 }
 
 function render(s) {
+  if ($("service-line")) $("service-line").textContent =
+    "服务 " + dash(s.service_state) + " · " + dash(s.mode) +
+    " · 未解订单 " + dash((s.metrics || {}).unknown_legs) +
+    " · " + dash(s.recovery_reason);
   const task = s.task;
   const label = s.status_label || "已停止";
   setStatus($("task-status"), label);
@@ -949,7 +954,7 @@ function render(s) {
   const rec = s.reconcile;
   $("stat-rec").textContent = rec ? "1" : "0";
   $("stat-rec-d").textContent = rec
-    ? ("已记录 · 未上链")
+    ? ((rec.ok ? "查询验证通过" : "对账闭锁") + " · 查询 " + dash(rec.query_count))
     : "尚未对账";
   const pending = !!(s.proposal);
   $("stat-q").textContent = pending ? "1" : "0";
@@ -1045,7 +1050,7 @@ function render(s) {
 function applyFlatten(offer) {
   const open = !!(offer && offer.available);
   $("btn-flatten").hidden = !open;
-  $("btn-flatten").disabled = !!(offer && offer.busy);
+  $("btn-flatten").disabled = !!(offer && (offer.busy || !offer.confirm_enabled));
   const note = $("flatten-note");
   if (open) {
     note.hidden = false;
@@ -1220,6 +1225,7 @@ $("flatten-ok").addEventListener("click", async () => {
     const result = await post("/api/flatten", {
       confirm: true,
       proposal_id: proposalId,
+      idempotency_key: "flatten:" + proposalId,
     });
     const note = result.sent
       ? (result.halted ? "单腿未平，已 HALT" : "清仓已提交")
@@ -1236,7 +1242,7 @@ $("flatten-ok").addEventListener("click", async () => {
 $("btn-recon").addEventListener("click", async () => {
   try {
     const body = await post("/api/reconcile");
-    $("stat-rec-d").textContent = body.gap || "已记录";
+    $("stat-rec-d").textContent = body.reason || body.gap || "已完成只读查询";
   } catch (err) {
     alert(err.message);
   }
@@ -1252,6 +1258,7 @@ $("confirm-x").addEventListener("click", () => { $("confirm-modal").hidden = tru
 $("c-ok").addEventListener("click", async () => {
   if (!lastPayload || $("c-ok").disabled) return;
   const body = Object.assign({}, lastPayload);
+  body.idempotency_key = "confirm:" + body.proposal_id;
   if ($("c-ok").textContent === "强制确认") body.force_confirm = true;
   $("c-ok").disabled = true;
   try {

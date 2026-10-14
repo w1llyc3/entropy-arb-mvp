@@ -1,4 +1,28 @@
-# Acceptance Criteria — Proposed, Not Yet Passed
+# Acceptance Criteria — Evidence and Remaining Gates
+
+## P3/P4 离线验证（2026-10-14）
+
+本段为实现证据；后续原始 AC 是最终验收目标，不代表全部已通过。默认真实发送仍关闭，具体边界见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)。
+
+- AC01：test_service 的同目录/跨目录账户锁、legacy 元数据拒绝接管、外部净零仓位拒绝接管；test_ownership 在实际 Windows 子进程 `os._exit` 后验证 OS 锁释放；test_service_api 真实默认 factory 禁止凭据读取及 live/flatten。
+- AC02–04：保留 P2 的线程/多进程幂等及五个进程终止窗口；新测 20 次并发确认、HTTP 重试、客户端取消、丢 ACK 后只查询同 ID、两次重启保持 NOT_SENT。
+- AC05–06：新测部分成交闭锁、人工模拟 reduce-only、外部仓位/挂单、缺逐笔成交、序列倒退、过期快照、缺失/NaN 结算水位均不能解除恢复门槛；保留 P2 的乱序、重复/矛盾成交测试。
+- API/调度：真实默认 factory 的 1000 次 GET 零下单副作用；fake 自动开仓再回归平仓全程无浏览器请求；pause 仍对账；重启恢复采集；cleanup 异常释放 owner；非 RTH 首次确认状态经刷新保留。
+- 数据：HL 按 client ID/oid/coin/tid 关联 fixture，Lighter symbol→market_id fixture 且明确 incomplete；心跳不掩盖旧盘口。
+
+最终命令：
+
+```powershell
+.\.venv-audit\Scripts\python.exe -m pytest tests -q --basetemp=.venv-audit/p34-final-cli --tb=short
+```
+
+Windows / Python 3.12.10；无实盘 SDK、真实账户、私钥和订单。POSIX flock 分支在 Windows 跳过，Starlette/httpx 既有弃用提示单独记录。
+
+最终结果：**223 passed、1 skipped、1 warning，20.38 秒**。相对 P2 的 195 passed，新增 28 项 P3/P4 离线测试，包含 CLI 已恢复采集时不重复 start 的回归。代码测试通过后仅补充文档与 PR 信息。
+
+**Requires Runtime Validation**：真实交易所契约/精度/资金费/结算最终性、24h soak、硬件断电、Windows 睡眠唤醒、浏览器人工视觉验收、真实旧账户迁移。以上不得以 fake 或本轮 pytest 替代。
+
+以下保留原验收规格。
 
 基线 `45d1d1f`，Phase 1 本地 Entropy ↔ Lighter SNDK。以下是未来实现验收，不是本轮已通过声明。本轮结果见 CURRENT_STATE_AUDIT.md。
 

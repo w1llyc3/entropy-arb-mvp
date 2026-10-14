@@ -1,3 +1,9 @@
+# P3/P4 交付状态（2026-10-14）
+
+用户已授权实施至 P4。持久化单 owner service、SQLite v2、共享命令/风险/恢复、薄 API、CLI、后台模拟自动开平仓及现有网页接入已实现。默认 RECORD_ONLY，无真实签名或下单路径。参见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)。
+
+真实适配器恢复完整性与 live 启用条件尚未满足，P5 迁移验收、长期稳定性及 Windows 睡眠/断电验证仍待执行。原 PRD 目标是最终验收要求，不能作为已完成声明。
+
 # Reliability Refactor PRD — Phase 1
 
 状态：待用户确认；基线 `45d1d1f`。本文件描述目标，不描述已实现能力。证据见 CURRENT_STATE_AUDIT.md。

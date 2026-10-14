@@ -158,6 +158,8 @@ class FundingPoller:
             self._note_failure(label, book, err or "endpoint returned no numeric funding")
             return
         book.funding = rate
+        import time
+        book.funding_observed_ts = time.time()
         key = ("ok", rate)
         if self._announced.get(label) != key:
             log.info("%s funding %.8g", label, rate)

@@ -99,7 +99,7 @@ def test_cli_defaults_record_only(monkeypatch):
     monkeypatch.setattr(main, "load_config", load)
     monkeypatch.setattr(main, "setup_logging", lambda *a, **kw: None)
     async def run(*a, **kw): assert kw["record_only"] is True
-    monkeypatch.setattr(main, "amain", run)
+    monkeypatch.setattr(main, "run_service", run)
     main.main()
 
 
