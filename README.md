@@ -4,6 +4,8 @@
 > real submission stays disabled. Historical live commands below are not active.
 > [Current delivery, safe startup and validation limits](P3_P4_DELIVERY.md).
 > Pause suspends sampling, not feeds or reconciliation; stop never liquidates positions.
+> Added fixed-watchlist market recording and price/basis charts for ten Entropy assets;
+> execution remains SNDK-only and real sending disabled. [Research runbook](MULTI_ASSET_RECORD_ONLY.md).
 
 **[中文文档 / Chinese documentation → README.zh-CN.md](README.zh-CN.md)**
 

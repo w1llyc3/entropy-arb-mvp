@@ -1,5 +1,9 @@
 # Implementation Plan
 
+## P5 前新增研究阶段（2026-10-14）
+
+用户授权将截图中的十个资产接入 record-only，先采集并审查 bp 图，再开始 P5 合并。分支 `codex/multi-asset-record-only`，基于 P3/P4。见 [MULTI_ASSET_RECORD_ONLY.md](MULTI_ASSET_RECORD_ONLY.md)。扩大的是行情记录范围，未扩大执行 symbol、账户状态或真实下单权限；P5 仍未合并。
+
 ## P3/P4 实施记录（2026-10-14）
 
 用户已批准直接开发至 P4；分支 `impl/p3-p4-service` 基于 P2。当前实现和限制见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)，原始分阶段设计保留如下。实际落地采用增量迁移，保留旧模块为显式 legacy 测试入口，默认 CLI/Web 切换到新服务。

@@ -1,5 +1,9 @@
 # Acceptance Criteria — Evidence and Remaining Gates
 
+## 多资产研究增量（2026-10-14）
+
+固定十资产的 record-only 增量完整回归为 **248 passed、1 skipped、1 warning（20.54 秒）**，命令 basetemp 为 `.venv-audit/multi-final`。新增 25 项测试，另有真实公开盘口、Windows pause/resume/stop/重启及浏览器图表验证；详见 [MULTI_ASSET_RECORD_ONLY.md](MULTI_ASSET_RECORD_ONLY.md)。新增资产没有执行权限；P5 合并与实盘门槛不因本轮行情/图表通过而解除。
+
 ## P3/P4 离线验证（2026-10-14）
 
 本段为实现证据；后续原始 AC 是最终验收目标，不代表全部已通过。默认真实发送仍关闭，具体边界见 [P3_P4_DELIVERY.md](P3_P4_DELIVERY.md)。

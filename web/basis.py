@@ -476,7 +476,7 @@ def _basis_note(points: list, markers: list, source: Optional[str],
 
 
 def build_basis(root: Path, hours: float = 0.0, now: Optional[float] = None,
-                csv_rel: Optional[str] = None) -> dict:
+                csv_rel: Optional[str] = None, include_markers: bool = True) -> dict:
     """Series, bands, and markers for the panel chart and the PNG tool."""
     root = Path(root)
     if csv_rel is None:
@@ -498,7 +498,7 @@ def build_basis(root: Path, hours: float = 0.0, now: Optional[float] = None,
         payload = _empty_payload(
             root, csv_rel=rel, csv_exists=False, error=None,
             header_only=False, missing=list(REQUIRED_COLUMNS))
-        payload["markers"], payload["marker_source"] = load_markers(root)
+        if include_markers: payload["markers"], payload["marker_source"] = load_markers(root)
         return payload
     try:
         parsed = parse_minutes(path)
@@ -522,7 +522,7 @@ def build_basis(root: Path, hours: float = 0.0, now: Optional[float] = None,
     if truncated:
         points = points[-MAX_POINTS:]
 
-    markers, source = load_markers(root)
+    markers, source = load_markers(root) if include_markers else ([],None)
     if cutoff is not None:
         markers = [m for m in markers if m["ts"] >= cutoff]
     if points:

@@ -30,6 +30,8 @@ class PublicCollector:
         self.root=Path(root); self.engine=None; self.task=None
         self.config=config
         self.flag=self.root/".web"/"collector.pause"
+        from .research_recorder import ResearchCollector
+        self.research=ResearchCollector(self.root,self.flag)
 
     @property
     def books(self):
@@ -48,6 +50,7 @@ class PublicCollector:
         self.engine=Engine(cfg,record_only=True)
         self.engine.record_pause_file=str(self.flag)
         self.task=asyncio.create_task(self.engine.run(),name="public-collector")
+        self.research.start()
 
     def pause(self, enabled):
         if enabled:
@@ -55,6 +58,7 @@ class PublicCollector:
         else: self.flag.unlink(missing_ok=True)
 
     async def close(self):
+        await self.research.close()
         if not self.task: return
         if self.engine: self.engine.request_stop()
         try: await asyncio.wait_for(asyncio.shield(self.task),15)
@@ -458,7 +462,8 @@ class TradingService:
             reconcile=self.ledger.get_setting("last_reconcile") if self.ledger else None,last_order=self.last_order,
             warnings=[] if self.recovered else [self.reason],flatten=self.flatten_offer(),rth=self._in_rth(),
             fee_check=dict(assumed_bps=.9,actual_bps=self._measured_fee() if self.ledger else None,
-                           mismatch=self._fee_mismatch() if self.ledger else False),edge=self._edge())
+                           mismatch=self._fee_mismatch() if self.ledger else False),edge=self._edge(),
+            research=(self.collector.research.status(self.collector.books) if getattr(self.collector,"research",None) else None))
 
     def _edge(self):
         e,h=self.books.get("entropy"),self.books.get("lighter")
