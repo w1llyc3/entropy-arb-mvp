@@ -7,6 +7,7 @@ import time
 
 from entropy_arb.watchlist import ASSETS,asset_for
 from web.basis import build_basis,MAX_POINTS
+from web.market_sessions import annotate
 
 
 def finite(value):
@@ -113,4 +114,4 @@ def build_research_basis(root,symbol="SNDK",hours=0,now=None):
         summary=stats,
         formula="(Entropy mid / hedge mid - 1) × 10000",
         research_warning="价格差不是净收益：未扣手续费、资金费与滑点；合约标的/结算条款尚未核验。")
-    return payload
+    return annotate(payload)

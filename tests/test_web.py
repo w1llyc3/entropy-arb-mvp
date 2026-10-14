@@ -318,8 +318,11 @@ def test_panel_pages_and_routes(tmp_path):
         assert "手动清仓" in html
         assert 'id="btn-flatten"' in html
         assert 'id="flatten-modal"' in html
-        assert html.count("<script") == 1
-        assert html.count("</script>") == 1
+        # One local, unit-tested clock helper plus the existing UI script.
+        assert html.count("<script") == 2
+        assert html.count("</script>") == 2
+        assert '<script src="/assets/chart-time.js"></script>' in html
+        assert '<script src="https://' not in html
         assert "async function refreshBasis" in html
         assert "/api/basis" in html
         assert "force_start_outside_rth" in html

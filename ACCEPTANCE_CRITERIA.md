@@ -1,5 +1,9 @@
 # Acceptance Criteria — Evidence and Remaining Gates
 
+## 时区与盘段展示（2026-10-14）
+
+完整 Python 回归 **273 passed、1 skipped、1 既有 warning**；新增 25 项日历/API 测试。Node 时钟测试 **7 passed**，覆盖夏令时与跨日。浏览器已验证双时区切换/记忆、全图同步和实际参考盘段，见 [CHART_TIMEZONES.md](CHART_TIMEZONES.md)。UTC/价格/bp 与执行门槛未改变；展示日历不能作为 P5 或 live 验收证据。
+
 ## 多资产研究增量（2026-10-14）
 
 固定十资产的 record-only 增量完整回归为 **248 passed、1 skipped、1 warning（20.54 秒）**，命令 basetemp 为 `.venv-audit/multi-final`。新增 25 项测试，另有真实公开盘口、Windows pause/resume/stop/重启及浏览器图表验证；详见 [MULTI_ASSET_RECORD_ONLY.md](MULTI_ASSET_RECORD_ONLY.md)。新增资产没有执行权限；P5 合并与实盘门槛不因本轮行情/图表通过而解除。

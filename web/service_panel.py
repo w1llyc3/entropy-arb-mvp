@@ -5,7 +5,7 @@ import asyncio
 import time
 
 from fastapi import FastAPI,Body,HTTPException
-from fastapi.responses import HTMLResponse,JSONResponse
+from fastapi.responses import HTMLResponse,JSONResponse,FileResponse
 
 from entropy_arb.service import TradingService,ServiceError
 from entropy_arb.risk import RiskRejected
@@ -14,6 +14,7 @@ from web.basis import build_basis
 from web.report import assemble_status,run_analyze
 from web.probe import decision_defaults
 from web.research_basis import build_research_basis,catalog
+from web.market_sessions import classify
 
 
 def create_app(root=None, *, public_accounts=None, service=None):
@@ -49,7 +50,12 @@ def create_app(root=None, *, public_accounts=None, service=None):
         # CSV is historical display only: it cannot arm, confirm or reconcile.
         history=await asyncio.to_thread(assemble_status,root,
             dict(running=snapshot.get("running",False),warnings=[],pid=snapshot.get("pid")))
-        return JSONResponse(dict(history,**snapshot),headers={"Cache-Control":"no-store"})
+        return JSONResponse(dict(history,**snapshot,display_session=classify(time.time())),headers={"Cache-Control":"no-store"})
+
+    @app.get("/assets/chart-time.js")
+    async def chart_time_script():
+        return FileResponse(Path(__file__).with_name("chart_time.js"),media_type="text/javascript",
+                            headers={"Cache-Control":"no-store"})
 
     @app.get("/api/probe")
     async def defaults(): return decision_defaults()
