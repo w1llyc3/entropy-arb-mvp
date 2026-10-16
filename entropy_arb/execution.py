@@ -1,7 +1,8 @@
-"""P2 fake-only durable dispatcher. Production paths remain RECORD_ONLY.
+"""Shared durable transport mechanics; default production remains RECORD_ONLY.
 
-Recovery here queries orders only. Position/fill reconciliation and live
-integration are deliberately left to P3; no local report unlocks trading.
+OfflineExecutor accepts simulation venues only. The isolated operator test
+uses ManualLiveExecutor with independent review/size/account gates. Recovery
+here queries orders only; no local report unlocks automatic trading.
 """
 import asyncio
 from decimal import Decimal
@@ -9,10 +10,8 @@ from decimal import Decimal
 from .execution_contract import OrderIntent, OrderReport, OrderState, submission_exception
 
 
-class OfflineExecutor:
+class DurableDispatcher:
     def __init__(self, ledger, venues, *, allow_submit=False, hook=None):
-        if not venues or any(getattr(v, "is_simulation", False) is not True for v in venues.values()):
-            raise ValueError("offline simulation venues required; no live adapters")
         self.ledger, self.venues = ledger, venues
         self.allow_submit = allow_submit
         self.hook = hook or (lambda stage, value: None)
@@ -27,7 +26,7 @@ class OfflineExecutor:
         if not self.allow_submit:
             return op  # Default RECORD_ONLY, including synthetic transport.
         if any(leg["venue"] not in self.venues for leg in op["legs"]):
-            raise ValueError("missing simulation venue")
+            raise ValueError("missing execution venue")
         if not self.ledger.claim(operation_id):
             return self.ledger.operation(operation_id)  # Never resend a claimed operation.
         self.hook("after_claim", operation_id)
@@ -70,7 +69,7 @@ class OfflineExecutor:
         return results
 
     async def cancel(self, key, leg_id, *, timeout=5):
-        """Fake-only, durable single-attempt cancel; acknowledgement never settles."""
+        """Durable single-attempt cancel; acknowledgement never settles."""
         if not self.allow_submit:
             raise ValueError("RECORD_ONLY: cancellation disabled")
         self.ledger.prepare_cancel(key, leg_id)
@@ -94,3 +93,10 @@ class OfflineExecutor:
         self.ledger.save_report(leg_id, report)
         self.ledger.verify_cancellations(leg_id)
         return self.ledger.cancellation(key)
+
+
+class OfflineExecutor(DurableDispatcher):
+    def __init__(self,ledger,venues,*,allow_submit=False,hook=None):
+        if not venues or any(getattr(v,'is_simulation',False) is not True for v in venues.values()):
+            raise ValueError('offline simulation venues required; no live adapters')
+        super().__init__(ledger,venues,allow_submit=allow_submit,hook=hook)

@@ -44,3 +44,9 @@ class OwnerLock:
                 fcntl.flock(self.handle, fcntl.LOCK_UN)
         finally:
             self.handle.close(); self.handle = None
+
+
+def account_locks(accounts,directory=None):
+    """Lock each venue/account, not only a pair (pairs may overlap one leg)."""
+    return [OwnerLock(dict(venue=name,account=account,market='SNDK',deployment='io/lighter-mainnet'),directory)
+            for name,account in sorted(accounts.items()) if account!='unconfigured']

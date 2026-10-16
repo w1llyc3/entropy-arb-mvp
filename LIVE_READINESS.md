@@ -1,6 +1,13 @@
 # P5 execution readiness — 2026-10-16
 
-**Release decision: NOT READY for real orders. Default remains RECORD_ONLY.**
+**Release decision: automatic live execution remains NOT READY. Default remains RECORD_ONLY.**
+
+The follow-up branch `codex/live-adapter-review` adds isolated, opt-in manual
+SNDK contract-test adapters/commands. See `MANUAL_LIVE_TEST.md`. This is a code
+candidate for user review, not proof of real account validation. The user will
+populate env and run manual tests; Codex has not accessed those credentials or
+sent real orders. The historical P5-preparation results below describe the
+preceding increment and must not be read as authentication/settlement evidence.
 
 This branch is a P5 preparation increment, not completion of P5. It does not
 load private keys, install signing SDKs, enable real submission/cancellation,
