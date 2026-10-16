@@ -30,6 +30,7 @@ class FakeVenue:
             raise ValueError("invalid fraction")
         self.query_lag = query_lag
         self.submit_calls = 0
+        self.cancel_calls = 0
 
     async def submit(self, intent: OrderIntent):
         self.submit_calls += 1
@@ -67,13 +68,23 @@ class FakeVenue:
         return self.state.reports.get(client_id) or OrderReport(
             client_id, OrderState.UNKNOWN, reason="not found; finality unproven")
 
+    async def cancel(self, client_id):
+        self.cancel_calls += 1
+        report = self.state.reports.get(client_id)
+        if report and report.state in (OrderState.OPEN, OrderState.PARTIAL):
+            self.state.reports[client_id] = OrderReport(client_id, OrderState.CANCELED,
+                                                      report.filled, True)
+        if self.fault == 'lose_cancel_ack':
+            raise TimeoutError('cancel accepted, response lost')
+
     def repeated_events(self):
         return self.state.events + self.state.events[::-1] + self.state.events
 
     async def fetch_snapshot(self):
         import time
         from entropy_arb.account_state import AccountSnapshot
-        return AccountSnapshot(self.venue,self.account,self.state.position,Decimal(1000),time.time(),True,
+        orders = tuple(k for k,r in self.state.reports.items() if r.state in (OrderState.OPEN,OrderState.PARTIAL))
+        return AccountSnapshot(self.venue,self.account,self.state.position,Decimal(1000),time.time(),True,orders,
                                settled_through=time.time(),sequence=self.state.accepted)
 
     async def query_fills(self, client_id):

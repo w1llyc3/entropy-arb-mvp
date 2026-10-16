@@ -67,3 +67,10 @@ def submission_exception(client_id: str, exc: Exception) -> OrderReport:
 class ExecutionVenue(Protocol):
     async def submit(self, intent: OrderIntent) -> OrderReport: ...
     async def query(self, client_id: str) -> OrderReport: ...
+    async def cancel(self, client_id: str) -> None:
+        """Request cancellation only. An acknowledgement is NOT a final order report.
+
+        The caller must query the same order and its fills afterwards, including
+        when this request times out. Implementations must never replace an order.
+        """
+        ...

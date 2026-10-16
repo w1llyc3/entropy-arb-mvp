@@ -14,6 +14,7 @@ import uuid
 import aiohttp
 
 from .execution import OfflineExecutor
+from .continuity import ClockContinuity
 from .ownership import OwnerLock
 from .read_only import PublicAccountReader
 from .recovery import RecoveryCoordinator
@@ -78,6 +79,7 @@ class TradingService:
         index=self.public_accounts.get("lighter")
         if index is not None and str(index).isdigit(): self.public_accounts["lighter"]=str(int(index))
         self.simulation=simulation
+        self.continuity=ClockContinuity()
         if venues and not simulation: raise ValueError("injected execution venues require simulation mode")
         if simulation and (not venues or any(getattr(v,"is_simulation",False) is not True for v in venues.values())):
             raise ValueError("simulation requires fake venues")
@@ -158,6 +160,15 @@ class TradingService:
         while not self.closing or not self.queue.empty():
             try: item=await asyncio.wait_for(self.queue.get(),self.interval)
             except asyncio.TimeoutError: item=None
+            gap=self.continuity.observe()
+            if gap:
+                self.recovered=False; self.state='RECOVERING'; self.reason=gap; self.armed=None
+                for book in self.books.values(): book.clear()
+                self.ledger.cancel_proposal()
+                self.ledger.set_setting('last_continuity_fault',dict(reason=gap,ts=time.time()))
+                # Require fresh exchange snapshots before any queued command;
+                # old books were invalidated even if the wall clock moved back.
+                self.last_recovery=float('-inf')
             if item:
                 command,payload,future=item
                 try:
@@ -240,6 +251,8 @@ class TradingService:
         if command=="cancel":
             self.ledger.cancel_proposal(); self.armed=None
             return dict(ok=True,skipped=True,sent=False)
+        if command=="cancel_order":
+            return await self._cancel_order(payload)
         if command=="confirm": return await self._confirm(payload)
         if command=="flatten": return await self._flatten(payload)
         raise ServiceError("unknown service command")
@@ -247,6 +260,21 @@ class TradingService:
     def _specs(self, proposal):
         return [LegSpec(p["venue"],p["account"],Decimal(p["qty"]),Decimal(p["limit_px"]),
                         p["is_buy"],p["reduce_only"]) for p in proposal["specs"]]
+
+    async def _cancel_order(self, payload):
+        if not self.simulation: raise ServiceError("RECORD_ONLY: exchange cancellation disabled")
+        if payload.get('confirm') is not True: raise ServiceError("explicit cancellation confirmation required")
+        key, leg_id = payload.get('idempotency_key'), payload.get('leg_id')
+        if not key or not leg_id: raise ServiceError("stable cancellation key and leg_id required")
+        with self.ledger.lock:
+            row = self.ledger.db.execute("SELECT * FROM legs WHERE id=?", (leg_id,)).fetchone()
+        if not row or self.accounts.get(row['venue']) != row['account']:
+            raise ServiceError("managed order identity required")
+        self.recovered=False; self.armed=None
+        self.ledger.cancel_proposal()
+        result=await self.executor.cancel(key,leg_id)
+        await self._reconcile()
+        return dict(ok=True,cancellation=result,reconciled=self.recovered)
 
     async def _confirm(self, payload):
         if payload.get("confirm") is not True: raise ServiceError("explicit confirmation required")
@@ -342,9 +370,9 @@ class TradingService:
 
     def _in_rth(self):
         if self.in_rth is not None: return self.in_rth()
-        from datetime import datetime,timezone
-        from web.probe import in_us_rth
-        return in_us_rth(datetime.now(timezone.utc))
+        from web.market_sessions import classify
+        session=classify(time.time())
+        return session['calendar_verified'] and session['key']=='regular'
 
     def _check_send_budget(self):
         with self.ledger.lock:
@@ -461,6 +489,10 @@ class TradingService:
             live_armed=False,halted=not self.recovered,net_base=(self.ledger.get_setting("last_reconcile",{}) or {}).get("net_base"),
             reconcile=self.ledger.get_setting("last_reconcile") if self.ledger else None,last_order=self.last_order,
             warnings=[] if self.recovered else [self.reason],flatten=self.flatten_offer(),rth=self._in_rth(),
+            continuity_fault=self.ledger.get_setting('last_continuity_fault'),
+            execution_capabilities=dict(real_submit=False,real_cancel=False,
+                simulation_only=True,exchange_cancel_api='/api/orders/cancel',
+                proposal_cancel_api='/api/confirm/cancel'),
             fee_check=dict(assumed_bps=.9,actual_bps=self._measured_fee() if self.ledger else None,
                            mismatch=self._fee_mismatch() if self.ledger else False),edge=self._edge(),
             research=(self.collector.research.status(self.collector.books) if getattr(self.collector,"research",None) else None))

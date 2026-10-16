@@ -72,3 +72,18 @@ HL 保留 cloid orderStatus 查询，补关联 userFills。Lighter 需先验证 
 暂停仅停止新开仓与新的策略平仓调度，已发送订单继续确认和对账；经明确授权的风险减仓/人工关闭有独立通道。停止记录 DRAINING，等待在途结果至界限；仍 unknown 时保留原 ID/预留后退出，重启恢复。禁止普通 stop 自动清仓。
 
 故障注入窗口：intent 前、intent commit 后、SUBMITTING commit 后/网络前、首腿接受后、双腿接受后/response 前、收到 fill/DB commit 前、结果 commit 后/API response 前、部分 close 后、补偿提交中、恢复 query 中、checkpoint 中。每个窗口都必须符合 ACCEPTANCE_CRITERIA.md。
+# P5 increment: cancellation requests (2026-10-16)
+
+Cancellation state is separate from order state. SQLite v3 persists a stable
+request key and target leg before cancel transport. Request states:
+`PREPARED → SUBMITTING → ACKNOWLEDGED | UNKNOWN → VERIFIED`.
+
+An acknowledgement never implies CANCELED or zero fills. Query the original
+client ID after every cancel attempt, including timeout. A final order may be
+FILLED due to a race; VERIFIED means final order evidence was obtained, while
+full fill/account reconciliation still controls reservation release. Repeated
+keys never resend; conflicting targets are rejected. Restart only queries,
+including a crash before transport after the send boundary. No automatic
+replacement or cancel retry policy is introduced. This increment is fake-only;
+real cancellation remains disabled. See `LIVE_READINESS.md` for release gates.
+

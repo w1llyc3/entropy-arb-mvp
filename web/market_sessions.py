@@ -1,9 +1,10 @@
-"""Display-only US cash-equity reference calendar. Never an execution gate.
+"""US cash-equity reference calendar for charts and the service's RTH policy.
 
 Scheduled NYSE 2026–2028 dates, checked 2026-10-14:
 https://ir.theice.com/press/news-details/2025/NYSE-Group-Announces-2026-2027-and-2028-Holiday-and-Early-Closings-Calendar/default.aspx
 Early-close late-session cutoff follows NYSE Arca's published 17:00 ET.
 Does not model emergency closures, individual halts or perp trading hours.
+The reference calendar alone never authorizes execution.
 """
 from datetime import date,datetime,time,timedelta,timezone
 from zoneinfo import ZoneInfo

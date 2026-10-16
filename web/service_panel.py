@@ -95,6 +95,8 @@ def create_app(root=None, *, public_accounts=None, service=None):
     async def confirm(body:dict=Body(...)): return await command("confirm",body)
     @app.post("/api/confirm/cancel")
     async def cancel(): return await command("cancel")
+    @app.post("/api/orders/cancel")
+    async def cancel_order(body:dict=Body(...)): return await command("cancel_order",body)
     @app.post("/api/flatten")
     async def flatten(body:dict=Body(...)): return await command("flatten",body)
     @app.post("/api/analyze")

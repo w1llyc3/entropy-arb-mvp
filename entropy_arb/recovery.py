@@ -37,6 +37,7 @@ class RecoveryCoordinator:
                     errors.append("order query unavailable")
                 try:
                     self.ledger.save_report(leg["id"],report)
+                    self.ledger.verify_cancellations(leg["id"])
                     queries += 1
                     fills = await asyncio.wait_for(venue.query_fills(leg["client_id"]),self.timeout)
                     for fill in fills:
