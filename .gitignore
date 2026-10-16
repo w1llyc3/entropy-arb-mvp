@@ -1,6 +1,9 @@
 # secrets / 密钥。config.yaml is committed in this measurement fork
 # (strategy only — credentials stay in .env).
 .env
+.env.live
+.env.live.*
+!.env.live.example
 
 # runtime output / 运行时输出
 logs/
@@ -15,6 +18,7 @@ __pycache__/
 *.pyc
 .venv/
 .venv-audit/
+.venv-live/
 venv/
 .pytest_cache/
 *.egg-info/

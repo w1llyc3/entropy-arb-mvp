@@ -1,5 +1,10 @@
 # entropy-arb
 
+> Review-stage manual SNDK test candidate: [operator runbook](MANUAL_LIVE_TEST.md)
+> and [contract evidence / unverified gates](SDK_CONTRACT_EVIDENCE.md). The default
+> service is still RECORD_ONLY. The isolated real-test command requires a clean,
+> explicitly reviewed commit and opt-in; no real account tests have been run.
+
 > P3/P4: CLI and web now share a persistent SQLite service. Default RECORD_ONLY;
 > real submission stays disabled. Historical live commands below are not active.
 > [Current delivery, safe startup and validation limits](P3_P4_DELIVERY.md).

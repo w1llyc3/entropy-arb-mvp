@@ -15,7 +15,7 @@ import aiohttp
 
 from .execution import OfflineExecutor
 from .continuity import ClockContinuity
-from .ownership import OwnerLock
+from .ownership import OwnerLock,account_locks
 from .read_only import PublicAccountReader
 from .recovery import RecoveryCoordinator
 from .risk import RiskEngine, RiskRejected
@@ -90,6 +90,7 @@ class TradingService:
         self.owner=OwnerLock(dict(root=str(self.root)),lock_dir)
         self.account_owner=(OwnerLock(dict(market="SNDK",deployment="io/lighter-mainnet",accounts=self.accounts),lock_dir)
                             if all(a!="unconfigured" for a in self.accounts.values()) else None)
+        self.account_locks=account_locks(self.accounts,lock_dir)
         self.collector=collector or (None if simulation else PublicCollector(self.root))
         self._books=books
         self.interval,self.reconcile_interval=interval,reconcile_interval
@@ -114,6 +115,8 @@ class TradingService:
         try:
             if self.account_owner and not self.account_owner.acquire():
                 raise ServiceError("another service owns these accounts in another workspace")
+            for lock in self.account_locks:
+                if not lock.acquire(): raise ServiceError('another service owns an overlapping account in another workspace')
             (self.root/".web").mkdir(parents=True,exist_ok=True)
             self.ledger=Ledger(self.root/".web"/"ledger.sqlite")
             domain=dict(mode="SIMULATION" if self.simulation else "RECORD_ONLY",accounts=self.accounts)
@@ -145,6 +148,7 @@ class TradingService:
             if self.http: await self.http.close()
             if self.ledger: self.ledger.close(); self.ledger=None
             if self.account_owner: self.account_owner.close()
+            for lock in self.account_locks: lock.close()
             self.owner.close(); raise
 
     async def call(self, command, payload=None):
@@ -553,4 +557,5 @@ class TradingService:
                     if self.ledger: self.ledger.close(); self.ledger=None
                 finally:
                     if self.account_owner: self.account_owner.close()
+                    for lock in self.account_locks: lock.close()
                     self.owner.close(); self.state="STOPPED"
