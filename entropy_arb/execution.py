@@ -65,5 +65,32 @@ class OfflineExecutor:
                     report = OrderReport(leg["client_id"], OrderState.UNKNOWN,
                                          reason=type(exc).__name__)
                 self.ledger.save_report(leg["id"], report)
+                self.ledger.verify_cancellations(leg["id"])
             results.append(self.ledger.operation(op_id))
         return results
+
+    async def cancel(self, key, leg_id, *, timeout=5):
+        """Fake-only, durable single-attempt cancel; acknowledgement never settles."""
+        if not self.allow_submit:
+            raise ValueError("RECORD_ONLY: cancellation disabled")
+        self.ledger.prepare_cancel(key, leg_id)
+        if not self.ledger.claim_cancel(key):
+            return self.ledger.cancellation(key)
+        with self.ledger.lock:
+            leg = dict(self.ledger.db.execute("SELECT * FROM legs WHERE id=?", (leg_id,)).fetchone())
+        self.hook("before_cancel", leg)
+        try:
+            await asyncio.wait_for(self.venues[leg['venue']].cancel(leg['client_id']), timeout)
+        except Exception:
+            self.ledger.cancel_ack(key, acknowledged=False)
+        else:
+            self.ledger.cancel_ack(key, acknowledged=True)
+        self.hook("after_cancel_ack", leg)
+        # A lost cancel response may race a fill. Query, never infer zero fills.
+        try:
+            report = await asyncio.wait_for(self.venues[leg['venue']].query(leg['client_id']), timeout)
+        except Exception:
+            report = OrderReport(leg['client_id'], OrderState.UNKNOWN)
+        self.ledger.save_report(leg_id, report)
+        self.ledger.verify_cancellations(leg_id)
+        return self.ledger.cancellation(key)

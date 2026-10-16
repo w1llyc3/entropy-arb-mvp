@@ -56,7 +56,7 @@ class Ledger:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RecoveryRequired("unsupported ledger schema")
             if version == 0:
                 if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").fetchone():
@@ -113,6 +113,27 @@ class Ledger:
             present = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not extra <= present:
                 raise RecoveryRequired("incomplete service schema")
+            if version < 3:
+                # Preserve the complete previous ledger, including WAL contents.
+                # Existing databases only; a new empty ledger needs no backup.
+                if version:
+                    backup = sqlite3.connect(str(path) + '.pre-v3-' + uuid.uuid4().hex + '.sqlite')
+                    try:
+                        self.db.backup(backup)
+                    finally:
+                        backup.close()
+                self.db.executescript("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE cancellations(
+                        key TEXT PRIMARY KEY, leg_id TEXT NOT NULL REFERENCES legs(id),
+                        state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
+                    CREATE UNIQUE INDEX one_pending_cancel_per_leg ON cancellations(leg_id)
+                        WHERE state != 'VERIFIED';
+                    PRAGMA user_version=3;
+                    COMMIT;
+                """)
+            if 'cancellations' not in {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}:
+                raise RecoveryRequired("incomplete cancellation schema")
             if self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RecoveryRequired("ledger integrity failure")
         except BaseException:
@@ -121,6 +142,58 @@ class Ledger:
 
     def close(self):
         with self.lock: self.db.close()
+
+    def prepare_cancel(self, key, leg_id):
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("stable cancellation key required")
+        with self.transaction() as db:
+            prior = db.execute("SELECT * FROM cancellations WHERE key=?", (key,)).fetchone()
+            if prior:
+                if prior['leg_id'] != leg_id:
+                    raise IdempotencyConflict("cancellation key belongs to another leg")
+                return dict(prior)
+            leg = db.execute("SELECT * FROM legs WHERE id=?", (leg_id,)).fetchone()
+            if not leg: raise KeyError(leg_id)
+            if leg['submit_state'] == 'PREPARED':
+                raise RecoveryRequired("order has not crossed the send boundary")
+            if leg['outcome'] in TERMINAL:
+                raise RecoveryRequired("order already terminal; reconcile instead")
+            if db.execute("SELECT 1 FROM cancellations WHERE leg_id=? AND state!='VERIFIED'", (leg_id,)).fetchone():
+                raise RecoveryRequired("cancellation pending; query before another attempt")
+            now = time.time()
+            db.execute("INSERT INTO cancellations VALUES(?,?,?,?,?)", (key, leg_id, 'PREPARED', now, now))
+            self._event(db, leg['operation_id'], leg_id, 'CANCEL_INTENT_COMMITTED')
+        return self.cancellation(key)
+
+    def cancellation(self, key):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM cancellations WHERE key=?", (key,)).fetchone()
+            if not row: raise KeyError(key)
+            return dict(row)
+
+    def claim_cancel(self, key):
+        with self.transaction() as db:
+            changed = db.execute("UPDATE cancellations SET state='SUBMITTING',updated=? WHERE key=? AND state='PREPARED'",
+                                 (time.time(), key)).rowcount
+            if changed:
+                leg = db.execute("SELECT l.* FROM legs l JOIN cancellations c ON c.leg_id=l.id WHERE c.key=?", (key,)).fetchone()
+                self._event(db, leg['operation_id'], leg['id'], 'CANCEL_SEND_BOUNDARY_COMMITTED')
+            return bool(changed)
+
+    def cancel_ack(self, key, *, acknowledged):
+        # Never change the order outcome or release its risk reservation here.
+        with self.transaction() as db:
+            db.execute("UPDATE cancellations SET state=?,updated=? WHERE key=? AND state='SUBMITTING'",
+                       ('ACKNOWLEDGED' if acknowledged else 'UNKNOWN', time.time(), key))
+
+    def verify_cancellations(self, leg_id):
+        """Only authoritative final order evidence resolves a cancellation attempt."""
+        with self.transaction() as db:
+            leg = db.execute("SELECT * FROM legs WHERE id=?", (leg_id,)).fetchone()
+            if not leg or leg['outcome'] not in TERMINAL: return
+            changed = db.execute("UPDATE cancellations SET state='VERIFIED',updated=? WHERE leg_id=? AND state!='VERIFIED'",
+                                 (time.time(), leg_id)).rowcount
+            if changed: self._event(db, leg['operation_id'], leg_id, 'CANCEL_ORDER_FINAL_VERIFIED')
 
     @contextmanager
     def transaction(self, *, immediate=True):
@@ -306,6 +379,7 @@ class Ledger:
                 "SELECT count(*) FROM operations").fetchone()[0], unknown_legs=self.db.execute(
                 "SELECT count(*) FROM legs WHERE submit_state IN ('SUBMITTING','UNKNOWN')").fetchone()[0],
                 fills=self.db.execute("SELECT count(*) FROM fills").fetchone()[0],
+                pending_cancellations=self.db.execute("SELECT count(*) FROM cancellations WHERE state!='VERIFIED'").fetchone()[0],
                 events=self.db.execute("SELECT count(*) FROM events").fetchone()[0],
                 oldest_unknown_age_sec=max(0, time.time()-oldest) if oldest is not None else None)
 
