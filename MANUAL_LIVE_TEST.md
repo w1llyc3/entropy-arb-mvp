@@ -198,3 +198,17 @@ fixtures, verified fee units/finality, real sleep results, 24h execution soak,
 backup/migration rehearsal and PR review. This candidate supplies an explicitly
 bounded manual test path for the operator to gather that evidence; it does not
 weaken the default service's release gate or rely on local JSON as trade proof.
+# Additional first-entry gate (2026-10-17)
+
+First real `send` for an opening intent now requires the runtime artifacts in
+`.web/prelive-validation/release.json` to pass independent re-evaluation before
+transaction signers are loaded. See `PRELIVE_VALIDATION.md`. Passing paper tests
+or setting the live env flags alone is insufficient. No evidence flag enables
+automatic real Sessions. Refresh read-only evidence immediately before testing;
+it expires after 60 seconds and is bound to the public account domain.
+
+If a managed order's execution quantities are verified but fee fields are
+missing, only an explicitly confirmed reduce-only exit may use that quantity
+evidence. Unknown fees are never recorded as zero, financial settlement remains
+pending, and another entry cannot bypass the single-entry test budget.
+

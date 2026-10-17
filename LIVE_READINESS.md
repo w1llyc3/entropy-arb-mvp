@@ -2,6 +2,12 @@
 
 **Release decision: automatic live execution remains NOT READY. Default remains RECORD_ONLY.**
 
+Latest validation work: `PRELIVE_VALIDATION.md` records authenticated historical
+quantity/identity checks, unknown-fee-safe explicit reduction, and machine-enforced
+first-entry runtime gates. New Session 24-hour stability and real Windows resume
+evidence are pending. Do not present this increment as released for small live
+testing until its runtime artifacts qualify and the user reviews the candidate.
+
 2026-10-17 Session follow-up: independent paper inventory/IOC execution and
 identity reconciliation are implemented for code review. No real Session
 execution or authenticated real Session order reconciler is connected to the

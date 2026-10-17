@@ -83,3 +83,15 @@ def test_entropy_only_session_cannot_start_paper_execution(tmp_path):
         s=client.post('/api/sessions',json=dict(key='create-ionq',rules=dict(symbol='IONQ',run_mode='PAPER'))).json()
         assert client.post(f'/api/sessions/{s["id"]}/start',json=dict(key='start-ionq',version=1)).status_code==409
         assert client.get('/api/status').json()['active']['state']=='DRAFT'
+
+
+def test_continuity_clock_is_observed_while_workbench_has_no_session(tmp_path,monkeypatch):
+    observed=[]
+    class Clock:
+        def observe(self):observed.append(time.monotonic());return None
+    monkeypatch.setattr('web.workbench.ClockContinuity',Clock)
+    with TestClient(create_app(state_dir=tmp_path/'state',data_root=tmp_path,paper_feed=PublicFeedFixture())) as client:
+        assert client.get('/api/status').json()['active'] is None
+        deadline=time.monotonic()+2
+        while len(observed)<2 and time.monotonic()<deadline:time.sleep(.02)
+        assert len(observed)>=2  # Idle intervals must not accumulate into fake resume faults.

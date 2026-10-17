@@ -12,6 +12,7 @@ from entropy_arb.storage import RecoveryRequired
 
 @pytest.fixture
 def runtime(tmp_path,monkeypatch):
+    monkeypatch.setattr('entropy_arb.live_check.require_manual_entry_evidence',lambda root,**kw:dict(synthetic_test_evidence=True))
     state=dict(hl=[],lighter=[],e=D(0),h=D(0),sends=0)
     env=tmp_path/'test.env'
     env.write_text('ENTROPY_HL_ACCOUNT=0x'+'1'*40+'\nLIGHTER_ACCOUNT_INDEX=7\n'
@@ -47,7 +48,7 @@ def runtime(tmp_path,monkeypatch):
             return dict(status='ok')
         async def lighter(self,path,p):
             if path=='accountLimits': return dict(code=200,current_maker_fee_tick=state.get('fee_tick',0),current_taker_fee_tick=state.get('fee_tick',0))
-            if path=='orderBooks': return dict(order_books=[dict(symbol='SNDK',status='active',market_id=139,
+            if path=='orderBooks': return dict(order_books=[dict(symbol='SNDK',status='active',market_type='perp',market_id=139,
                 supported_size_decimals=4,supported_price_decimals=2,min_base_amount='.0035',min_quote_amount='10')])
             if path=='account': return dict(code=200,accounts=[dict(account_index=7,available_balance='1000',pending_order_count=0,
                 positions=[dict(market_id=139,position=str(abs(state['h'])),sign=1 if state['h']>=0 else -1,pending_order_count=0)])])
@@ -62,6 +63,9 @@ def runtime(tmp_path,monkeypatch):
                     integrator_maker_fee=0,integrator_taker_fee=0)
                 trade.update({side+'_account_id':7,side+'_id':r['order_index'],side+'_client_id':r['client_order_index'],
                     other+'_account_id':8,other+'_id':42,other+'_client_id':42})
+                if state.get('missing_fees'):
+                    for name in ('maker_fee','taker_fee','integrator_maker_fee','integrator_taker_fee'):trade.pop(name)
+                if state.get('trade_identity_bad'):trade[side+'_client_id']+=1
                 return dict(code=200,trades=[trade],next_cursor='')
             raise AssertionError(path)
     class Signer:
@@ -87,6 +91,52 @@ def runtime(tmp_path,monkeypatch):
     def args(command,**kw):
         return Namespace(env_file=str(env),state_dir=str(tmp_path/'state'),command=command,ack=LIVE_ACK,**kw)
     return state,args,env
+
+
+def test_unknown_fees_do_not_trap_verified_inventory_or_fabricate_financial_fills(runtime):
+    state,args,_=runtime
+    state['missing_fees']=True
+    async def workflow():
+        plan=await run(args('prepare',key='entry',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        result=await run(args('send',operation=plan['operation']['id']))
+        assert result['evidence_errors']  # Financial evidence remains incomplete.
+        close=await run(args('prepare-close',key='exit',price_entropy='1599.9',price_lighter='1599.1'))
+        assert all(leg['reduce_only'] for leg in close['operation']['legs'])
+        result=await run(args('send',operation=close['operation']['id']))
+        assert state['e']==state['h']==0 and result['evidence_errors']
+        from entropy_arb.storage import Ledger
+        ledger=Ledger(args('query').state_dir+'/ledger.sqlite')
+        try:
+            assert not list(ledger.db.execute("SELECT 1 FROM fills WHERE venue='lighter'"))
+        finally:ledger.close()
+        with pytest.raises(RecoveryRequired):
+            await run(args('prepare',key='again',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+    asyncio.run(workflow())
+
+
+def test_old_quantity_evidence_cannot_bypass_new_identity_failure(runtime):
+    state,args,_=runtime
+    async def workflow():
+        plan=await run(args('prepare',key='entry',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        await run(args('send',operation=plan['operation']['id']))
+        state['trade_identity_bad']=True
+        with pytest.raises(RecoveryRequired):
+            await run(args('prepare-close',key='unsafe-exit',price_entropy='1599.9',price_lighter='1599.1'))
+        assert state['sends']==2
+    asyncio.run(workflow())
+
+
+def test_entry_evidence_gate_blocks_before_real_signer_loading(runtime,monkeypatch):
+    state,args,_=runtime
+    async def workflow():
+        plan=await run(args('prepare',key='entry',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        def blocked(root,**kwargs):raise RecoveryRequired('synthetic missing validation')
+        async def forbidden(*a):pytest.fail('signer constructed before validation gate')
+        monkeypatch.setattr('entropy_arb.live_check.require_manual_entry_evidence',blocked)
+        monkeypatch.setattr('entropy_arb.live_check.make_signers',forbidden)
+        with pytest.raises(RecoveryRequired):await run(args('send',operation=plan['operation']['id']))
+        assert state['sends']==0
+    asyncio.run(workflow())
 
 
 def test_manual_plan_send_replay_query_and_owned_close(runtime):

@@ -21,6 +21,8 @@ from .live_execution import ManualLiveExecutor,LIVE_ACK
 from .live_transport import RestTransport,read_operator_env,make_signers,make_read_signer,inspect_operator_env,ExchangeReadError
 from .ownership import OwnerLock,account_locks
 from .storage import Ledger,LegSpec,RecoveryRequired,EvidenceConflict,TERMINAL
+from .history_audit import audit as audit_history
+from .release_gate import require_manual_entry_evidence,account_digest
 
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -31,7 +33,7 @@ async def markets(rest):
         rest.info(dict(type='perpDexs')),rest.lighter('orderBooks',{}))
     dex=[i for i,d in enumerate(dexes) if d and d.get('name')=='io']
     hl=[(i,a) for i,a in enumerate(meta['universe']) if a.get('name')=='io:SNDK']
-    lighter=[b for b in books['order_books'] if b.get('symbol')=='SNDK' and b.get('status')=='active']
+    lighter=[b for b in books['order_books'] if b.get('symbol')=='SNDK' and b.get('status')=='active' and b.get('market_type')=='perp']
     if len(dex)!=1 or len(hl)!=1 or len(lighter)!=1: raise RecoveryRequired('ambiguous SNDK catalog')
     i,a=hl[0]; b=lighter[0]
     if a.get('isDelisted') or b.get('is_frozen'): raise RecoveryRequired('SNDK unavailable')
@@ -162,7 +164,7 @@ def check_specs(specs,snapshots,books,rules):
             raise RecoveryRequired('insufficient conservative test collateral')
 
 
-async def refresh_orders(ledger,adapters):
+async def refresh_orders(ledger,adapters,*,quantity_only=False):
     # Do not invoke recover(): PREPARED plans are operator-reviewable, not lost work.
     errors=[]
     for op in ledger.all_operations():
@@ -174,11 +176,24 @@ async def refresh_orders(ledger,adapters):
                 report=await asyncio.wait_for(adapter.query(leg['client_id']),10)
                 ledger.save_report(leg['id'],report)
                 ledger.verify_cancellations(leg['id'])
-                for fill in await asyncio.wait_for(adapter.query_fills(leg['client_id']),10):
-                    ledger.record_fill(leg['id'],fill.trade_id,fill.qty,fill.price,fill.fee)
-                if ledger.fill_total(leg['id'])!=report.filled: raise RecoveryRequired('fills disagree')
+                query=getattr(adapter,'query_execution_fills',adapter.query_fills)
+                fills=await asyncio.wait_for(query(leg['client_id']),10)
+                if any(fill.client_id!=leg['client_id'] for fill in fills) or sum((f.qty for f in fills),D(0))!=report.filled:
+                    raise RecoveryRequired('fills disagree')
+                ledger.set_setting('execution-quantity:'+leg['id'],dict(client_id=leg['client_id'],account=leg['account'],
+                    venue=leg['venue'],filled=str(report.filled),observed_at=time.time(),fees_verified=all(f.fee is not None for f in fills)))
+                for fill in fills:
+                    if fill.fee is not None: ledger.record_fill(leg['id'],fill.trade_id,fill.qty,fill.price,fill.fee)
+                if not quantity_only and (any(f.fee is None for f in fills) or ledger.fill_total(leg['id'])!=report.filled):
+                    raise RecoveryRequired('financial fill evidence incomplete')
             except Exception as exc: errors.append(type(exc).__name__)
     return sorted(set(errors))
+
+
+def quantity_verified(ledger,leg):
+    evidence=ledger.get_setting('execution-quantity:'+leg['id'])
+    return bool(evidence and all(evidence.get(k)==leg[k] for k in ('client_id','account','venue'))
+                and D(evidence['filled'])==D(leg['filled']) and 0<=time.time()-evidence['observed_at']<=30)
 
 
 async def run(args):
@@ -201,7 +216,6 @@ async def run(args):
             or args.ack!=LIVE_ACK): raise RecoveryRequired('review/opt-in/ack gate closed')
         if subprocess.check_output(['git','status','--porcelain','--untracked-files=normal'],cwd=ROOT,text=True).strip():
             raise RecoveryRequired('reviewed checkout must be clean')
-        values=read_operator_env(args.env_file,secrets=True)
     state=Path(args.state_dir).resolve()
     owner=OwnerLock(dict(root=str(state)))
     account_owner=OwnerLock(dict(market='SNDK',deployment='io/lighter-mainnet',accounts=accounts))
@@ -219,6 +233,13 @@ async def run(args):
         old=ledger.get_setting('account_domain')
         if old and old!=domain: raise RecoveryRequired('test ledger domain mismatch')
         ledger.set_setting('account_domain',domain)
+        if mutating:
+            if args.command=='send':
+                operation=ledger.operation(args.operation)
+                if operation['state']!='INTENT_COMMITTED':
+                    return dict(sent=False,replayed=True,operation=operation)
+                if operation['intent']=='open':require_manual_entry_evidence(ROOT,accounts=accounts)
+            values=read_operator_env(args.env_file,secrets=True)
         if args.command=='abort-plan':
             operation=ledger.operation(args.operation)
             if any(accounts.get(l['venue'])!=l['account'] for l in operation['legs']):
@@ -254,10 +275,15 @@ async def run(args):
                 result=await check_read_contracts(rest,accounts,rules)
                 ledger.set_setting('read_contract_check',dict(result,observed_at=time.time()))
                 return result
+            if args.command=='history-audit':
+                result=await audit_history(rest,accounts,rules)
+                ledger.set_setting('history_audit',dict(result,observed_at=time.time()))
+                return result
             if args.command=='preflight':
                 snapshots,_=await observe(rest,accounts,rules)
                 fees=await fee_guard(rest,accounts,scale,required=False)
                 return dict(mode='READ_ONLY_PREFLIGHT',real_orders_sent=False,
+                    account_domain=account_digest(accounts),
                     flat=all(s.position==0 and not s.open_orders for s in snapshots.values()),
                     sdk_and_credentials_not_loaded=not authenticated_read,settlement_contract_verified=False,
                     fee_unit_configured=scale is not None,fee_policy=fees,automatic_live_enabled=False)
@@ -272,8 +298,8 @@ async def run(args):
                     positions_observed_match=all(s.position==expected[n] for n,s in snapshots.items()),
                     settlement_verified=False,automatic_live_enabled=False)
             if args.command in ('prepare','prepare-close'):
-                await fee_guard(rest,accounts,scale)
-                errors=await refresh_orders(ledger,adapters)
+                await fee_guard(rest,accounts,scale,required=args.command=='prepare')
+                errors=await refresh_orders(ledger,adapters,quantity_only=args.command=='prepare-close')
                 if errors: raise RecoveryRequired('order/fill evidence incomplete')
                 snapshots,books=await observe(rest,accounts,rules)
                 operations=[o for o in ledger.all_operations() if o['state']!='ABORTED']
@@ -292,7 +318,7 @@ async def run(args):
                     expected={n:D(0) for n in accounts}
                     for operation in operations:
                         for leg in operation['legs']:
-                            if leg['outcome'] not in TERMINAL or ledger.fill_total(leg['id'])!=D(leg['filled']):
+                            if leg['outcome'] not in TERMINAL or not quantity_verified(ledger,leg):
                                 raise RecoveryRequired('unknown or incomplete order; do not blindly replace orders')
                             expected[leg['venue']]+=D(leg['filled'])*(1 if leg['is_buy'] else -1)
                     for name,snapshot in snapshots.items():
@@ -323,7 +349,7 @@ async def run(args):
                 plan=ledger.get_setting('manual-test-plan:'+args.operation)
                 if not plan or plan['commit']!=current or not 0<=time.time()-plan['created']<=600:
                     raise RecoveryRequired('plan missing, stale, or code changed')
-                await fee_guard(rest,accounts,scale)
+                await fee_guard(rest,accounts,scale,required=op['intent']=='open')
                 # Reject a pre-existing external ID before either leg can send.
                 # This is not an assertion that the exchange deduplicates IDs.
                 for leg in op['legs']:
@@ -371,7 +397,7 @@ def main(argv=None):
         help='explicitly load only Lighter auth credentials for read-only commands; never submit')
     sub=parser.add_subparsers(dest='command',required=True)
     sub.add_parser('config-check')
-    sub.add_parser('preflight'); sub.add_parser('query'); sub.add_parser('contract-check'); sub.add_parser('signer-check')
+    sub.add_parser('preflight'); sub.add_parser('query'); sub.add_parser('contract-check'); sub.add_parser('signer-check'); sub.add_parser('history-audit')
     p=sub.add_parser('abort-plan'); p.add_argument('--operation',required=True)
     for name in ('prepare','prepare-close'):
         p=sub.add_parser(name); p.add_argument('--key',required=True)

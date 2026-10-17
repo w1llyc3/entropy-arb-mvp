@@ -69,6 +69,15 @@ class MarketRules:
             raise BeforeSubmitError('wire integer overflow')
 
 
+@dataclass(frozen=True)
+class ExecutionFill:
+    client_id: str
+    trade_id: str
+    qty: Decimal
+    price: Decimal
+    fee: Decimal | None  # Missing financial evidence never becomes zero.
+
+
 class ExternalIds:
     """Stable mapping committed before transport, collision checked per account.
 
@@ -186,7 +195,7 @@ class LighterAdapter:
         else: return OrderReport(client_id,OrderState.UNKNOWN,filled,reason='pending or unmapped status')
         return OrderReport(client_id,state,filled,True)
 
-    async def query_fills(self,client_id):
+    async def query_execution_fills(self,client_id):
         order=await self._find(client_id)
         if order is None: raise EvidenceConflict('order identity unresolved')
         params=dict(account_index=int(self.account),market_id=self.rules.market_id,
@@ -202,24 +211,26 @@ class LighterAdapter:
                 raise EvidenceConflict('trade identity mismatch')
             if type(row['is_maker_ask']) is not bool: raise EvidenceConflict('maker side unverified')
             role='maker' if row['is_maker_ask']==ask else 'taker'
-            if row.get(role+'_fee') is None:
-                raise EvidenceConflict('fee unit or amount not verified')
-            for field in ('integrator_maker_fee','integrator_taker_fee'):
-                if row.get(field) is None or integer(row[field])!=0:
-                    raise EvidenceConflict('integrator fees missing or not verified')
-            raw_fee=decimal(row[role+'_fee'])
-            if self.fee_scale is None and raw_fee!=0:
-                raise EvidenceConflict('nonzero fee unit not verified')
+            raw_fee=decimal(row[role+'_fee']) if row.get(role+'_fee') is not None else None
+            integrator_known=all(row.get(k) is not None and integer(row[k])==0
+                                 for k in ('integrator_maker_fee','integrator_taker_fee'))
             qty,price=decimal(row['size']),decimal(row['price'])
             if qty<=0 or price<=0 or row.get('type')!='trade': raise EvidenceConflict('unsupported trade evidence')
-            fee=raw_fee/self.fee_scale if self.fee_scale is not None else Decimal(0)
+            fee=(raw_fee/self.fee_scale if self.fee_scale is not None else Decimal(0)) if (
+                raw_fee is not None and integrator_known and (self.fee_scale is not None or raw_fee==0)) else None
             trade_id=str(integer(row['trade_id']))
-            fill=TradeFill(client_id,trade_id,qty,price,fee)
+            fill=ExecutionFill(client_id,trade_id,qty,price,fee)
             if trade_id in fills and fills[trade_id]!=fill: raise EvidenceConflict('trade ID changed evidence')
             fills[trade_id]=fill
         if sum((f.qty for f in fills.values()),Decimal(0))!=decimal(order['filled_base_amount']):
             raise EvidenceConflict('fill history differs from cumulative order')
         return list(fills.values())
+
+    async def query_fills(self,client_id):
+        rows=await self.query_execution_fills(client_id)
+        if any(row.fee is None for row in rows):
+            raise EvidenceConflict('fee unit or amount not verified')
+        return [TradeFill(row.client_id,row.trade_id,row.qty,row.price,row.fee) for row in rows]
 
     async def cancel(self,client_id):
         order=await self._find(client_id)

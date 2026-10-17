@@ -50,12 +50,12 @@ def create_app(*, state_dir=None, data_root=None, public_accounts=None, paper_fe
                 continuity=ClockContinuity()
                 while True:
                     try:
+                        interrupted=continuity.observe()  # Idle time is not a scheduler stall.
                         store.expire()
                         current=store.snapshot()["active"]
                         if current:
                             sid=current["id"]
                             store.capture_real_evidence(sid,inventory.snapshot(current["rules"]["symbol"]))
-                            interrupted=continuity.observe()
                             if interrupted and current["state"] in ("OBSERVING","PAUSED","DRAINING"):
                                 for book in feed.books.values(): book.clear()
                                 with store.transaction():
