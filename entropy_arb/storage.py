@@ -143,6 +143,21 @@ class Ledger:
     def close(self):
         with self.lock: self.db.close()
 
+    def abort_plan(self,operation_id):
+        """Release only a transactionally proven unsent plan; never an order."""
+        with self.transaction() as db:
+            op=db.execute('SELECT state FROM operations WHERE id=?',(operation_id,)).fetchone()
+            if not op: raise KeyError(operation_id)
+            if op['state']=='ABORTED': return False
+            legs=list(db.execute('SELECT * FROM legs WHERE operation_id=?',(operation_id,)))
+            if (op['state']!='INTENT_COMMITTED' or not legs or any(l['submit_state']!='PREPARED' or Decimal(l['filled'])!=0 for l in legs)
+                or db.execute('SELECT 1 FROM fills f JOIN legs l ON f.leg_id=l.id WHERE l.operation_id=?',(operation_id,)).fetchone()):
+                raise RecoveryRequired('plan crossed send boundary; query orders instead')
+            db.execute("UPDATE legs SET submit_state='REPORTED',outcome='not_sent',reservation='0',version=version+1 WHERE operation_id=?",(operation_id,))
+            db.execute("UPDATE operations SET state='ABORTED',updated=? WHERE id=?",(time.time(),operation_id))
+            self._event(db,operation_id,None,'PLAN_ABORTED_PROVEN_UNSUBMITTED')
+        return True
+
     def prepare_cancel(self, key, leg_id):
         if not isinstance(key, str) or not key.strip():
             raise ValueError("stable cancellation key required")

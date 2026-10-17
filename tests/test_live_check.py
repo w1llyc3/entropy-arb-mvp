@@ -19,11 +19,15 @@ def runtime(tmp_path,monkeypatch):
         'LIGHTER_TRADE_FEE_SCALE=1000000\nLIGHTER_READ_TOKEN=synthetic\n')
     monkeypatch.setattr('entropy_arb.live_check.subprocess.check_output',
         lambda command,**kw:'a'*40 if command[1]=='rev-parse' else '')
+    env.write_text(env.read_text()+'LIGHTER_API_KEY_INDEX=2\n')
     class Rest:
         def __init__(self,*a): self.token=None
         async def info(self,p):
             kind=p['type']
             if kind=='perpDexs': return [None,dict(name='io')]
+            if kind=='extraAgents':
+                import time
+                return [] if state.get('agent_invalid') else [dict(address='0x'+'2'*40,validUntil=int(time.time()*1000)+86400000)]
             if kind=='meta': return dict(universe=[dict(name='io:SNDK',szDecimals=2)])
             if kind=='l2Book': return dict(levels=[[dict(px='1599.9',sz='1')],[dict(px='1600',sz='1')]])
             if kind=='openOrders': return []
@@ -42,6 +46,7 @@ def runtime(tmp_path,monkeypatch):
                     qty=wire['s'],price=wire['p'],origSz=wire['s'],limitPx=wire['p'],side='B' if wire['b'] else 'A',reduceOnly=wire['r']))
             return dict(status='ok')
         async def lighter(self,path,p):
+            if path=='accountLimits': return dict(code=200,current_maker_fee_tick=state.get('fee_tick',0),current_taker_fee_tick=state.get('fee_tick',0))
             if path=='orderBooks': return dict(order_books=[dict(symbol='SNDK',status='active',market_id=139,
                 supported_size_decimals=4,supported_price_decimals=2,min_base_amount='.0035',min_quote_amount='10')])
             if path=='account': return dict(code=200,accounts=[dict(account_index=7,available_balance='1000',pending_order_count=0,
@@ -53,7 +58,8 @@ def runtime(tmp_path,monkeypatch):
                 r=next(r for r in state['lighter'] if str(r['order_index'])==p['order_index_str'])
                 ask=r['is_ask']; side='ask' if ask else 'bid'; other='bid' if ask else 'ask'
                 trade=dict(trade_id=r['order_index'],market_id=139,is_maker_ask=not ask,
-                    size=r['filled_base_amount'],price=r['price'],type='trade',taker_fee=1,maker_fee=0)
+                    size=r['filled_base_amount'],price=r['price'],type='trade',taker_fee=state.get('raw_fee',1),maker_fee=0,
+                    integrator_maker_fee=0,integrator_taker_fee=0)
                 trade.update({side+'_account_id':7,side+'_id':r['order_index'],side+'_client_id':r['client_order_index'],
                     other+'_account_id':8,other+'_id':42,other+'_client_id':42})
                 return dict(code=200,trades=[trade],next_cursor='')
@@ -69,7 +75,9 @@ def runtime(tmp_path,monkeypatch):
                 remaining_base_amount=str(qty-filled),status='filled' if filled==qty else 'canceled',
                 is_ask=kw['is_ask'],price=str(D(kw['price']).scaleb(-2)),reduce_only=kw['reduce_only']))
             return None,None,None
-        def create_auth_token_with_expiry(self): return 'synthetic',None
+        def create_auth_token_with_expiry(self,**kw):
+            assert kw['api_key_index']==2
+            return 'synthetic',None
         async def close(self): pass
     async def signers(values):
         from types import SimpleNamespace
@@ -160,4 +168,46 @@ def test_manual_executor_cannot_overlap_one_service_account(runtime,tmp_path):
                 await run(args('preflight'))
             assert state['sends']==0
         finally: await service.close()
+    asyncio.run(workflow())
+
+
+def test_zero_only_fee_policy_rechecks_changed_tier_before_sending(runtime):
+    state,args,env=runtime
+    env.write_text(env.read_text().replace('LIGHTER_TRADE_FEE_SCALE=1000000','LIGHTER_TRADE_FEE_SCALE='))
+    async def workflow():
+        assert (await run(args('preflight')))['fee_policy']['allowed']
+        plan=await run(args('prepare',key='entry',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        state['fee_tick']=1
+        with pytest.raises(RecoveryRequired,match='nonzero fee'):
+            await run(args('send',operation=plan['operation']['id']))
+        assert state['sends']==0
+        state['fee_tick']=0; state['raw_fee']=0
+        result=await run(args('send',operation=plan['operation']['id']))
+        assert not result['evidence_errors'] and state['sends']==2
+    asyncio.run(workflow())
+
+
+def test_unapproved_hl_key_blocks_both_legs_before_any_send(runtime):
+    state,args,_=runtime
+    async def workflow():
+        plan=await run(args('prepare',key='entry',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        state['agent_invalid']=True
+        with pytest.raises(RecoveryRequired,match='unexpired agent'):
+            await run(args('send',operation=plan['operation']['id']))
+        assert state['sends']==0
+    asyncio.run(workflow())
+
+
+def test_stale_unsent_plan_can_be_abandoned_without_losing_sent_evidence(runtime):
+    state,args,_=runtime
+    async def workflow():
+        plan=await run(args('prepare',key='old',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        op=plan['operation']['id']
+        assert (await run(args('abort-plan',operation=op)))['aborted']
+        assert not (await run(args('abort-plan',operation=op)))['aborted']
+        fresh=await run(args('prepare',key='fresh',qty='.01',buy='entropy',price_entropy='1600',price_lighter='1599'))
+        await run(args('send',operation=fresh['operation']['id']))
+        with pytest.raises(RecoveryRequired,match='send boundary'):
+            await run(args('abort-plan',operation=fresh['operation']['id']))
+        assert state['sends']==2
     asyncio.run(workflow())

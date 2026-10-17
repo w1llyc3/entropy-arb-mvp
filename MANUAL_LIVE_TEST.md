@@ -1,5 +1,22 @@
 # Manual SNDK live-contract test candidate
 
+2026-10-17 update: Windows SDK/native checks and account read-only checks passed.
+Existing `HL_ACCOUNT_ADDRESS` / `HL_PRIVATE_KEY` names are supported. Use the
+parent project's existing env without copying keys by passing `--env-file ../.env`
+before the command. No env file is auto-discovered.
+
+```powershell
+.\.venv-live\Scripts\python.exe -m entropy_arb.live_check --env-file ../.env config-check
+.\.venv-live\Scripts\python.exe -m entropy_arb.live_check --env-file ../.env signer-check
+.\.venv-live\Scripts\python.exe -m entropy_arb.live_check --env-file ../.env --authenticated-read preflight
+.\.venv-live\Scripts\python.exe -m entropy_arb.live_check --env-file ../.env --authenticated-read contract-check
+```
+
+Config diagnostics disclose presence flags only. Signer checks process keys
+inside the local SDK to validate public identities/query auth, never to create
+transaction signatures or send orders. Wrong/expired HL agents block both legs.
+History samples alone do not prove history completeness or final settlement.
+
 This branch is for **human review before any real test**. The web/strategy
 service remains RECORD_ONLY. Nothing in this document authorizes Codex to load
 your private keys or send orders. The operator supplies `.env.live` and runs
@@ -67,8 +84,12 @@ Verify account identity, flat positions, active/inactive history pagination,
 and the `trades` response against UI/explorer. `LIGHTER_TRADE_FEE_SCALE` must
 remain blank until the integer fee field's unit is independently verified
 against a known trade. Do not assume `1000000` merely because USDC has six
-decimals: the API schema does not describe fee units. Preparing a test is
-blocked while the field is blank. Synthetic test fixtures are not this proof.
+decimals: the API schema does not describe fee units. With a blank scale, only
+ZERO_ONLY is permitted: accountLimits must explicitly report zero maker/taker
+fees, checked again before each send. Exact-zero fill fees need no conversion
+unit; nonzero/unknown fees and integrator fees block evidence release. Nonzero
+fee accounts still require independently verified units. Synthetic fixtures do
+not establish those units.
 
 `query` records order/fill evidence. `positions_observed_match=true` means the
 fresh observed quantities agree with accumulated fills. It is **not** a
@@ -89,6 +110,17 @@ This writes an intent, baselines and stable client IDs. It sends no orders.
 Inspect the returned operation and both legs. Repeat inspection with `query`.
 Do not prepare another entry if an earlier request exists; inspect the existing
 operation. Existing IDs survive process restarts and SDK exceptions.
+
+If a plan expires or prices need changing, discard only that proven-unsent plan,
+then prepare another with a new key:
+
+```powershell
+.\.venv-live\Scripts\python.exe -m entropy_arb.live_check --env-file ../.env abort-plan --operation "<unsent operation ID>"
+```
+
+This is a local transactional abort, not exchange cancellation. Once the send
+boundary was crossed, it refuses to release or erase the order. Never delete
+the ledger to work around that refusal.
 
 Only after your review and the preceding account checks, set the live env
 switch to YES. Sending requires the operation ID returned above:
@@ -154,7 +186,7 @@ the fake service is armed, then resume. It never submits, even fake orders.
 No observed gap returns INCONCLUSIVE, not PASS. Confirm yourself that the gap
 corresponded to actual sleep, rather than a scheduler stall/clock change.
 
-The soak creates only fake accounts and a disposable DB. It exercises duplicate
+The soak creates only fake accounts and an isolated retained DB. It exercises duplicate
 confirmations, paired entry/exit and service restarts. Keep the output, including
 any failure; shorter smoke runs do not qualify as 24h evidence. It does not
 measure real exchange latency, permissions, fills or settlement finality.

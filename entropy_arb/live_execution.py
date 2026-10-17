@@ -24,7 +24,7 @@ class ManualLiveExecutor(DurableDispatcher):
         operation=self.ledger.operation(operation_id)
         if operation['state']!='INTENT_COMMITTED':
             return operation # No transport on replay, even if the exchange accepted.
-        operations=self.ledger.all_operations()
+        operations=[o for o in self.ledger.all_operations() if o['state']!='ABORTED']
         # Lifetime test budget: one entry, at most four separately verified exits.
         if len(operations)>5 or sum(o['intent']=='open' for o in operations)>1:
             raise RecoveryRequired('manual test budget exhausted')

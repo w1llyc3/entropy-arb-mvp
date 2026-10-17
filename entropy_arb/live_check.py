@@ -18,7 +18,7 @@ from .execution import DurableDispatcher
 from .execution_contract import BeforeSubmitError
 from .live_adapter import MarketRules,HyperliquidAdapter,LighterAdapter,decimal,integer
 from .live_execution import ManualLiveExecutor,LIVE_ACK
-from .live_transport import RestTransport,read_operator_env,make_signers,make_read_signer
+from .live_transport import RestTransport,read_operator_env,make_signers,make_read_signer,inspect_operator_env,ExchangeReadError
 from .ownership import OwnerLock,account_locks
 from .storage import Ledger,LegSpec,RecoveryRequired,EvidenceConflict,TERMINAL
 
@@ -87,6 +87,63 @@ async def observe(rest,accounts,rules):
     return snapshots,books
 
 
+async def check_read_contracts(rest,accounts,rules):
+    """Read a bounded sample; report schema evidence, never auth or trade payloads."""
+    params=dict(account_index=int(accounts['lighter']),market_id=rules['lighter'].market_id,limit=1)
+    inactive,trades,hlfills=await asyncio.gather(
+        rest.lighter('accountInactiveOrders',params),
+        rest.lighter('trades',dict(params,sort_by='trade_id',aggregate=False)),
+        rest.info(dict(type='userFillsByTime',user=accounts['entropy'],
+            startTime=int((time.time()-86400)*1000),aggregateByTime=False)))
+    for response,field in ((inactive,'orders'),(trades,'trades')):
+        if integer(response.get('code',0))!=200 or not isinstance(response.get(field),list):
+            raise RecoveryRequired('authenticated history response incomplete')
+    for row in inactive['orders']:
+        if integer(row['owner_account_index'])!=int(accounts['lighter']) or integer(row['market_index'])!=rules['lighter'].market_id:
+            raise RecoveryRequired('history account or market mismatch')
+        for key in ('client_order_index','order_index'): integer(row[key])
+        for key in ('filled_base_amount','initial_base_amount','price'): decimal(row[key])
+    for row in trades['trades']:
+        if integer(row['market_id'])!=rules['lighter'].market_id or int(accounts['lighter']) not in (integer(row['ask_account_id']),integer(row['bid_account_id'])):
+            raise RecoveryRequired('trade history identity mismatch')
+        for key in ('trade_id','ask_id','bid_id'): integer(row[key])
+        for key in ('size','price'): decimal(row[key])
+    if not isinstance(hlfills,list): raise RecoveryRequired('HL history response incomplete')
+    sndk=[r for r in hlfills if r.get('coin')=='io:SNDK']
+    for row in sndk:
+        for key in ('oid','tid'): integer(row[key])
+        for key in ('sz','px','fee'): decimal(row[key])
+        if row['feeToken']!='USDC': raise RecoveryRequired('HL fee currency unverified')
+    return dict(mode='READ_ONLY_CONTRACT_CHECK',real_orders_sent=False,
+        lighter_inactive_endpoint_ok=True,lighter_trade_endpoint_ok=True,hl_fill_endpoint_ok=True,
+        lighter_order_sample_present=bool(inactive['orders']),lighter_trade_sample_present=bool(trades['trades']),
+        hl_sndk_fill_sample_present=bool(sndk),
+        more_lighter_history=bool(inactive.get('next_cursor') or trades.get('next_cursor')),
+        history_completeness_verified=False,fee_unit_verified=False,settlement_contract_verified=False)
+
+
+async def fee_guard(rest,accounts,scale,*,required=True):
+    if scale is not None: return dict(policy='OPERATOR_VERIFIED_SCALE',allowed=True)
+    limits=await rest.lighter('accountLimits',dict(account_index=int(accounts['lighter'])))
+    if integer(limits.get('code',0))!=200: raise RecoveryRequired('account fee schedule unavailable')
+    zero=all(integer(limits[key])==0 for key in ('current_maker_fee_tick','current_taker_fee_tick'))
+    if required and not zero: raise RecoveryRequired('nonzero fee account requires verified fee units')
+    # Exact zero is unit-independent. Do not infer a conversion scale or allow
+    # nonzero fills; recheck this schedule immediately before every real send.
+    return dict(policy='ZERO_ONLY',allowed=zero,nonzero_fee_units_verified=False)
+
+
+async def check_hl_signer(rest,account,wallet):
+    address=wallet.address.lower()
+    if address==account: return 'MASTER'
+    agents=await rest.info(dict(type='extraAgents',user=account))
+    if not isinstance(agents,list): raise RecoveryRequired('HL signer authorization response incomplete')
+    matches=[agent for agent in agents if str(agent.get('address','')).lower()==address]
+    if len(matches)!=1 or integer(matches[0].get('validUntil',0))<=int(time.time()*1000)+60000:
+        raise RecoveryRequired('HL signer is not a verified unexpired agent for this account')
+    return 'APPROVED_AGENT'
+
+
 def check_specs(specs,snapshots,books,rules):
     for leg in specs:
         rules[leg.venue].validate(DurableDispatcher.intent(leg.payload()|dict(client_id='0'*32)))
@@ -109,6 +166,7 @@ async def refresh_orders(ledger,adapters):
     # Do not invoke recover(): PREPARED plans are operator-reviewable, not lost work.
     errors=[]
     for op in ledger.all_operations():
+        if op['state']=='ABORTED': continue
         for leg in op['legs']:
             if leg['submit_state']=='PREPARED': continue
             try:
@@ -124,11 +182,15 @@ async def refresh_orders(ledger,adapters):
 
 
 async def run(args):
+    if args.command=='config-check':
+        return dict(mode='CONFIG_PRESENCE_ONLY',real_orders_sent=False,**inspect_operator_env(args.env_file))
     mutating=args.command in ('send','cancel')
+    signer_check=args.command=='signer-check'
     values=read_operator_env(args.env_file,secrets=False)
     authenticated_read=bool(getattr(args,'authenticated_read',False))
     if authenticated_read and not mutating:
         values=read_operator_env(args.env_file,lighter_auth=True)
+    if signer_check: values=read_operator_env(args.env_file,secrets=True)
     accounts=dict(entropy=values.get('ENTROPY_HL_ACCOUNT','').lower(),lighter=values.get('LIGHTER_ACCOUNT_INDEX',''))
     if not re.fullmatch('0x[0-9a-f]{40}',accounts['entropy']) or not accounts['lighter'].isdigit():
         raise RecoveryRequired('public accounts missing or invalid')
@@ -157,30 +219,48 @@ async def run(args):
         old=ledger.get_setting('account_domain')
         if old and old!=domain: raise RecoveryRequired('test ledger domain mismatch')
         ledger.set_setting('account_domain',domain)
+        if args.command=='abort-plan':
+            operation=ledger.operation(args.operation)
+            if any(accounts.get(l['venue'])!=l['account'] for l in operation['legs']):
+                raise RecoveryRequired('plan account identity mismatch')
+            changed=ledger.abort_plan(args.operation)
+            return dict(real_orders_sent=False,aborted=changed,operation=ledger.operation(args.operation))
         async with aiohttp.ClientSession() as session:
             rest=RestTransport(session,values.get('LIGHTER_READ_TOKEN'))
             wallet=sign=None
-            if mutating:
+            if mutating or signer_check:
                 wallet,sign,signer=await make_signers(values)
+                signer_role=await check_hl_signer(rest,accounts['entropy'],wallet)
                 signer_owner=OwnerLock(dict(signer=wallet.address.lower(),deployment='hyperliquid-mainnet'))
                 if not signer_owner.acquire(): raise RecoveryRequired('HL signer owned by another executor')
             elif authenticated_read:
                 signer=await make_read_signer(values)
             if signer:
-                token,error=signer.create_auth_token_with_expiry()
+                token,error=signer.create_auth_token_with_expiry(api_key_index=int(values['LIGHTER_API_KEY_INDEX']))
                 if error: raise RecoveryRequired('authenticated read token unavailable')
                 rest.token=token
+            if signer_check:
+                active=await rest.lighter('accountActiveOrders',dict(account_index=int(accounts['lighter'])))
+                if integer(active.get('code',0))!=200 or not isinstance(active.get('orders'),list):
+                    raise RecoveryRequired('Lighter read authentication response incomplete')
+                return dict(mode='READ_ONLY_SIGNER_CHECK',hl_signer_authorized=True,hl_role=signer_role,
+                    lighter_read_auth_ok=True,real_orders_sent=False,transaction_signatures_created=False)
             rules=await markets(rest)
             scale=decimal(values['LIGHTER_TRADE_FEE_SCALE']) if values.get('LIGHTER_TRADE_FEE_SCALE') else None
             if scale is not None and scale<=0: raise RecoveryRequired('invalid verified fee scale')
             adapters=dict(entropy=HyperliquidAdapter(ledger,accounts['entropy'],rules['entropy'],rest.info,rest.exchange,wallet=wallet,sign=sign),
                           lighter=LighterAdapter(ledger,accounts['lighter'],rules['lighter'],rest.lighter,signer=signer if mutating else None,fee_scale=scale))
+            if args.command=='contract-check':
+                result=await check_read_contracts(rest,accounts,rules)
+                ledger.set_setting('read_contract_check',dict(result,observed_at=time.time()))
+                return result
             if args.command=='preflight':
                 snapshots,_=await observe(rest,accounts,rules)
+                fees=await fee_guard(rest,accounts,scale,required=False)
                 return dict(mode='READ_ONLY_PREFLIGHT',real_orders_sent=False,
                     flat=all(s.position==0 and not s.open_orders for s in snapshots.values()),
                     sdk_and_credentials_not_loaded=not authenticated_read,settlement_contract_verified=False,
-                    fee_unit_configured=scale is not None,automatic_live_enabled=False)
+                    fee_unit_configured=scale is not None,fee_policy=fees,automatic_live_enabled=False)
             if args.command=='query':
                 errors=await refresh_orders(ledger,adapters)
                 snapshots,_=await observe(rest,accounts,rules)
@@ -192,11 +272,11 @@ async def run(args):
                     positions_observed_match=all(s.position==expected[n] for n,s in snapshots.items()),
                     settlement_verified=False,automatic_live_enabled=False)
             if args.command in ('prepare','prepare-close'):
-                if scale is None: raise RecoveryRequired('verify and configure fee units before preparing test')
+                await fee_guard(rest,accounts,scale)
                 errors=await refresh_orders(ledger,adapters)
                 if errors: raise RecoveryRequired('order/fill evidence incomplete')
                 snapshots,books=await observe(rest,accounts,rules)
-                operations=ledger.all_operations()
+                operations=[o for o in ledger.all_operations() if o['state']!='ABORTED']
                 specs=[]
                 if args.command=='prepare':
                     if operations: raise RecoveryRequired('only one entry permitted per test ledger; query existing work')
@@ -243,6 +323,7 @@ async def run(args):
                 plan=ledger.get_setting('manual-test-plan:'+args.operation)
                 if not plan or plan['commit']!=current or not 0<=time.time()-plan['created']<=600:
                     raise RecoveryRequired('plan missing, stale, or code changed')
+                await fee_guard(rest,accounts,scale)
                 # Reject a pre-existing external ID before either leg can send.
                 # This is not an assertion that the exchange deduplicates IDs.
                 for leg in op['legs']:
@@ -289,7 +370,9 @@ def main(argv=None):
     parser.add_argument('--authenticated-read',action='store_true',
         help='explicitly load only Lighter auth credentials for read-only commands; never submit')
     sub=parser.add_subparsers(dest='command',required=True)
-    sub.add_parser('preflight'); sub.add_parser('query')
+    sub.add_parser('config-check')
+    sub.add_parser('preflight'); sub.add_parser('query'); sub.add_parser('contract-check'); sub.add_parser('signer-check')
+    p=sub.add_parser('abort-plan'); p.add_argument('--operation',required=True)
     for name in ('prepare','prepare-close'):
         p=sub.add_parser(name); p.add_argument('--key',required=True)
         p.add_argument('--price-entropy',required=True); p.add_argument('--price-lighter',required=True)
@@ -306,7 +389,8 @@ def main(argv=None):
     except Exception as exc:
         # No raw exceptions or traceback: parsers/SDKs can include credentials.
         message=str(exc) if type(exc) in (RecoveryRequired,EvidenceConflict,BeforeSubmitError) else 'test blocked; inspect configuration and sanitized evidence'
-        print(json.dumps(dict(ok=False,error_type=type(exc).__name__,message=message)))
+        detail=dict(endpoint=exc.endpoint,http_status=exc.status,category=exc.category) if isinstance(exc,ExchangeReadError) else {}
+        print(json.dumps(dict(ok=False,error_type=type(exc).__name__,message=message,**detail)))
         return 1
     return 0
 

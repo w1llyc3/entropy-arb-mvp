@@ -2,6 +2,12 @@
 
 **Release decision: automatic live execution remains NOT READY. Default remains RECORD_ONLY.**
 
+2026-10-17: SDK installation/native Windows validation, configured-account
+identity/read authentication, empty SNDK exposure/open-order checks and bounded
+history endpoint checks passed. See SDK_CONTRACT_EVIDENCE.md for the actual
+evidence and remaining gaps. Real Windows sleep, 24h fake execution soak and
+the user's pre-live review are still release gates. No real orders were sent.
+
 The follow-up branch `codex/live-adapter-review` adds isolated, opt-in manual
 SNDK contract-test adapters/commands. See `MANUAL_LIVE_TEST.md`. This is a code
 candidate for user review, not proof of real account validation. The user will

@@ -44,7 +44,8 @@ def order(ledger,**kw):
 def trade(ledger,**kw):
     return dict(trade_id=99,market_id=139,ask_account_id=8,bid_account_id=7,ask_id=456,bid_id=12345678901234567,
         bid_client_id=ExternalIds(ledger,'7').lighter(CLIENT),ask_client_id=42,is_maker_ask=True,
-        taker_fee=640,maker_fee=0,size='0.004',price='1600',type='trade')|kw
+        taker_fee=640,maker_fee=0,integrator_maker_fee=0,integrator_taker_fee=0,
+        size='0.004',price='1600',type='trade')|kw
 
 
 def adapter(ledger,row=None,trades=None,signer=None,fee_scale=D(1000000)):
@@ -128,6 +129,13 @@ def test_incomplete_history_or_unknown_fee_units_blocks_release(ledger,trades):
 def test_changed_duplicate_trade_id_is_rejected(ledger):
     venue=adapter(ledger,trades=[trade(ledger),trade(ledger,price='1601')])
     with pytest.raises(EvidenceConflict): asyncio.run(venue.query_fills(CLIENT))
+
+
+def test_zero_fees_need_no_unit_assumption_but_nonzero_integrator_fee_blocks(ledger):
+    fills=asyncio.run(adapter(ledger,trades=[trade(ledger,taker_fee=0)],fee_scale=None).query_fills(CLIENT))
+    assert fills[0].fee==0
+    with pytest.raises(EvidenceConflict):
+        asyncio.run(adapter(ledger,trades=[trade(ledger,taker_fee=0,integrator_taker_fee=1)],fee_scale=None).query_fills(CLIENT))
 
 
 def test_cursor_pagination_has_no_silent_truncation_or_loop():
