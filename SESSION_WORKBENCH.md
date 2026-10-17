@@ -1,5 +1,16 @@
 # Independent multi-asset Session workbench
 
+## Latest: Session inventory/reconciliation and paper execution
+
+An explicit PAPER mode now runs a separate virtual IOC ledger using fresh
+public depth. It includes stable intents, per-Session inventory, order query
+recovery, cost/risk rules, pause/drain lifecycle and simulated reports. Real
+account observations stay separate and are never automatically attributed.
+See **SESSION_EXECUTION_REVIEW.md** for exact completed scope, assumptions and
+the remaining real execution/reconciliation gates. The historical sections below
+describe previous milestones; their execution-not-connected statements continue
+to apply to **real** trading, not the new isolated paper runtime.
+
 ## 2026-10-17: watchlist and read-only position milestone
 
 The workbench now switches between SNDK, ANTH, DRAM, OAI, NBIS, EWY, XIAOMI,

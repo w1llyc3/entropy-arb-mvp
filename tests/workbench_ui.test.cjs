@@ -25,7 +25,7 @@ async function setup() {
   const elements=new Map();
   const el=id=>{if(!elements.has(id))elements.set(id,new Element(id));return elements.get(id);};
   el('zone').value='Asia/Shanghai';el('symbol').value='SNDK';
-  const buttons=['start','pause','resume','end'].map(action=>{const b=new Element();b.dataset.action=action;return b;});
+  const buttons=['start','pause','resume','end','reconcile-paper'].map(action=>{const b=new Element();b.dataset.action=action;return b;});
   const fixture={active:null,sessions:[],events:[]};
   const overrides=new Map();
   const context=vm.createContext({
@@ -88,4 +88,17 @@ test('delayed report cannot populate a different asset or enable its download',a
   await reading;await tick();
   assert.equal(el('report').textContent,'');
   assert.equal(el('download').disabled,true);
+});
+test('paper draining controls and virtual PnL remain distinct from real inventory',async()=>{
+  const {el,buttons,fixture,context}=await setup();
+  fixture.active={id:'paper-sndk',mode:'PAPER_SIMULATION',state:'DRAINING',rules_version:1,rules:{symbol:'SNDK',direction:'BUY_ENTROPY',entry_bps:10,exit_bps:2,order_usd:11,max_inventory_usd:22,duration_minutes:60}};
+  fixture.paper={status:'WAITING_FOR_FRESH_BOOKS',reason:'stale',positions:{entropy:'0.1',lighter:'-0.1'},recovery_required:false,inventory_held_sec:12,signal:null,fees_usd:'0.01',realized_pnl_before_funding_usd:null,orders:[],fill_edge_distribution:[]};
+  fixture.real_account_reconciliation={status:'UNATTRIBUTED_CHANGE',account_position_delta:{entropy:'9',lighter:'0'}};
+  await vm.runInContext('refresh()',context);
+  assert.equal(buttons.find(b=>b.dataset.action==='start').disabled,true);
+  assert.equal(buttons.find(b=>b.dataset.action==='reconcile-paper').disabled,false);
+  assert.match(el('paper-inventory').textContent,/虚拟库存/);
+  assert.doesNotMatch(el('paper-inventory').textContent,/9/);
+  assert.match(el('paper-pnl').textContent,/暂不结算/);
+  assert.match(el('attribution').textContent,/不自动认领/);
 });

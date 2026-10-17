@@ -1,6 +1,6 @@
 "use strict";
 const el = id => document.getElementById(id);
-const states = {DRAFT:"规则已保存",OBSERVING:"观察中",PAUSED:"已暂停",RECOVERY_REQUIRED:"重启待确认",ENDED:"已结束"};
+const states = {DRAFT:"规则已保存",OBSERVING:"运行中",PAUSED:"已暂停新开仓",DRAINING:"模拟收尾中",RECOVERY_REQUIRED:"待核验后继续",ENDED:"已结束"};
 const labels = {RULES_SAVED:"规则已保存",OBSERVATION_START:"开始观察",OBSERVATION_PAUSE:"暂停观察",OBSERVATION_RESUME:"继续观察",OBSERVATION_END:"结束观察并生成报告",PROCESS_RESTART_OBSERVATION_INTERRUPTED:"进程重启，观察已中断，等待确认",DURATION_REACHED_OBSERVATION_PAUSED:"达到时长，观察已暂停"};
 let active = null, busy = false, market = null, report = null, assets = [], marketRequest = 0, reportRequest = 0;
 // A failed response keeps its key so retrying an uncertain create is idempotent.
@@ -18,8 +18,8 @@ async function api(path, body) {
 }
 function controls() {
   const state = active?.state;
-  const allowed = {start:["DRAFT"],pause:["OBSERVING"],resume:["PAUSED","RECOVERY_REQUIRED"],end:["DRAFT","OBSERVING","PAUSED","RECOVERY_REQUIRED"]};
-  document.querySelectorAll("[data-action]").forEach(b => b.disabled = busy || (active && sessionSymbol(active) !== selectedSymbol()) || !allowed[b.dataset.action].includes(state));
+  const allowed = {start:["DRAFT"],pause:["OBSERVING"],resume:["PAUSED","RECOVERY_REQUIRED"],end:["DRAFT","OBSERVING","PAUSED","RECOVERY_REQUIRED","DRAINING"],"reconcile-paper":["OBSERVING","PAUSED","RECOVERY_REQUIRED","DRAINING"]};
+  document.querySelectorAll("[data-action]").forEach(b => b.disabled = busy || (active && sessionSymbol(active) !== selectedSymbol()) || (b.dataset.action === "reconcile-paper" && active?.mode !== "PAPER_SIMULATION") || !allowed[b.dataset.action].includes(state));
   el("create").disabled = busy || !!active || !assets.length;
 }
 async function loadReport(id) {
@@ -28,15 +28,15 @@ async function loadReport(id) {
     const result=await api(`/api/sessions/${id}/report`);
     if(request !== reportRequest || symbol !== selectedSymbol() || sessionSymbol(result.session) !== symbol) return;
     report=result;
-    el("report-note").textContent = "观察报告 · 仓位、成交、费用及结算尚未核验；不代表一次真实交易 Session 已完成。";
+    el("report-note").textContent = result.status === "PAPER_SIMULATION_REPORT" ? "模拟报告 · 费用和盈亏仅属于虚拟账本，未计真实资金费；不代表真实账户收益。" : "观察报告 · 仓位、成交、费用及结算尚未核验；不代表一次真实交易 Session 已完成。";
     el("report").textContent = JSON.stringify(report,null,2);
     el("download").disabled = false;
   } catch (error) { if(request === reportRequest && symbol === selectedSymbol()) el("error").textContent = error.message; }
 }
 async function refresh() {
-  const data = await api("/api/status"); active = data.active;
+  const data = await api("/api/status"); const previous=active;active = data.active;
   el("state").textContent = active ? states[active.state] : "未运行";
-  el("session-id").textContent = active ? `${active.id.slice(0,10)} · v${active.rules_version}` : "可创建下一次 Session";
+  el("session-id").textContent = active ? `${active.id.slice(0,10)} · ${active.mode === "PAPER_SIMULATION" ? "盘口模拟" : "仅观察"} · v${active.rules_version}` : "可创建下一次 Session";
   el("session-summary").textContent = active ? `${sessionSymbol(active)} · ${active.rules.direction === "BUY_ENTROPY" ? "买 Entropy / 卖 Lighter" : "卖 Entropy / 买 Lighter"} · 开仓 ${active.rules.entry_bps} bps / 平仓 ${active.rules.exit_bps} bps · 单次 $${active.rules.order_usd} · 库存上限 $${active.rules.max_inventory_usd} / 腿 · ${active.rules.duration_minutes} 分钟（含暂停）${sessionSymbol(active) !== selectedSymbol() ? "。当前浏览其他资产；请切回该 Session 标的后操作。" : ""}` : "先保存规则，再开始观察。";
   el("events").replaceChildren();
   for (const event of data.events.slice().reverse()) {
@@ -52,7 +52,21 @@ async function refresh() {
     button.textContent=`${sessionSymbol(session)} · ${fmt(session.created)} · ${states[session.state]}`;
     button.addEventListener("click",() => loadReport(session.id));el("history").append(button);
   }
+  renderPaper(data);
+  if(!active && previous?.mode === "PAPER_SIMULATION" && sessionSymbol(previous) === selectedSymbol() && !(report?.session.id === previous.id && report.session.state === "ENDED")) loadReport(previous.id);
   controls();
+}
+function renderPaper(data) {
+  const paper=active && sessionSymbol(active)===selectedSymbol() && active.mode === "PAPER_SIMULATION" ? data.paper : null;
+  el("paper-state").textContent=paper ? `模拟状态：${paper.status} · ${paper.reason}` : "所选资产尚无活动盘口模拟";
+  el("paper-inventory").textContent=paper ? `虚拟库存 · Entropy ${paper.positions.entropy ?? "未知"} / Lighter ${paper.positions.lighter ?? "未知"} · 持有 ${Math.round(paper.inventory_held_sec)} 秒 · 待确认：${paper.recovery_required ? "是，先查询模拟订单" : "否"}` : "模拟仓位：—";
+  const signal=paper?.signal;
+  el("paper-signal").textContent=signal ? `开仓净价差 ${Number(signal.entry_net_bps).toFixed(2)} bps · 平仓剩余价差 ${Number(signal.exit_residual_bps).toFixed(2)} bps · 信号时间 ${fmt(signal.observed_at)}（可能已过期，执行前重新检查）` : "盘口信号：待新鲜双边盘口";
+  el("paper-pnl").textContent=paper ? `模拟手续费 $${Number(paper.fees_usd).toFixed(4)} · 已平仓净收益（未计资金费）${paper.realized_pnl_before_funding_usd == null ? "持仓或未核验，暂不结算" : "$"+Number(paper.realized_pnl_before_funding_usd).toFixed(4)}` : "模拟费用 / 盈亏：—";
+  el("paper-orders").textContent=paper ? paper.orders.slice(-12).map(o=>`${o.venue} · ${o.reduce_only ? "减仓" : "开仓"} · ${o.side ? "买" : "卖"} ${o.qty} · ${o.state} · ${o.id.slice(0,8)}`).join("\n") : "";
+  el("paper-distribution").textContent=paper?.fill_edge_distribution.length ? paper.fill_edge_distribution.map(b=>`${b.intent === "reduce" ? "减仓" : "开仓"} ${b.lower_bps} ~ ${b.upper_bps} bps：${b.fill_count} 笔虚拟成交 / $${Number(b.notional_usd).toFixed(2)}`).join("；") : "暂无模拟成交。真实成交尚未接入，绝不混用。";
+  const evidence=active && sessionSymbol(active)===selectedSymbol() ? data.real_account_reconciliation : null;
+  el("attribution").textContent=evidence ? `${evidence.status} · 归属尚未完成；${evidence.account_position_delta ? "账户数量变化 "+JSON.stringify(evidence.account_position_delta)+"，不自动认领" : "等待本 Session 开始后的双边新鲜基线"}` : "尚无所选资产的 Session 基线";
 }
 async function command(path, payload) {
   if (busy) return;
@@ -67,8 +81,8 @@ async function command(path, payload) {
   finally { busy=false;controls(); }
 }
 el("rules-form").addEventListener("submit",event => {
-  event.preventDefault();const rules={symbol:selectedSymbol(),strategy:el("strategy").value,direction:el("direction").value};
-  for (const name of ["entry_bps","exit_bps","order_usd","max_inventory_usd","max_unhedged_usd","duration_minutes"]) rules[name]=Number(el(name).value);
+  event.preventDefault();const rules={symbol:selectedSymbol(),run_mode:el("run_mode").value,strategy:el("strategy").value,direction:el("direction").value};
+  for (const name of ["entry_bps","exit_bps","order_usd","max_inventory_usd","max_unhedged_usd","duration_minutes","fee_entropy_bps","fee_lighter_bps","slippage_bps","funding_buffer_bps","max_loss_usd"]) rules[name]=Number(el(name).value);
   command("/api/sessions",{rules});
 });
 document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click",() => {

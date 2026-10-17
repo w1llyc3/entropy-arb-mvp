@@ -2,6 +2,12 @@
 
 **Release decision: automatic live execution remains NOT READY. Default remains RECORD_ONLY.**
 
+2026-10-17 Session follow-up: independent paper inventory/IOC execution and
+identity reconciliation are implemented for code review. No real Session
+execution or authenticated real Session order reconciler is connected to the
+workbench. See SESSION_EXECUTION_REVIEW.md for the candidate's exact boundaries.
+Paper readiness does not supersede the real runtime/review gates below.
+
 2026-10-17: SDK installation/native Windows validation, configured-account
 identity/read authentication, empty SNDK exposure/open-order checks and bounded
 history endpoint checks passed. See SDK_CONTRACT_EVIDENCE.md for the actual

@@ -9,6 +9,8 @@ import io
 from pathlib import Path
 import re
 import time
+import hashlib
+import json
 
 from dotenv import dotenv_values
 
@@ -115,6 +117,7 @@ def lighter_positions(books, data, account):
 class InventoryView:
     def __init__(self, accounts=None, *, now=time.time):
         self.accounts = accounts or {}
+        self.domain=hashlib.sha256(json.dumps(self.accounts,sort_keys=True).encode()).hexdigest()
         self.now = now
         self.rows = {}
         self.observed = {}
@@ -167,7 +170,7 @@ class InventoryView:
                                available_usd=row["available_usd"] if fresh and row else None,
                                open_order_count=row["open_order_count"] if fresh and row else None,
                                open_orders_verified=bool(fresh and row and row["open_orders_verified"]))
-        return dict(symbol=symbol, source="PUBLIC_EXCHANGE_POSITION_READ", legs=legs,
+        return dict(symbol=symbol, account_domain=self.domain, source="PUBLIC_EXCHANGE_POSITION_READ", legs=legs,
                     net_exposure_usd=None, contracts_equivalence_verified=False,
                     execution_ready=False, settlement_verified=False,
                     notice="Account-wide positions, not Session-attributed inventory. No cross-contract netting.")
