@@ -138,6 +138,15 @@ def test_zero_fees_need_no_unit_assumption_but_nonzero_integrator_fee_blocks(led
         asyncio.run(adapter(ledger,trades=[trade(ledger,taker_fee=0,integrator_taker_fee=1)],fee_scale=None).query_fills(CLIENT))
 
 
+def test_quantity_evidence_preserves_unknown_fee_as_none(ledger):
+    row=trade(ledger)
+    for field in ('taker_fee','maker_fee','integrator_maker_fee','integrator_taker_fee'):row.pop(field,None)
+    venue=adapter(ledger,trades=[row])
+    fills=asyncio.run(venue.query_execution_fills(CLIENT))
+    assert fills[0].qty==D('.004') and fills[0].fee is None
+    with pytest.raises(EvidenceConflict):asyncio.run(venue.query_fills(CLIENT))
+
+
 def test_cursor_pagination_has_no_silent_truncation_or_loop():
     calls=[]
     async def fetch(params):
