@@ -62,11 +62,17 @@ no-order validation can claim to have exercised.
 
 ## Current validation evidence
 
-- Full offline suite: **470 passed, 1 skipped** (POSIX flock), existing
+- Full offline suite: **471 passed, 1 skipped** (POSIX flock), existing
   Starlette/httpx warning. Frontend script harness: **5 passed**.
 - New workbench smoke: 15 cycles, 3 restarts, 2 lost-ack recoveries, no failures;
   explicitly NOT a 24-hour pass. Failed initial harness attempts are retained
   as failed evidence; their command-key/market-fixture issues were corrected.
+- The first 30-second-cycle run found a real worker bug: continuity timestamps
+  were only updated while a Session existed, so idle time looked like a scheduler
+  gap when starting the next Session. Observe the clock on every worker tick,
+  including idle ticks. A 35-second real-time check then completed both cycles
+  across the 30-second idle interval. This is still not a 24-hour pass. Preserve
+  the failed cc795ac report and restart the evidence window on the fixed candidate.
 - Real SDK/native Windows checks passed. At observation, SNDK was flat with no
   active orders and the current ZERO_ONLY account fee policy was allowed.
 - Historical sample execution identities/quantities matched; fee fields and

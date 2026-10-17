@@ -98,7 +98,7 @@ def soak(state,seconds,cycle_sec,progress):
             progress(dict(running=True,passed=False,cycles=cycles,restarts=restarts,
                           lost_ack_checks=lost_ack_checks,elapsed_sec=time.monotonic()-started,
                           qualifies_as_24h_soak=False))
-            time.sleep(max(0,cycle_sec-(time.monotonic()-tick)))
+            time.sleep(max(0,min(cycle_sec-(time.monotonic()-tick),seconds-(time.monotonic()-started))))
     except Exception as exc:
         failure=type(exc).__name__
     finally:
