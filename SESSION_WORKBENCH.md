@@ -1,4 +1,59 @@
-# Independent SNDK Session workbench
+# Independent multi-asset Session workbench
+
+## 2026-10-17: watchlist and read-only position milestone
+
+The workbench now switches between SNDK, ANTH, DRAM, OAI, NBIS, EWY, XIAOMI,
+IONQ, GPRO and TCNT using the existing fixed watchlist and exact venue aliases.
+New observation Sessions freeze `rules.symbol`; existing rules without that field
+display as SNDK without rewriting old events/reports. One open Session remains
+the limit. Browsing another asset does not retarget an existing Session, and
+its action buttons are disabled until switching back. History/report views are
+asset-filtered. Stale chart/report responses are discarded after switching.
+
+Paired history shows both USD mid-price lines and signed basis shading on the
+right bps axis. Single-venue history shows only the Entropy USD line and never
+creates fake paired basis. Missing history stays empty. Data gaps remain visible.
+
+Optional public position monitor:
+
+```powershell
+& ./.venv-audit/Scripts/python.exe -m web.workbench --port 8770 --public-env-file ../.env
+```
+
+Only `HL_ACCOUNT_ADDRESS` / `ENTROPY_HL_ACCOUNT` and `LIGHTER_ACCOUNT_INDEX`
+are selected for parsing. Private keys/tokens are ignored, no SDK is loaded,
+and account identifiers do not appear in the browser API payload. Configuration
+is explicit and not discovered automatically. No account locks are acquired.
+Without the argument, the workbench remains credential-free and makes no account
+requests. Fixed official public endpoints are queried every 15 seconds, shared
+across the watchlist; GET polling only reads cached projections.
+
+Positions are account-wide observations, not Session-attributed inventory.
+Missing/ambiguous markets, account failures, nonfinite quantities and snapshots
+older than 30 seconds remain UNKNOWN. Lighter public positions do not establish
+outstanding-order completeness. Both legs' quantities are shown separately;
+contract equivalence is unverified, net USD exposure remains null, and no
+settlement or execution readiness is granted. Session reports still do not claim
+verified inventory/PnL. Account balance fields are account-wide, not per-asset.
+
+The prior milestone notes below describe the original implementation. Account
+client absence applies to default startup; the optional monitor is new. Real
+execution stays disabled for every watchlist asset, including SNDK. Adapter and
+contract validation must be completed per asset before adding execution support.
+
+Validation for this milestone: **412 Python tests passed, 1 skipped** with the
+existing deprecation warning; **4 offline Node UI tests passed** for all choices,
+out-of-order chart responses, single-venue rendering, Session action isolation
+and delayed report downloads. JS syntax and whitespace checks passed. These are
+script/DOM harness tests, not an actual browser rendering pass.
+
+Live local HTTP checks returned paired history and fresh public position reads
+for SNDK, ANTH, DRAM, OAI, NBIS, EWY, XIAOMI and TCNT. IONQ/GPRO returned
+single-venue history with unknown Lighter positions, as intended. All assets
+remained execution_ready=false. Collector PID 26504 remained RECORD_ONLY.
+The in-app browser control connection timed out during this milestone, so visual
+and manual selector acceptance remains unverified; do not reuse the previous
+milestone's browser pass as evidence for the new selector/chart layout.
 
 ## Agreed product scope
 

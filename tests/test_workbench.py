@@ -6,6 +6,7 @@ import pytest
 
 from entropy_arb.workbench import SessionConflict, SessionStore
 from web.workbench import create_app
+from entropy_arb.watchlist import ASSETS
 
 
 def test_concurrent_create_replay_and_conflicting_payload(tmp_path):
@@ -137,3 +138,72 @@ def test_origin_and_exclusive_process_owner(tmp_path):
             with TestClient(create_app(state_dir=state, data_root=tmp_path)):
                 pass
         assert client.get("/api/status").json()["sessions"] == []
+
+
+@pytest.mark.parametrize("asset", ASSETS, ids=lambda a:a.symbol)
+def test_watchlist_sessions_charts_and_reports_are_asset_bound(tmp_path, asset):
+    with TestClient(create_app(state_dir=tmp_path/"state",data_root=tmp_path/"collector")) as client:
+        catalog=client.get("/api/assets").json()
+        assert len(catalog["assets"])==10
+        assert all(not a["execution_enabled"] for a in catalog["assets"])
+        created=client.post("/api/sessions",json=dict(key="create-asset",rules=dict(symbol=asset.symbol))).json()
+        assert created["rules"]["symbol"]==asset.symbol
+        sid=created["id"]
+        assert client.get("/api/basis",params=dict(symbol=asset.symbol)).json()["symbol"]==asset.symbol
+        inventory=client.get("/api/inventory",params=dict(symbol=asset.symbol)).json()
+        assert inventory["symbol"]==asset.symbol and not inventory["execution_ready"]
+        assert all(r["position_qty"] is None for r in inventory["legs"].values())
+        # Browsing a different chart cannot retarget a frozen session.
+        client.get("/api/basis",params=dict(symbol="TCNT"))
+        assert client.get("/api/status").json()["active"]["rules"]["symbol"]==asset.symbol
+        assert client.post(f"/api/sessions/{sid}/end",json=dict(key="end-asset",version=1)).status_code==200
+        assert client.get(f"/api/sessions/{sid}/report").json()["session"]["rules"]["symbol"]==asset.symbol
+        assert client.get("/api/basis?symbol=BAD").status_code==400
+        assert client.get("/api/inventory?symbol=BAD").status_code==400
+        assert client.post("/api/sessions",json=dict(key="bad-symbol",rules=dict(symbol="BAD"))).status_code==400
+
+
+def test_legacy_sndk_rules_normalized_without_rewriting_evidence(tmp_path):
+    store=SessionStore(tmp_path/"sessions.sqlite")
+    try:
+        s=store.command("create","old-session")
+        rules=s["rules"].copy();del rules["symbol"]
+        store.db.execute("UPDATE sessions SET rules=? WHERE id=?",(json.dumps(rules),s["id"]))
+        assert store.snapshot()["active"]["rules"]["symbol"]=="SNDK"
+        stored=store.db.execute("SELECT rules FROM sessions").fetchone()[0]
+        assert "symbol" not in json.loads(stored)
+    finally:
+        store.close()
+
+
+def test_chart_data_isolation_and_single_venue_no_fake_basis(tmp_path):
+    import time
+    from test_research import write_rows, row, save_catalog, metadata
+    from entropy_arb.watchlist import resolve_catalog
+    root=tmp_path/"collector"
+    stamp=int(time.time()//60)*60-120
+    write_rows(root,"SNDK",[row(stamp,99)])
+    write_rows(root,"ANTH",[row(stamp,3)])
+    write_rows(root,"IONQ",[row(stamp,999)],single=True)
+    save_catalog(root,resolve_catalog(*metadata()))
+    with TestClient(create_app(state_dir=tmp_path/"state",data_root=root)) as client:
+        sndk=client.get("/api/basis?symbol=SNDK").json()
+        anth=client.get("/api/basis?symbol=ANTH").json()
+        single=client.get("/api/basis?symbol=IONQ").json()
+        assert sndk["points"][0]["basis_bps"]==99
+        assert anth["points"][0]["basis_bps"]==3
+        assert not single["paired"]
+        assert single["points"][0]["entropy_usd"]==101
+        assert single["points"][0]["basis_bps"] is None
+        assert single["summary"]["basis_count"]==0
+
+
+def test_session_asset_cannot_be_retargeted_by_browsing_or_command(tmp_path):
+    with TestClient(create_app(state_dir=tmp_path/"state",data_root=tmp_path)) as client:
+        s=client.post("/api/sessions",json=dict(key="start-nbis",rules=dict(symbol="NBIS"))).json()
+        url=f'/api/sessions/{s["id"]}/start'
+        assert client.post(url,json=dict(key="retarget-try",version=1,symbol="SNDK")).status_code==400
+        assert client.post(url,json=dict(key="start-valid",version=1)).status_code==200
+        assert client.post("/api/sessions",json=dict(key="other-asset",rules=dict(symbol="SNDK"))).status_code==409
+        client.get("/api/basis?symbol=SNDK")
+        assert client.get("/api/status").json()["active"]["rules"]["symbol"]=="NBIS"
