@@ -13,6 +13,8 @@ import threading
 import time
 import uuid
 
+from .watchlist import asset_for
+
 
 class SessionConflict(ValueError):
     pass
@@ -25,19 +27,20 @@ def encode(value):
 def rules_for(body):
     if not isinstance(body, dict):
         raise ValueError("rules must be an object")
-    allowed = {"strategy", "direction", "entry_bps", "exit_bps", "order_usd",
+    allowed = {"symbol", "strategy", "direction", "entry_bps", "exit_bps", "order_usd",
                "max_inventory_usd", "max_unhedged_usd", "duration_minutes"}
     if set(body) - allowed:
         raise ValueError("unknown rule fields")
-    rules = dict(strategy="SPREAD", direction="BUY_ENTROPY", entry_bps=10,
+    rules = dict(symbol="SNDK", strategy="SPREAD", direction="BUY_ENTROPY", entry_bps=10,
                  exit_bps=2, order_usd=11, max_inventory_usd=22,
                  max_unhedged_usd=11, duration_minutes=60)
     rules.update(body)
+    asset_for(rules["symbol"])
     if rules["strategy"] != "SPREAD":
         raise SessionConflict("passive quoting is a later milestone")
     if rules["direction"] not in ("BUY_ENTROPY", "SELL_ENTROPY"):
         raise ValueError("invalid direction")
-    for field in allowed - {"strategy", "direction"}:
+    for field in allowed - {"symbol", "strategy", "direction"}:
         value = rules[field]
         if type(value) not in (int, float) or not math.isfinite(value):
             raise ValueError("finite numeric rules required")
@@ -120,6 +123,9 @@ class SessionStore:
             raise KeyError(sid)
         result = dict(row)
         result["rules"] = json.loads(result["rules"])
+        # Existing v1 rules predate the watchlist and were exclusively SNDK.
+        # Display normalization only: preserve stored rules/events/reports.
+        result["rules"].setdefault("symbol", "SNDK")
         result.update(mode="OBSERVATION_ONLY", live_enabled=False, rules_version=1)
         return result
 

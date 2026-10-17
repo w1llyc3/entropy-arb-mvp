@@ -6,23 +6,27 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+import aiohttp
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from entropy_arb.ownership import OwnerLock
 from entropy_arb.workbench import SessionConflict, SessionStore
-from web.research_basis import build_research_basis
+from entropy_arb.inventory_view import InventoryView, public_identity
+from entropy_arb.watchlist import asset_for
+from web.research_basis import build_research_basis, catalog
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def create_app(*, state_dir=None, data_root=None):
+def create_app(*, state_dir=None, data_root=None, public_accounts=None):
     state_dir = Path(state_dir or ROOT / ".web" / "session-workbench").resolve()
     data_root = Path(data_root or ROOT).resolve()
     if state_dir == data_root / ".web" or state_dir == ROOT / ".web" / "manual-live-test":
         raise ValueError("workbench requires its own state directory")
     owner = OwnerLock(dict(workbench=str(state_dir)))
+    inventory = InventoryView(public_accounts)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -30,6 +34,8 @@ def create_app(*, state_dir=None, data_root=None):
             raise RuntimeError("workbench state already owned by another process")
         store = None
         timer = None
+        account_timer = None
+        http = None
         try:
             store = SessionStore(state_dir / "sessions.sqlite")
             app.state.store = store
@@ -39,8 +45,20 @@ def create_app(*, state_dir=None, data_root=None):
                     store.expire()
                     await asyncio.sleep(1)
             timer = asyncio.create_task(expire_sessions())
+            if any(inventory.accounts.values()):
+                http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=7), trust_env=True)
+                async def refresh_inventory():
+                    while True:
+                        await inventory.refresh(http)
+                        await asyncio.sleep(15)
+                account_timer = asyncio.create_task(refresh_inventory())
             yield
         finally:
+            if account_timer:
+                account_timer.cancel()
+                await asyncio.gather(account_timer, return_exceptions=True)
+            if http:
+                await http.close()
             if timer:
                 timer.cancel()
                 await asyncio.gather(timer, return_exceptions=True)
@@ -48,7 +66,7 @@ def create_app(*, state_dir=None, data_root=None):
                 store.close()
             owner.close()
 
-    app = FastAPI(title="SNDK session workbench · observation milestone", lifespan=lifespan,
+    app = FastAPI(title="Entropy session workbench · observation milestone", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
@@ -83,8 +101,23 @@ def create_app(*, state_dir=None, data_root=None):
         return app.state.store.snapshot()
 
     @app.get("/api/basis")
-    async def basis():
-        return await asyncio.to_thread(build_research_basis, data_root, symbol="SNDK", hours=24)
+    async def basis(symbol: str = "SNDK"):
+        try:
+            return await asyncio.to_thread(build_research_basis, data_root, symbol=symbol, hours=24)
+        except ValueError:
+            raise HTTPException(400, "unknown research asset") from None
+
+    @app.get("/api/assets")
+    async def assets():
+        return await asyncio.to_thread(catalog, data_root)
+
+    @app.get("/api/inventory")
+    def positions(symbol: str = "SNDK"):
+        try:
+            asset_for(symbol)
+        except ValueError:
+            raise HTTPException(400, "unknown research asset") from None
+        return inventory.snapshot(symbol)
 
     @app.post("/api/sessions")
     def create(body: dict = Body(...)):
@@ -128,13 +161,19 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, default=ROOT / ".web" / "session-workbench")
     parser.add_argument("--data-root", type=Path, default=ROOT,
                         help="existing recorder repository; historical CSV read access only")
+    parser.add_argument("--public-env-file", type=Path,
+                        help="explicit file: select only public account identifiers; no keys or signing")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("invalid port")
     if args.port == 8766:
         parser.error("8766 is reserved for the existing collector dashboard")
+    try:
+        accounts = public_identity(args.public_env_file) if args.public_env_file else None
+    except Exception:
+        parser.error("public account configuration unavailable or invalid; values are not displayed")
     import uvicorn
-    uvicorn.run(create_app(state_dir=args.state_dir, data_root=args.data_root),
+    uvicorn.run(create_app(state_dir=args.state_dir, data_root=args.data_root, public_accounts=accounts),
                 host="127.0.0.1", port=args.port)
 
 
