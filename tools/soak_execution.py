@@ -3,9 +3,11 @@ import argparse
 import asyncio
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 import sys
-import tempfile
+import subprocess
+import hashlib
 import time
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -34,7 +36,7 @@ async def proposal(service):
     raise AssertionError('proposal deadline exceeded')
 
 
-async def soak(root,seconds,cycle_sec):
+async def soak(root,seconds,cycle_sec,progress=None):
     venues={n:FakeVenue(venue=n,account='soak-'+n) for n in ('entropy','lighter')}
     book_state=books()
     def service():
@@ -65,6 +67,10 @@ async def soak(root,seconds,cycle_sec):
                 # Recording is intentionally restored on restart. Pause before
                 # the next explicit start rather than treating it as stopped.
                 await svc.call('pause')
+            if progress:
+                progress(dict(running=True,passed=False,cycles=cycles,restarts=restarts,
+                    elapsed_sec=time.monotonic()-started,metrics=svc.ledger.metrics(),
+                    qualifies_as_24h_soak=False))
             await asyncio.sleep(max(0,cycle_sec-(time.monotonic()-tick)))
     except Exception as exc:
         failure=type(exc).__name__
@@ -85,13 +91,24 @@ def main():
     parser.add_argument('--seconds',type=float,default=86400)
     parser.add_argument('--cycle-sec',type=float,default=30)
     parser.add_argument('--output',required=True)
+    parser.add_argument('--state-dir',default=None,help='fresh isolated fake-state directory; never reuse a production path')
     args=parser.parse_args()
     if args.seconds<=0 or args.cycle_sec<5: parser.error('positive duration; cycle >=5sec to respect order budget')
     output=Path(args.output); output.parent.mkdir(parents=True,exist_ok=True)
-    # No production paths/config/env; OS locks and SQLite live in a disposable directory.
-    with tempfile.TemporaryDirectory(prefix='entropy-offline-soak-') as directory:
-        report=asyncio.run(soak(Path(directory),args.seconds,args.cycle_sec))
-    output.write_text(json.dumps(report,indent=2),encoding='utf-8')
+    state=Path(args.state_dir) if args.state_dir else output.with_suffix('.state')
+    state.mkdir(parents=True,exist_ok=False) # Preserve existing evidence; never resume with an empty fake server.
+    commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+    metadata=dict(simulation=True,requested_sec=args.seconds,pid=os.getpid(),commit=commit,
+                  state_dir=str(state.resolve()),started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
+    def write_progress(item):
+        temporary=output.with_suffix(output.suffix+'.tmp')
+        temporary.write_text(json.dumps(dict(metadata,**item),indent=2),encoding='utf-8')
+        temporary.replace(output)
+    write_progress(dict(running=True,cycles=0,passed=False,qualifies_as_24h_soak=False))
+    report=asyncio.run(soak(state,args.seconds,args.cycle_sec,write_progress))
+    ledger=state/'.web/ledger.sqlite'
+    report.update(running=False,ledger_sha256=hashlib.sha256(ledger.read_bytes()).hexdigest())
+    write_progress(report)
     print(json.dumps(report))
     return 0 if report['passed'] else 1
 

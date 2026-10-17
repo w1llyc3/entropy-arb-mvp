@@ -37,6 +37,17 @@ def test_intent_ids_reservations_and_constraints_survive_reopen(tmp_path):
     b.close()
 
 
+def test_abort_and_send_claim_are_mutually_exclusive(ledger):
+    op=ledger.create_intent('key','proposal','open',legs())
+    assert ledger.abort_plan(op)
+    assert not ledger.claim(op)
+    assert all(D(l['reservation'])==0 and l['outcome']=='not_sent' for l in ledger.operation(op)['legs'])
+    sent=ledger.create_intent('new-key','new-proposal','open',legs())
+    assert ledger.claim(sent)
+    with pytest.raises(RecoveryRequired): ledger.abort_plan(sent)
+    assert all(D(l['reservation'])>0 for l in ledger.operation(sent)['legs'])
+
+
 def test_concurrent_command_and_proposal_consumption(tmp_path):
     path = tmp_path / "ledger.sqlite"
     stores = [Ledger(path), Ledger(path)]

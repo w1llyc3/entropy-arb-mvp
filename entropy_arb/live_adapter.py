@@ -202,11 +202,17 @@ class LighterAdapter:
                 raise EvidenceConflict('trade identity mismatch')
             if type(row['is_maker_ask']) is not bool: raise EvidenceConflict('maker side unverified')
             role='maker' if row['is_maker_ask']==ask else 'taker'
-            if self.fee_scale is None or row.get(role+'_fee') is None:
+            if row.get(role+'_fee') is None:
                 raise EvidenceConflict('fee unit or amount not verified')
+            for field in ('integrator_maker_fee','integrator_taker_fee'):
+                if row.get(field) is None or integer(row[field])!=0:
+                    raise EvidenceConflict('integrator fees missing or not verified')
+            raw_fee=decimal(row[role+'_fee'])
+            if self.fee_scale is None and raw_fee!=0:
+                raise EvidenceConflict('nonzero fee unit not verified')
             qty,price=decimal(row['size']),decimal(row['price'])
             if qty<=0 or price<=0 or row.get('type')!='trade': raise EvidenceConflict('unsupported trade evidence')
-            fee=decimal(row[role+'_fee'])/self.fee_scale
+            fee=raw_fee/self.fee_scale if self.fee_scale is not None else Decimal(0)
             trade_id=str(integer(row['trade_id']))
             fill=TradeFill(client_id,trade_id,qty,price,fee)
             if trade_id in fills and fills[trade_id]!=fill: raise EvidenceConflict('trade ID changed evidence')

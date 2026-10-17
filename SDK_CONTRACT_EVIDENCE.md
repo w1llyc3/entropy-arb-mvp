@@ -1,5 +1,38 @@
 # Execution contract evidence — 2026-10-16
 
+## Follow-up, 2026-10-17 (supersedes earlier installation limitation)
+
+- Both pinned SDKs installed in `.venv-live` after the installer temporarily
+  used the existing Windows proxy. No system proxy setting changed. Native
+  Windows AMD64 loading and SDK callable-signature checks passed.
+- Existing parent-project env is explicitly supported with `--env-file ../.env`,
+  including legacy HL names. Diagnostics disclose no values/fingerprints, and
+  the user's env was not modified.
+- Real read-only preflight observed flat SNDK positions/no outstanding orders.
+  HL approved-agent identity and Lighter read auth passed. Local credentials
+  were used only for identity/query authentication, not order signing/sending.
+- Lighter inactive-order and trade endpoints returned real samples. HL fill
+  history endpoint worked but had no SNDK fills in the 24h sample. History and
+  settlement completeness are not inferred from endpoint/sample availability.
+- Real querying exposed bool URL-encoding failure in `trades`; GET booleans now
+  use lowercase strings. Errors expose endpoint path/status/category only,
+  never auth headers, query values or response bodies. Auth tokens explicitly
+  use the configured API-key index. HL authorization is rechecked before send.
+- Current account fee schedule supports ZERO_ONLY. A missing conversion scale
+  permits only exact-zero fees with a send-time schedule recheck, not guessed
+  nonzero conversion. Missing/nonzero integrator fees block reconciliation.
+- Unsent plans may be atomically abandoned without deleting ledger evidence;
+  this cannot release a sent/unknown order. Soak output now retains its database,
+  publishes running progress and hashes final DB evidence.
+
+No real orders have been sent. Real Windows sleep and 24h execution soak results
+are still pending; the normal strategy service remains RECORD_ONLY.
+
+Follow-up regression: **370 Python tests passed, 1 skipped**, one existing
+Starlette/httpx warning (28.77 seconds). Real identity/auth/history checks
+were read-only; no order intents were submitted or transaction signatures
+created. The zero-only account policy is not a claim about nonzero fee units.
+
 ## Confirmed by Code / public source inspection
 
 - Official Hyperliquid SDK revision:
